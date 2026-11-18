@@ -1,0 +1,20 @@
+[package]
+name = "brumm-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "brumm"
+path = "src/main.rs"
+
+[dependencies]
+brumm-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+directories.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe.workspace = true
+egui.workspace = true
+qrcode.workspace = true
+jiff.workspace = true
