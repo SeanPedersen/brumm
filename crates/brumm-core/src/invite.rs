@@ -1,14 +1,15 @@
-//! Invite tickets: everything a peer needs to dial us once and prove it was invited.
+//! Invite tickets: everything a peer needs to dial us once, prove it was invited and open an
+//! Olm session to us (via the one-time key).
 //! Encoded as `brumm://invite/<base32(postcard)>` for links and QR codes.
 
 use data_encoding::BASE32_NOPAD;
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 
-use crate::{identity::Profile, wire::InviteSecret};
+use crate::{crypto::OneTimeKey, identity::Profile, wire::InviteSecret};
 
 const INVITE_PREFIX: &str = "brumm://invite/";
-const INVITE_VERSION: u8 = 1;
+const INVITE_VERSION: u8 = 2;
 pub const INVITE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,7 @@ pub struct Invite {
     pub profile: Profile,
     pub device_addr: EndpointAddr,
     pub secret: InviteSecret,
+    pub one_time_key: OneTimeKey,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,12 +34,13 @@ pub enum InviteError {
 }
 
 impl Invite {
-    pub fn new(profile: Profile, device_addr: EndpointAddr, secret: InviteSecret) -> Self {
+    pub fn new(profile: Profile, device_addr: EndpointAddr, secret: InviteSecret, one_time_key: OneTimeKey) -> Self {
         Self {
             version: INVITE_VERSION,
             profile,
             device_addr,
             secret,
+            one_time_key,
         }
     }
 
@@ -76,9 +79,9 @@ mod tests {
         let device = iroh::SecretKey::generate().public();
         let profile = Profile {
             display_name: "alice".into(),
-            device_cert: identity.certify_device(device, 1),
+            device_cert: identity.certify_device(device, [3; 32], 1),
         };
-        let invite = Invite::new(profile, EndpointAddr::from(device), [9; 16]);
+        let invite = Invite::new(profile, EndpointAddr::from(device), [9; 16], [8; 32]);
         let decoded = Invite::from_link(&invite.to_link()).unwrap();
         assert_eq!(decoded, invite);
     }

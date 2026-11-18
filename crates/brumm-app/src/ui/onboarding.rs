@@ -14,6 +14,13 @@ pub struct OnboardingView {
     submitted: bool,
 }
 
+impl OnboardingView {
+    /// Re-enables the submit button after the core rejected the attempt.
+    pub fn allow_retry(&mut self) {
+        self.submitted = false;
+    }
+}
+
 pub fn show(ui: &mut egui::Ui, view: &mut OnboardingView, commands: &mut Vec<Command>) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.vertical_centered(|ui| {

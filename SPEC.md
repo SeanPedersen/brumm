@@ -38,7 +38,7 @@ read receipts, typing indicators, Tor / relay-only mode, own mailbox server.
 │  ├─ identity    user key, device keys, device certs/lists        │
 │  ├─ invite      ticket encode/decode, single-use secrets         │
 │  ├─ wire        versioned frames (postcard)                      │
-│  ├─ crypto      vodozemac Olm sessions per device pair     [M2]  │
+│  ├─ crypto/e2ee vodozemac Olm sessions per device pair     [M2]  │
 │  ├─ transport   iroh endpoint, ALPN brumm/1, conn cache          │
 │  ├─ mailbox     trait Mailbox + NostrMailbox               [M3]  │
 │  ├─ files       iroh-blobs offers / fetch                  [M4]  │
@@ -61,13 +61,13 @@ the core wakes the UI via a repaint callback.
 |---|---|---|---|
 | **User key** `UK` | Ed25519 | forever (recoverable) | derived from seed; **stored on every linked device** |
 | **Device key** `DK` | Ed25519 (= iroh `EndpointId`) | per device install | random, never leaves the device |
-| **Olm identity** `OK` | Curve25519 + Ed25519 (vodozemac) | per device | [M2] |
+| **Olm identity** `OK` | Curve25519 (vodozemac account) | per device | bound to the user via `DeviceCert` [M2] |
 
 `UK = Ed25519::from_bytes(blake3::derive_key("brumm 2026 user identity key v1", bip39_seed))`
 
 ### 3.2 Device certificate & device list
 ```
-DeviceCert { user_key: UK_pub, device_id: DK_pub, issued_at_ms, sig_UK(...) }
+DeviceCert { user_key: UK_pub, device_id: DK_pub, olm_identity_key: OK_pub, issued_at_ms, sig_UK(...) }
 DeviceList { user_key, seq: u64 (monotonic), devices: Vec<DeviceEntry>, sig_UK(...) }   [later M-multi]
 DeviceEntry { device_id, olm_identity_key, olm_fallback_key, added_at_ms }
 ```
@@ -109,17 +109,19 @@ badges, local nicknames and fingerprints.
 
 ### 5.1 Invite (QR / link) [M1]
 ```
-Invite { v: 1, profile: Profile, device_addr: EndpointAddr, secret: [u8;16] }
+Invite { v: 2, profile: Profile, device_addr: EndpointAddr, secret: [u8;16], one_time_key: OTK_pub }
 Profile { user_key, display_name, device_cert }
 link = "brumm://invite/" + base32(postcard(Invite))
 ```
 - The inviter stores `secret` as a pending single-use invite.
-- The invitee dials `device_addr`, sends `Hello { invite_secret, profile }`.
-- The inviter checks that the secret exists and has not been used, that the cert is valid and
-  `cert.device_id == connection.remote_id()`, then consumes the secret, stores the contact
-  (trust = verified) and replies `HelloAck { profile }`.
-- The invitee checks that `HelloAck.profile.user_key == invite.profile.user_key` and stores the contact.
-- [M2] Invite and Hello additionally carry Olm identity + one-time keys.
+- The invitee opens an outbound Olm session from `(invite.cert.olm_identity_key, invite.one_time_key)`
+  and sends `Hello { invite_secret, sealed: Olm pre-key message(Profile) }`.
+- The inviter consumes the single-use secret, opens the inbound session (consuming the one-time
+  key), and checks that the cert is valid, `cert.device_id == connection.remote_id()` and
+  `cert.olm_identity_key == pre-key sender key`. It then stores the contact (trust = verified) and the
+  session, and replies `HelloAck { sealed: Olm(Profile) }`.
+- The invitee decrypts it and checks that the user key and Olm key match the invite, then stores the contact
+  and the session. Profiles never travel in plaintext.
 - [M3] Invite carries the inviter's Nostr relay list + an inbox tag, so the invite works offline.
 
 ### 5.2 Introduction (contact card) [M3]
@@ -138,14 +140,16 @@ Intro { introducer: UK_alice, introducee: UK_carol, subject: UK_bob, ts, sig_UK_
 
 ## 6. Messaging
 
-### 6.1 Wire frames (`brumm/1`, postcard, max 64 KiB per frame) [M1]
+### 6.1 Wire frames (`brumm/2`, postcard, max 64 KiB per frame) [M2]
 ```
-Frame::Hello    { invite_secret, profile }           → Reply::HelloAck { profile } | Reply::Rejected
-Frame::Message  { id: [u8;16], sent_at_ms, body }    → Reply::Ack { id }           | Reply::Rejected
-Body::Text(String)  · Body::FileOffer [M4] · Body::ContactCard [M3] · Body::DeviceList [multi]
+Frame::Hello  { invite_secret, sealed: Olm(Profile) }  → Reply::HelloAck { sealed: Olm(Profile) } | Reply::Rejected
+Frame::Sealed(Olm(Payload))                            → Reply::Ack { id }                        | Reply::Rejected
+Payload::Chat(ChatMessage { id: [u8;16], sent_at_ms, body })
+Body::Text(String) · Body::FileOffer [M4] · Body::ContactCard [M3] · Body::DeviceList [multi]
+Sealed { message_type: u8, ciphertext }   # vodozemac OlmMessage::to_parts
 ```
 One request/response per QUIC bi-stream. Connections are cached per peer device.
-From M2 `Frame::Message` becomes `Frame::Sealed { olm_message }`, which wraps the same body.
+Acks are plaintext random ids over QUIC/TLS. They become sealed payloads when the mailbox arrives (M3).
 
 ### 6.2 Delivery algorithm
 ```
@@ -164,9 +168,14 @@ or `Failed`.
 ---
 
 ## 7. Encryption [M2]
-- **vodozemac Olm** (Double Ratchet) session **per device pair**; each message is encrypted for
-  every recipient device and each of my other devices (Sesame-style).
-- Session bootstrap: one-time key from the invite/hello; the fallback key from the user record for introductions.
+- **vodozemac Olm** (Double Ratchet, `SessionConfig::version_1`) session **per device pair**; each
+  message is encrypted for every recipient device and each of my other devices (Sesame-style).
+- Session bootstrap: the one-time key from the invite [M2]; the fallback key from the user record for
+  introductions [M3].
+- Every message is re-encrypted on retry (fresh ratchet step); receivers deduplicate by id.
+- Ratchet state is written through to the DB after every encrypt/decrypt. If an existing session
+  can't decrypt a pre-key message from the peer's *certified* Olm key, a new inbound session replaces it.
+- Account and session pickles are encrypted with `pickle_key = blake3::derive_key(ctx, device_secret)`.
 - iroh QUIC/TLS (authenticated by `DK`) is a second, transport-level layer.
 - [later] Groups: MLS (openmls) with commit ordering by the group's mailbox, or Megolm-style sender keys.
 
@@ -192,8 +201,13 @@ or `Failed`.
 ---
 
 ## 10. Storage
-- SQLite via rusqlite; **SQLCipher** with a passphrase from M2 (M1 stores plaintext — dev only).
-- Tables: `meta`, `contacts`, `devices`, `messages`, `invites`.
+- SQLite via rusqlite. **No passphrase or unlock screen, ever** (Telegram-like UX).
+- At rest today: OS disk encryption, plus Olm pickles encrypted with the pickle key.
+- [M5] SQLCipher with a random DB key held in the **OS keychain** (Signal Desktop style), so there is still no prompt.
+  Optional app lock later.
+- Tables: `meta` (seed phrase, device secret, profile, Olm account), `contacts`, `devices`,
+  `olm_sessions`, `messages`, `invites`. `PRAGMA user_version` = schema version; pre-release
+  schemas are rejected with a "delete profile" hint.
 - **Retention**: messages older than 60 days (configurable) are pruned at startup and every 6 h.
 
 ---
@@ -214,12 +228,12 @@ Out of scope for v0.1: global passive adversaries, traffic analysis, compromised
 ## 12. Milestones
 | | Scope | Done when |
 |---|---|---|
-| **M1** | identity (seed), invite + QR, iroh direct text with ack, SQLite history, egui chat | two local profiles can add each other and chat |
-| **M2** | vodozemac Olm sessions, SQLCipher passphrase unlock | wire carries only Olm ciphertext |
+| **M1** ✅ | identity (seed), invite + QR, iroh direct text with ack, SQLite history, egui chat | two local profiles can add each other and chat |
+| **M2** ✅ | vodozemac Olm sessions per device pair, sealed hello/profiles | wire carries only Olm ciphertext (besides acks) |
 | **M3** | Nostr mailbox, offline invite, contact cards + intro requests | message reaches a peer that comes online later |
 | **M4** | file offers via iroh-blobs | send a 1 GiB file, resume after disconnect |
 | **Multi** | device lists, linking, revocation, own-device fan-out | two devices of one user share the conversations |
-| **M5** | retention UI, error states, settings, release builds | installable builds for 3 OSes |
+| **M5** | keychain-backed SQLCipher, retention UI, error states, settings, release builds | installable builds for 3 OSes |
 
 ## 13. Roadmap after v0.1
 Groups (MLS) · stickers · Android/iOS · own mailbox server · Mainline DHT + mDNS discovery ·

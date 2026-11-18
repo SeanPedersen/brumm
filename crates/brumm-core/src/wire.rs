@@ -1,11 +1,12 @@
-//! Wire protocol `brumm/1`: request/response frames exchanged over one QUIC bi-stream each,
-//! serialized with postcard. See SPEC.md §6.1.
+//! Wire protocol `brumm/2`: request/response frames exchanged over one QUIC bi-stream each,
+//! serialized with postcard. Everything except acks and invite secrets travels inside Olm
+//! ciphertext ([`Sealed`]). See SPEC.md §6.1.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::identity::Profile;
+use crate::crypto::Sealed;
 
-pub const ALPN: &[u8] = b"brumm/1";
+pub const ALPN: &[u8] = b"brumm/2";
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 
@@ -14,16 +15,25 @@ pub type InviteSecret = [u8; 16];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Frame {
+    /// Pre-key message opening the session; plaintext is the sender's `Profile`.
     Hello {
         invite_secret: InviteSecret,
-        profile: Profile,
+        sealed: Sealed,
     },
-    Message(ChatMessage),
+    /// Plaintext is a [`Payload`].
+    Sealed(Sealed),
+}
+
+/// Plaintext inside [`Frame::Sealed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Payload {
+    Chat(ChatMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Reply {
-    HelloAck { profile: Profile },
+    /// Plaintext is the responder's `Profile`.
+    HelloAck { sealed: Sealed },
     Ack { id: MessageId },
     Rejected(RejectReason),
 }

@@ -1,5 +1,6 @@
-//! Local persistence (SQLite): own identity, contacts and their devices, message history,
-//! pending invites. Plaintext in M1 — SQLCipher with a passphrase arrives in M2 (SPEC.md §10).
+//! Local persistence (SQLite): own identity + Olm account, contacts and their devices, Olm
+//! sessions, message history, pending invites. Olm pickles are encrypted with the device's
+//! pickle key; the database itself relies on OS disk encryption for now (SPEC.md §10).
 
 use std::path::Path;
 
@@ -14,7 +15,7 @@ use crate::{
     wire::{self, Body, ChatMessage, InviteSecret, MessageId},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -42,6 +43,10 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (contact, id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_time ON messages (contact, sent_at_ms);
+CREATE TABLE IF NOT EXISTS olm_sessions (
+    device_id BLOB PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
+    pickle    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS invites (
     secret        BLOB PRIMARY KEY,
     created_at_ms INTEGER NOT NULL
@@ -51,12 +56,15 @@ CREATE TABLE IF NOT EXISTS invites (
 const META_SEED_PHRASE: &str = "seed_phrase";
 const META_DEVICE_SECRET: &str = "device_secret";
 const META_PROFILE: &str = "profile";
+const META_OLM_ACCOUNT: &str = "olm_account";
 
 /// Own identity as persisted on this device.
 pub struct StoredIdentity {
     pub seed_phrase: String,
     pub device_secret: SecretKey,
     pub profile: Profile,
+    /// Encrypted vodozemac account pickle.
+    pub olm_account: String,
 }
 
 pub struct Store {
@@ -80,6 +88,9 @@ impl Store {
         if version > SCHEMA_VERSION {
             bail!("database schema v{version} is newer than this brumm build");
         }
+        if version != 0 && version < SCHEMA_VERSION {
+            bail!("this profile was created by an incompatible pre-release build (schema v{version}); delete its data folder to start fresh");
+        }
         db.execute_batch(SCHEMA)?;
         db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { db })
@@ -92,8 +103,13 @@ impl Store {
         set_meta(&tx, META_SEED_PHRASE, identity.seed_phrase.as_bytes())?;
         set_meta(&tx, META_DEVICE_SECRET, &identity.device_secret.to_bytes())?;
         set_meta(&tx, META_PROFILE, &wire::encode(&identity.profile))?;
+        set_meta(&tx, META_OLM_ACCOUNT, identity.olm_account.as_bytes())?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn save_olm_account(&self, pickle: &str) -> Result<()> {
+        set_meta(&self.db, META_OLM_ACCOUNT, pickle.as_bytes())
     }
 
     pub fn load_identity(&self) -> Result<Option<StoredIdentity>> {
@@ -102,11 +118,13 @@ impl Store {
         };
         let secret = get_meta(&self.db, META_DEVICE_SECRET)?.context("device secret missing")?;
         let profile = get_meta(&self.db, META_PROFILE)?.context("profile missing")?;
+        let olm_account = get_meta(&self.db, META_OLM_ACCOUNT)?.context("olm account missing")?;
         let secret: [u8; 32] = secret.try_into().ok().context("device secret corrupt")?;
         Ok(Some(StoredIdentity {
             seed_phrase: String::from_utf8(phrase)?,
             device_secret: SecretKey::from_bytes(&secret),
             profile: wire::decode(&profile)?,
+            olm_account: String::from_utf8(olm_account)?,
         }))
     }
 
@@ -184,6 +202,39 @@ impl Store {
             )
             .optional()?;
         Ok(key.and_then(|key| key.try_into().ok()))
+    }
+
+    pub fn device_cert(&self, device_id: &EndpointId) -> Result<Option<DeviceCert>> {
+        let cert: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT cert FROM devices WHERE device_id = ?1",
+                params![device_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        cert.map(|cert| Ok(wire::decode(&cert)?)).transpose()
+    }
+
+    // ── olm sessions ────────────────────────────────────────────────────────
+
+    pub fn session_pickle(&self, device_id: &EndpointId) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT pickle FROM olm_sessions WHERE device_id = ?1",
+                params![device_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_session(&self, device_id: &EndpointId, pickle: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO olm_sessions (device_id, pickle) VALUES (?1, ?2)",
+            params![device_id.as_bytes().as_slice(), pickle],
+        )?;
+        Ok(())
     }
 
     pub fn devices_of(&self, user_key: &UserKey) -> Result<Vec<EndpointId>> {
@@ -380,7 +431,7 @@ mod tests {
         let identity = UserIdentity::generate();
         Profile {
             display_name: name.into(),
-            device_cert: identity.certify_device(SecretKey::generate().public(), 1),
+            device_cert: identity.certify_device(SecretKey::generate().public(), [3; 32], 1),
         }
     }
 
@@ -401,6 +452,11 @@ mod tests {
         let bob = profile("bob");
         let contact = store.upsert_contact(&bob, Trust::Verified, 0).unwrap();
         assert_eq!(store.contact_for_device(&bob.device_cert.device_id).unwrap(), Some(contact.user_key));
+
+        let device = bob.device_cert.device_id;
+        assert_eq!(store.device_cert(&device).unwrap(), Some(bob.device_cert.clone()));
+        store.save_session(&device, "pickle").unwrap();
+        assert_eq!(store.session_pickle(&device).unwrap().as_deref(), Some("pickle"));
 
         let message = ChatMessage { id: [3; 16], sent_at_ms: 100, body: Body::Text("hi".into()) };
         assert!(store.insert_incoming(&contact.user_key, &message, 101).unwrap());

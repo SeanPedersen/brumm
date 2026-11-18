@@ -8,8 +8,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::OlmIdentityKey;
+
 const USER_KEY_CONTEXT: &str = "brumm 2026 user identity key v1";
-const DEVICE_CERT_DOMAIN: &[u8] = b"brumm/device-cert/v1";
+const DEVICE_CERT_DOMAIN: &[u8] = b"brumm/device-cert/v2";
 const SEED_ENTROPY_BYTES: usize = 32;
 const FINGERPRINT_BYTES: usize = 10;
 const FINGERPRINT_GROUP_CHARS: usize = 4;
@@ -52,36 +54,38 @@ impl UserIdentity {
         self.mnemonic.to_string()
     }
 
-    pub fn certify_device(&self, device_id: EndpointId, issued_at_ms: u64) -> DeviceCert {
-        let user_key = self.public();
-        let signature = self
-            .signing_key
-            .sign(&DeviceCert::signed_bytes(&user_key, &device_id, issued_at_ms));
-        DeviceCert {
-            user_key,
+    pub fn certify_device(&self, device_id: EndpointId, olm_identity_key: OlmIdentityKey, issued_at_ms: u64) -> DeviceCert {
+        let mut cert = DeviceCert {
+            user_key: self.public(),
             device_id,
+            olm_identity_key,
             issued_at_ms,
-            signature,
-        }
+            signature: Signature::from_bytes(&[0; Signature::BYTE_SIZE]),
+        };
+        cert.signature = self.signing_key.sign(&cert.signed_bytes());
+        cert
     }
 }
 
-/// Statement "device `device_id` belongs to user `user_key`", signed by the user key.
+/// Statement "device `device_id` with Olm identity `olm_identity_key` belongs to user
+/// `user_key`", signed by the user key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCert {
     pub user_key: UserKey,
     pub device_id: EndpointId,
+    pub olm_identity_key: OlmIdentityKey,
     pub issued_at_ms: u64,
     pub signature: Signature,
 }
 
 impl DeviceCert {
-    fn signed_bytes(user_key: &UserKey, device_id: &EndpointId, issued_at_ms: u64) -> Vec<u8> {
+    fn signed_bytes(&self) -> Vec<u8> {
         [
             DEVICE_CERT_DOMAIN,
-            user_key,
-            device_id.as_bytes(),
-            &issued_at_ms.to_le_bytes(),
+            &self.user_key,
+            self.device_id.as_bytes(),
+            &self.olm_identity_key,
+            &self.issued_at_ms.to_le_bytes(),
         ]
         .concat()
     }
@@ -90,8 +94,7 @@ impl DeviceCert {
         let Ok(key) = VerifyingKey::from_bytes(&self.user_key) else {
             return false;
         };
-        let message = Self::signed_bytes(&self.user_key, &self.device_id, self.issued_at_ms);
-        key.verify_strict(&message, &self.signature).is_ok()
+        key.verify_strict(&self.signed_bytes(), &self.signature).is_ok()
     }
 }
 
@@ -153,9 +156,12 @@ mod tests {
     fn device_cert_verifies_and_detects_tampering() {
         let identity = UserIdentity::generate();
         let device = iroh::SecretKey::generate().public();
-        let mut cert = identity.certify_device(device, 42);
+        let mut cert = identity.certify_device(device, [3; 32], 42);
         assert!(cert.verify());
         cert.issued_at_ms += 1;
+        assert!(!cert.verify());
+        cert.issued_at_ms -= 1;
+        cert.olm_identity_key = [4; 32];
         assert!(!cert.verify());
     }
 
@@ -166,7 +172,7 @@ mod tests {
         let other_device = iroh::SecretKey::generate().public();
         let profile = Profile {
             display_name: "alice".into(),
-            device_cert: identity.certify_device(device, 1),
+            device_cert: identity.certify_device(device, [3; 32], 1),
         };
         assert!(profile.is_valid_for(device));
         assert!(!profile.is_valid_for(other_device));

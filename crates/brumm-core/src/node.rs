@@ -1,21 +1,24 @@
-//! The node actor: single owner of the store and the transport. It serializes UI commands,
-//! inbound peer frames and results of background network tasks into one loop, so state
-//! changes never race.
+//! The node actor: single owner of the store, the E2EE state and the transport. It
+//! serializes UI commands, inbound peer frames and results of background network tasks into
+//! one loop, so state changes (including Olm ratchets) never race.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use iroh::SecretKey;
+use iroh::{EndpointId, SecretKey};
 use tokio::sync::mpsc;
+use vodozemac::olm::Session;
 
 use crate::{
     api::{Command, DeliveryStatus, Direction, Event, EventSink, MessageView, ProfileView, Trust},
     clock::now_ms,
+    crypto::{self, Sealed},
+    e2ee::DeviceCrypto,
     identity::{Profile, UserIdentity, UserKey, fingerprint, normalize_display_name},
     invite::Invite,
     store::{Store, StoredIdentity},
     transport::{InboundRequest, Transport},
-    wire::{Body, ChatMessage, Frame, MessageId, RejectReason, Reply},
+    wire::{self, Body, ChatMessage, Frame, MessageId, Payload, RejectReason, Reply},
 };
 
 const DATABASE_FILE: &str = "brumm.db";
@@ -60,24 +63,27 @@ pub async fn run(config: NodeConfig, mut commands: mpsc::UnboundedReceiver<Comma
     node.shutdown().await;
 }
 
-/// Identity + network, available once the user has created or restored an identity.
-struct Session {
+/// Own identity, keys and network; exists once the user created or restored an identity.
+struct Me {
     user: UserIdentity,
     profile: Profile,
+    crypto: DeviceCrypto,
     transport: Arc<Transport>,
 }
 
 /// Results of network work spawned off the actor loop.
 enum Outcome {
-    HelloFinished { invite: Invite, reply: Result<Reply> },
+    HelloFinished { invite: Box<Invite>, reply: Result<Reply> },
     DeliveryFinished { contact: UserKey, id: MessageId, reply: Result<Reply> },
 }
 
 struct Node {
     store: Store,
     events: EventSink,
-    session: Option<Session>,
-    in_flight: std::collections::HashSet<MessageId>,
+    me: Option<Me>,
+    /// Outbound sessions created from invites, waiting for the inviter's `HelloAck`.
+    pending_hellos: HashMap<EndpointId, Session>,
+    in_flight: HashSet<MessageId>,
     inbound_tx: mpsc::Sender<InboundRequest>,
     inbound_rx: mpsc::Receiver<InboundRequest>,
     outcomes_tx: mpsc::UnboundedSender<Outcome>,
@@ -93,8 +99,9 @@ impl Node {
         Ok(Self {
             store,
             events,
-            session: None,
-            in_flight: Default::default(),
+            me: None,
+            pending_hellos: HashMap::new(),
+            in_flight: HashSet::new(),
             inbound_tx,
             inbound_rx,
             outcomes_tx,
@@ -104,33 +111,34 @@ impl Node {
 
     async fn start(&mut self) {
         let result = async {
-            if let Some(stored) = self.store.load_identity()? {
-                let user = UserIdentity::from_phrase(&stored.seed_phrase)?;
-                self.start_session(user, stored.profile, stored.device_secret).await?;
-            }
-            anyhow::Ok(())
+            let Some(stored) = self.store.load_identity()? else {
+                return anyhow::Ok(());
+            };
+            let user = UserIdentity::from_phrase(&stored.seed_phrase)?;
+            let crypto = DeviceCrypto::load(&stored.olm_account, &stored.device_secret.to_bytes())?;
+            self.go_online(user, stored.profile, crypto, stored.device_secret).await
         }
         .await;
         self.report(result);
         let contacts = self.store.contacts().unwrap_or_default();
-        let profile = self.session.as_ref().map(|session| profile_view(&session.profile));
+        let profile = self.me.as_ref().map(|me| profile_view(&me.profile));
         self.events.emit(Event::Ready { profile, contacts });
     }
 
-    async fn start_session(&mut self, user: UserIdentity, profile: Profile, device_secret: SecretKey) -> Result<()> {
+    async fn go_online(&mut self, user: UserIdentity, profile: Profile, crypto: DeviceCrypto, device_secret: SecretKey) -> Result<()> {
         let transport = Transport::bind(device_secret, self.inbound_tx.clone()).await?;
-        self.session = Some(Session {
+        self.me = Some(Me {
             user,
             profile,
+            crypto,
             transport: Arc::new(transport),
         });
         Ok(())
     }
 
     async fn shutdown(self) {
-        let Some(session) = self.session else { return };
-        drop(session.user);
-        match Arc::try_unwrap(session.transport) {
+        let Some(me) = self.me else { return };
+        match Arc::try_unwrap(me.transport) {
             Ok(transport) => transport.shutdown().await,
             Err(_) => tracing::debug!("transport still in use by a background task at shutdown"),
         }
@@ -143,8 +151,8 @@ impl Node {
         }
     }
 
-    fn session(&self) -> Result<&Session> {
-        self.session.as_ref().context("create an identity first")
+    fn me(&self) -> Result<&Me> {
+        self.me.as_ref().context("create an identity first")
     }
 
     // ── commands ────────────────────────────────────────────────────────────
@@ -170,56 +178,64 @@ impl Node {
     }
 
     async fn create_identity(&mut self, user: UserIdentity, display_name: &str) -> Result<()> {
-        if self.session.is_some() {
+        if self.me.is_some() {
             bail!("an identity already exists on this device");
         }
         let display_name = normalize_display_name(display_name).context("display name is empty or invalid")?;
         let device_secret = SecretKey::generate();
+        let crypto = DeviceCrypto::generate(&device_secret.to_bytes());
         let profile = Profile {
             display_name,
-            device_cert: user.certify_device(device_secret.public(), now_ms()),
+            device_cert: user.certify_device(device_secret.public(), crypto.identity_key(), now_ms()),
         };
         let seed_phrase = user.phrase();
         self.store.save_identity(&StoredIdentity {
             seed_phrase: seed_phrase.clone(),
             device_secret: device_secret.clone(),
             profile: profile.clone(),
+            olm_account: crypto.account_pickle(),
         })?;
         let view = profile_view(&profile);
-        self.start_session(user, profile, device_secret).await?;
+        self.go_online(user, profile, crypto, device_secret).await?;
         self.events.emit(Event::IdentityCreated { profile: view, seed_phrase });
         Ok(())
     }
 
-    fn create_invite(&self) -> Result<()> {
-        let session = self.session()?;
+    fn create_invite(&mut self) -> Result<()> {
         let secret: [u8; 16] = rand::random();
-        self.store.add_invite(&secret, now_ms())?;
-        let transport = session.transport.clone();
-        let profile = session.profile.clone();
-        let events = self.events.clone();
+        let Self { store, me, events, .. } = self;
+        let me = me.as_mut().context("create an identity first")?;
+        let one_time_key = me.crypto.new_one_time_key(store)?;
+        store.add_invite(&secret, now_ms())?;
+        let transport = me.transport.clone();
+        let profile = me.profile.clone();
+        let events = events.clone();
         tokio::spawn(async move {
-            let invite = Invite::new(profile, transport.addr().await, secret);
+            let invite = Invite::new(profile, transport.addr().await, secret, one_time_key);
             events.emit(Event::InviteCreated { link: invite.to_link() });
         });
         Ok(())
     }
 
-    fn accept_invite(&self, link: &str) -> Result<()> {
-        let session = self.session()?;
+    fn accept_invite(&mut self, link: &str) -> Result<()> {
         let invite = Invite::from_link(link)?;
-        if invite.profile.user_key() == session.user.public() {
+        let me = self.me()?;
+        if invite.profile.user_key() == me.user.public() {
             bail!("that is your own invite");
         }
+        let mut session = me
+            .crypto
+            .start_outbound(&invite.profile.device_cert.olm_identity_key, &invite.one_time_key)?;
         let frame = Frame::Hello {
             invite_secret: invite.secret,
-            profile: session.profile.clone(),
+            sealed: crypto::seal(&mut session, &wire::encode(&me.profile))?,
         };
-        let transport = session.transport.clone();
+        let transport = me.transport.clone();
+        self.pending_hellos.insert(invite.device_addr.id, session);
         let outcomes = self.outcomes_tx.clone();
         tokio::spawn(async move {
             let reply = transport.request(invite.device_addr.clone(), &frame).await;
-            let _ = outcomes.send(Outcome::HelloFinished { invite, reply });
+            let _ = outcomes.send(Outcome::HelloFinished { invite: Box::new(invite), reply });
         });
         Ok(())
     }
@@ -244,29 +260,33 @@ impl Node {
         self.deliver(contact, message)
     }
 
-    /// Spawns delivery to every known device of the contact (one device per contact in M1).
+    /// Encrypts for and spawns delivery to the contact's device (one device per contact until
+    /// multi-device). Re-encrypts on every attempt; receivers deduplicate by message id.
     fn deliver(&mut self, contact: UserKey, message: ChatMessage) -> Result<()> {
-        if !self.in_flight.insert(message.id) {
+        if self.in_flight.contains(&message.id) {
             return Ok(());
         }
-        let session = self.session()?;
         let device = *self
             .store
             .devices_of(&contact)?
             .first()
             .context("contact has no known device")?;
-        let transport = session.transport.clone();
+        let Self { store, me, .. } = self;
+        let me = me.as_mut().context("create an identity first")?;
+        let sealed = me.crypto.seal(store, &device, &wire::encode(&Payload::Chat(message.clone())))?;
+        let transport = me.transport.clone();
         let outcomes = self.outcomes_tx.clone();
+        let id = message.id;
+        self.in_flight.insert(id);
         tokio::spawn(async move {
-            let id = message.id;
-            let reply = transport.request(device, &Frame::Message(message)).await;
+            let reply = transport.request(device, &Frame::Sealed(sealed)).await;
             let _ = outcomes.send(Outcome::DeliveryFinished { contact, id, reply });
         });
         Ok(())
     }
 
     fn retry_pending(&mut self) -> Result<()> {
-        if self.session.is_none() {
+        if self.me.is_none() {
             return Ok(());
         }
         for (contact, message) in self.store.pending_outgoing()? {
@@ -312,26 +332,33 @@ impl Node {
         }
     }
 
-    fn finish_hello(&self, invite: Invite, reply: Result<Reply>) -> Result<()> {
+    fn finish_hello(&mut self, invite: Box<Invite>, reply: Result<Reply>) -> Result<()> {
+        let device = invite.device_addr.id;
+        let mut session = self.pending_hellos.remove(&device).context("no pending invite for this device")?;
         let reply = reply.context("could not reach the inviter — are they online?")?;
-        let profile = match reply {
-            Reply::HelloAck { profile } => profile,
+        let sealed = match reply {
+            Reply::HelloAck { sealed } => sealed,
             Reply::Rejected(RejectReason::UnknownInvite) => bail!("invite was already used or has expired"),
             other => bail!("inviter refused the connection: {other:?}"),
         };
+        let profile: Profile = wire::decode(&crypto::open(&mut session, &sealed)?)?;
         let matches_invite = profile.user_key() == invite.profile.user_key()
-            && profile.is_valid_for(invite.device_addr.id);
+            && profile.device_cert.olm_identity_key == invite.profile.device_cert.olm_identity_key
+            && profile.is_valid_for(device);
         if !matches_invite {
             bail!("inviter answered with a different identity");
         }
-        let contact = self.store.upsert_contact(&profile, Trust::Verified, now_ms())?;
-        self.events.emit(Event::ContactAdded(contact));
+        let Self { store, me, events, .. } = self;
+        let me = me.as_mut().context("no identity")?;
+        let contact = store.upsert_contact(&profile, Trust::Verified, now_ms())?;
+        me.crypto.adopt(store, device, session)?;
+        events.emit(Event::ContactAdded(contact));
         Ok(())
     }
 
     // ── inbound frames ──────────────────────────────────────────────────────
 
-    fn handle_inbound(&self, request: InboundRequest) {
+    fn handle_inbound(&mut self, request: InboundRequest) {
         let reply = match self.process_inbound(request.from, request.frame) {
             Ok(reply) => reply,
             Err(err) => {
@@ -342,38 +369,54 @@ impl Node {
         let _ = request.reply.send(reply);
     }
 
-    fn process_inbound(&self, from: iroh::EndpointId, frame: Frame) -> Result<Reply> {
-        let session = self.session()?;
+    fn process_inbound(&mut self, from: EndpointId, frame: Frame) -> Result<Reply> {
         match frame {
-            Frame::Hello { invite_secret, profile } => {
-                if !profile.is_valid_for(from) {
-                    return Ok(Reply::Rejected(RejectReason::InvalidProfile));
-                }
-                if !self.store.take_invite(&invite_secret, now_ms())? {
-                    return Ok(Reply::Rejected(RejectReason::UnknownInvite));
-                }
-                let contact = self.store.upsert_contact(&profile, Trust::Verified, now_ms())?;
-                self.events.emit(Event::ContactAdded(contact));
-                Ok(Reply::HelloAck { profile: session.profile.clone() })
-            }
-            Frame::Message(message) => {
-                let Some(contact) = self.store.contact_for_device(&from)? else {
-                    return Ok(Reply::Rejected(RejectReason::UnknownSender));
-                };
-                if !message.body.is_valid() {
-                    return Ok(Reply::Rejected(RejectReason::InvalidMessage));
-                }
-                if self.store.insert_incoming(&contact, &message, now_ms())? {
-                    self.events.emit(Event::MessageAdded(message_view(
-                        contact,
-                        &message,
-                        Direction::Incoming,
-                        DeliveryStatus::Delivered,
-                    )));
-                }
-                Ok(Reply::Ack { id: message.id })
-            }
+            Frame::Hello { invite_secret, sealed } => self.accept_hello(from, invite_secret, &sealed),
+            Frame::Sealed(sealed) => self.receive_sealed(from, &sealed),
         }
+    }
+
+    fn accept_hello(&mut self, from: EndpointId, invite_secret: wire::InviteSecret, sealed: &Sealed) -> Result<Reply> {
+        let Self { store, me, events, .. } = self;
+        let me = me.as_mut().context("no identity")?;
+        if sealed.pre_key_sender().is_none() {
+            return Ok(Reply::Rejected(RejectReason::InvalidProfile));
+        }
+        if !store.take_invite(&invite_secret, now_ms())? {
+            return Ok(Reply::Rejected(RejectReason::UnknownInvite));
+        }
+        let (mut session, plaintext, sender_identity) = me.crypto.accept_inbound(store, sealed)?;
+        let profile: Profile = wire::decode(&plaintext)?;
+        if !profile.is_valid_for(from) || profile.device_cert.olm_identity_key != sender_identity {
+            return Ok(Reply::Rejected(RejectReason::InvalidProfile));
+        }
+        let contact = store.upsert_contact(&profile, Trust::Verified, now_ms())?;
+        let ack = crypto::seal(&mut session, &wire::encode(&me.profile))?;
+        me.crypto.adopt(store, from, session)?;
+        events.emit(Event::ContactAdded(contact));
+        Ok(Reply::HelloAck { sealed: ack })
+    }
+
+    fn receive_sealed(&mut self, from: EndpointId, sealed: &Sealed) -> Result<Reply> {
+        let Self { store, me, events, .. } = self;
+        let me = me.as_mut().context("no identity")?;
+        let (Some(contact), Some(cert)) = (store.contact_for_device(&from)?, store.device_cert(&from)?) else {
+            return Ok(Reply::Rejected(RejectReason::UnknownSender));
+        };
+        let plaintext = me.crypto.open(store, &from, &cert.olm_identity_key, sealed)?;
+        let Payload::Chat(message) = wire::decode(&plaintext)?;
+        if !message.body.is_valid() {
+            return Ok(Reply::Rejected(RejectReason::InvalidMessage));
+        }
+        if store.insert_incoming(&contact, &message, now_ms())? {
+            events.emit(Event::MessageAdded(message_view(
+                contact,
+                &message,
+                Direction::Incoming,
+                DeliveryStatus::Delivered,
+            )));
+        }
+        Ok(Reply::Ack { id: message.id })
     }
 }
 
