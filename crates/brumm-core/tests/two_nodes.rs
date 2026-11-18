@@ -19,13 +19,13 @@ async fn invite_then_chat() {
     assert_eq!((contact.user_key, contact.display_name.as_str()), (alice_key, "Alice"));
     assert_eq!(alice.contact_added().await.user_key, bob_key);
 
-    bob.send(Command::SendText { contact: alice_key, text: "hi alice".into() });
+    let to_alice = bob.send_text(alice_key, "hi alice").await;
     assert_eq!(alice.received_text().await, "hi alice");
-    bob.delivered().await;
+    bob.delivered(to_alice).await;
 
-    alice.send(Command::SendText { contact: bob_key, text: "hi bob".into() });
+    let to_bob = alice.send_text(bob_key, "hi bob").await;
     assert_eq!(bob.received_text().await, "hi bob");
-    alice.delivered().await;
+    alice.delivered(to_bob).await;
 
     bob.send(Command::AcceptInvite { link });
     let error = bob.expect_error().await;

@@ -27,7 +27,7 @@ impl CoreBridge {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                runtime.block_on(node::run(NodeConfig { data_dir }, command_rx, sink));
+                runtime.block_on(node::run(NodeConfig::new(data_dir), command_rx, sink));
             })
             .expect("spawn core thread");
         Self {

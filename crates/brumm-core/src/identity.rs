@@ -1,17 +1,24 @@
-//! Identity layer: a user key derived from a BIP-39 seed phrase, per-device iroh keys and
-//! device certificates that bind a device (`EndpointId`) to its user.
+//! Identity layer: a user key derived from a BIP-39 seed phrase, per-device iroh keys,
+//! device certificates and the signed, versioned device list of a user (SPEC.md §3).
 //!
 //! The user key is the stable identity contacts know; device keys are what iroh dials.
+//! A user's devices are exactly those in the device list with the highest `seq`.
 
 use bip39::Mnemonic;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::OlmIdentityKey;
+use crate::{
+    crypto::{OlmIdentityKey, OneTimeKey},
+    mailbox::MailboxAddress,
+};
 
 const USER_KEY_CONTEXT: &str = "brumm 2026 user identity key v1";
 const DEVICE_CERT_DOMAIN: &[u8] = b"brumm/device-cert/v2";
+const DEVICE_LIST_DOMAIN: &[u8] = b"brumm/device-list/v1";
+pub const MAX_DEVICES: usize = 8;
+pub const MAX_DEVICE_LABEL_CHARS: usize = 32;
 const SEED_ENTROPY_BYTES: usize = 32;
 const FINGERPRINT_BYTES: usize = 10;
 const FINGERPRINT_GROUP_CHARS: usize = 4;
@@ -65,6 +72,17 @@ impl UserIdentity {
         cert.signature = self.signing_key.sign(&cert.signed_bytes());
         cert
     }
+
+    pub fn sign_device_list(&self, seq: u64, entries: Vec<DeviceEntry>) -> DeviceList {
+        let mut list = DeviceList {
+            user_key: self.public(),
+            seq,
+            entries,
+            signature: Signature::from_bytes(&[0; Signature::BYTE_SIZE]),
+        };
+        list.signature = self.signing_key.sign(&list.signed_bytes());
+        list
+    }
 }
 
 /// Statement "device `device_id` with Olm identity `olm_identity_key` belongs to user
@@ -98,23 +116,95 @@ impl DeviceCert {
     }
 }
 
+/// One device in a [`DeviceList`]: its cert, the Olm fallback key others use to open a
+/// session without a one-time key, its Nostr mailbox and a human label ("Linux", "Phone").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub cert: DeviceCert,
+    pub fallback_key: OneTimeKey,
+    pub mailbox: MailboxAddress,
+    pub label: String,
+}
+
+impl DeviceEntry {
+    pub fn device_id(&self) -> EndpointId {
+        self.cert.device_id
+    }
+}
+
+/// All devices of a user, signed by the user key. Higher `seq` supersedes lower.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceList {
+    pub user_key: UserKey,
+    pub seq: u64,
+    pub entries: Vec<DeviceEntry>,
+    pub signature: Signature,
+}
+
+impl DeviceList {
+    fn signed_bytes(&self) -> Vec<u8> {
+        [
+            DEVICE_LIST_DOMAIN,
+            &self.user_key,
+            &self.seq.to_le_bytes(),
+            &crate::wire::encode(&self.entries),
+        ]
+        .concat()
+    }
+
+    pub fn verify(&self) -> bool {
+        let Ok(key) = VerifyingKey::from_bytes(&self.user_key) else {
+            return false;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let entries_valid = self.entries.iter().all(|entry| {
+            entry.cert.user_key == self.user_key
+                && entry.cert.verify()
+                && entry.label.chars().count() <= MAX_DEVICE_LABEL_CHARS
+                && entry.mailbox.is_valid()
+                && seen.insert(entry.device_id())
+        });
+        !self.entries.is_empty()
+            && self.entries.len() <= MAX_DEVICES
+            && entries_valid
+            && key.verify_strict(&self.signed_bytes(), &self.signature).is_ok()
+    }
+
+    pub fn entry(&self, device_id: &EndpointId) -> Option<&DeviceEntry> {
+        self.entries.iter().find(|entry| &entry.device_id() == device_id)
+    }
+}
+
 /// What a device presents about its user to a peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub display_name: String,
-    pub device_cert: DeviceCert,
+    pub devices: DeviceList,
 }
 
 impl Profile {
     pub fn user_key(&self) -> UserKey {
-        self.device_cert.user_key
+        self.devices.user_key
     }
 
-    /// Valid iff the cert is correctly signed and names the device we are actually talking to.
+    /// Valid iff the device list is correctly signed and contains the device we talk to.
     pub fn is_valid_for(&self, remote_device: EndpointId) -> bool {
-        self.device_cert.device_id == remote_device
-            && self.device_cert.verify()
-            && is_valid_display_name(&self.display_name)
+        is_valid_display_name(&self.display_name)
+            && self.devices.verify()
+            && self.devices.entry(&remote_device).is_some()
+    }
+}
+
+/// Default label for this device, e.g. "Linux".
+pub fn default_device_label() -> String {
+    let os = std::env::consts::OS;
+    let mut label: String = os.chars().take(MAX_DEVICE_LABEL_CHARS).collect();
+    if let Some(first) = label.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    match label.as_str() {
+        "Macos" => "macOS".to_owned(),
+        _ => label,
     }
 }
 
@@ -142,7 +232,7 @@ pub fn fingerprint(user_key: &UserKey) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -165,6 +255,15 @@ mod tests {
         assert!(!cert.verify());
     }
 
+    pub(crate) fn entry(identity: &UserIdentity, device: EndpointId) -> DeviceEntry {
+        DeviceEntry {
+            cert: identity.certify_device(device, [3; 32], 1),
+            fallback_key: [4; 32],
+            mailbox: crate::mailbox::address(&[5; 32], crate::mailbox::default_relays()),
+            label: "Linux".into(),
+        }
+    }
+
     #[test]
     fn profile_rejects_foreign_device() {
         let identity = UserIdentity::generate();
@@ -172,10 +271,27 @@ mod tests {
         let other_device = iroh::SecretKey::generate().public();
         let profile = Profile {
             display_name: "alice".into(),
-            device_cert: identity.certify_device(device, [3; 32], 1),
+            devices: identity.sign_device_list(1, vec![entry(&identity, device)]),
         };
         assert!(profile.is_valid_for(device));
         assert!(!profile.is_valid_for(other_device));
+    }
+
+    #[test]
+    fn device_list_rejects_tampering_and_foreign_certs() {
+        let alice = UserIdentity::generate();
+        let mallory = UserIdentity::generate();
+        let device = iroh::SecretKey::generate().public();
+        let mut list = alice.sign_device_list(3, vec![entry(&alice, device)]);
+        assert!(list.verify());
+        list.seq = 4;
+        assert!(!list.verify());
+
+        let foreign = mallory.sign_device_list(1, vec![entry(&alice, device)]);
+        assert!(!foreign.verify());
+
+        let duplicate = alice.sign_device_list(1, vec![entry(&alice, device), entry(&alice, device)]);
+        assert!(!duplicate.verify());
     }
 
     #[test]

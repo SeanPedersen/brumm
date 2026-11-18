@@ -91,6 +91,20 @@ impl OlmDevice {
         self.account.curve25519_key().to_bytes()
     }
 
+    /// Generates a new fallback key (reusable; lets peers open sessions without a one-time key).
+    /// Persist the account afterwards.
+    pub fn rotate_fallback_key(&mut self) -> OneTimeKey {
+        self.account.generate_fallback_key();
+        let key = *self
+            .account
+            .fallback_key()
+            .values()
+            .next()
+            .expect("a fallback key was just generated");
+        self.account.mark_keys_as_published();
+        key.to_bytes()
+    }
+
     /// Generates a one-time key to hand out (e.g. in an invite). Persist the account afterwards.
     pub fn new_one_time_key(&mut self) -> OneTimeKey {
         let generated = self.account.generate_one_time_keys(ONE_TIME_KEYS_PER_INVITE);
@@ -131,6 +145,10 @@ pub fn seal(session: &mut Session, plaintext: &[u8]) -> Result<Sealed, CryptoErr
 
 pub fn open(session: &mut Session, sealed: &Sealed) -> Result<Vec<u8>, CryptoError> {
     Ok(session.decrypt(&sealed.to_olm()?)?)
+}
+
+pub fn session_id(session: &Session) -> String {
+    session.session_id()
 }
 
 pub fn pickle_session(session: &Session, key: &PickleKey) -> String {
@@ -177,6 +195,18 @@ mod tests {
         let replay = seal(&mut bob.outbound_session(&alice.identity_key(), &one_time_key).unwrap(), b"2").unwrap();
         alice.inbound_session(&bob.identity_key(), &hello).unwrap();
         assert!(alice.inbound_session(&bob.identity_key(), &replay).is_err());
+    }
+
+    #[test]
+    fn fallback_key_opens_sessions_repeatedly() {
+        let mut alice = OlmDevice::generate();
+        let fallback = alice.rotate_fallback_key();
+        for _ in 0..2 {
+            let bob = OlmDevice::generate();
+            let hello = seal(&mut bob.outbound_session(&alice.identity_key(), &fallback).unwrap(), b"hey").unwrap();
+            let (_, plaintext) = alice.inbound_session(&bob.identity_key(), &hello).unwrap();
+            assert_eq!(plaintext, b"hey");
+        }
     }
 
     #[test]

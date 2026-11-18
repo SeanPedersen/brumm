@@ -18,6 +18,8 @@ rusqlite = { version = "0.43.0", features = ["bundled"] }
 ed25519-dalek = { version = "3.0.0", features = ["serde"] }
 bip39 = "3.0.0"
 vodozemac = "0.11.2"
+nostr-sdk = "0.45.6"
+nostr = { version = "0.45.7", features = ["nip44", "os-rng"] }
 rand = "0.10.4"
 blake3 = "1.8.7"
 data-encoding = "2.11.1"

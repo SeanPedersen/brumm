@@ -8,6 +8,8 @@ pub mod crypto;
 mod e2ee;
 pub mod identity;
 pub mod invite;
+pub mod link;
+pub mod mailbox;
 pub mod node;
 mod store;
 mod transport;

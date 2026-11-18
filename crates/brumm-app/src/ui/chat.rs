@@ -86,7 +86,8 @@ fn status_marker(message: &MessageView) -> &'static str {
     }
     match message.status {
         DeliveryStatus::Pending => "🕓",
-        DeliveryStatus::Delivered => "✔",
+        DeliveryStatus::Sent => "✔",
+        DeliveryStatus::Delivered => "✔✔",
         DeliveryStatus::Failed => "⚠ not delivered",
     }
 }

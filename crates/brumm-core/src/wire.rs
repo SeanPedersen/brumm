@@ -1,40 +1,42 @@
-//! Wire protocol `brumm/2`: request/response frames exchanged over one QUIC bi-stream each,
-//! serialized with postcard. Everything except acks and invite secrets travels inside Olm
-//! ciphertext ([`Sealed`]). See SPEC.md §6.1.
+//! Wire protocol `brumm/3`: request/response frames exchanged over one QUIC bi-stream each,
+//! serialized with postcard. Everything except acks and one-time secrets travels inside Olm
+//! ciphertext ([`Sealed`]); the plaintext of `Frame::Sealed` is an [`Envelope`]. SPEC.md §6.1.
 
+use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::crypto::Sealed;
+use crate::{
+    crypto::Sealed,
+    identity::{DeviceList, Profile, UserKey},
+};
 
-pub const ALPN: &[u8] = b"brumm/2";
+pub const ALPN: &[u8] = b"brumm/3";
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Plaintext budget per history chunk, leaving room for Olm + framing overhead.
+pub const HISTORY_CHUNK_BYTES: usize = 32 * 1024;
 
 pub type MessageId = [u8; 16];
+pub type EnvelopeId = [u8; 16];
 pub type InviteSecret = [u8; 16];
+pub type LinkSecret = [u8; 16];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Frame {
-    /// Pre-key message opening the session; plaintext is the sender's `Profile`.
-    Hello {
-        invite_secret: InviteSecret,
-        sealed: Sealed,
-    },
-    /// Plaintext is a [`Payload`].
+    /// Pre-key message opening a contact session; plaintext is the sender's [`Profile`].
+    Hello { invite_secret: InviteSecret, sealed: Sealed },
+    /// Pre-key message to a device being linked; plaintext is a [`crate::link::LinkBundle`].
+    Link { link_secret: LinkSecret, sealed: Sealed },
+    /// Plaintext is an [`Envelope`].
     Sealed(Sealed),
-}
-
-/// Plaintext inside [`Frame::Sealed`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Payload {
-    Chat(ChatMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Reply {
-    /// Plaintext is the responder's `Profile`.
+    /// Plaintext is the responder's [`Profile`].
     HelloAck { sealed: Sealed },
-    Ack { id: MessageId },
+    /// Acknowledges an envelope (or a link, with the link secret as id).
+    Ack { id: EnvelopeId },
     Rejected(RejectReason),
 }
 
@@ -44,6 +46,29 @@ pub enum RejectReason {
     InvalidProfile,
     UnknownSender,
     InvalidMessage,
+}
+
+/// Unit of reliable delivery to one device; acked by `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub id: EnvelopeId,
+    pub payload: Payload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Payload {
+    /// A message from the sender's user to the recipient's user.
+    Chat(ChatMessage),
+    /// Own-device sync: "I sent `message` to `contact`".
+    SentTranscript { contact: UserKey, message: ChatMessage },
+    /// The sender's user published a new device list.
+    DeviceList(DeviceList),
+    /// Own-device sync: a contact was added or updated.
+    ContactSync(ContactRecord),
+    /// Own-device sync: a chunk of message history for a freshly linked device.
+    History(Vec<HistoryItem>),
+    /// "I processed these envelopes" — the ack for envelopes that arrived via the mailbox.
+    Receipt(Vec<EnvelopeId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,10 +91,82 @@ impl Body {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRecord {
+    pub profile: Profile,
+    pub added_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryItem {
+    pub contact: UserKey,
+    pub outgoing: bool,
+    pub message: ChatMessage,
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     postcard::to_stdvec(value).expect("in-memory serialization cannot fail")
 }
 
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
     postcard::from_bytes(bytes)
+}
+
+/// `<prefix><lowercase base32(postcard(value))>`, used for invite and link URIs / QR codes.
+pub fn to_uri<T: Serialize>(prefix: &str, value: &T) -> String {
+    format!("{prefix}{}", BASE32_NOPAD.encode(&encode(value)).to_ascii_lowercase())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UriError {
+    #[error("this is not the expected kind of brumm link")]
+    WrongPrefix,
+    #[error("link is corrupted")]
+    Malformed,
+}
+
+pub fn from_uri<T: DeserializeOwned>(prefix: &str, uri: &str) -> Result<T, UriError> {
+    let payload = uri.trim().strip_prefix(prefix).ok_or(UriError::WrongPrefix)?;
+    let bytes = BASE32_NOPAD
+        .decode(payload.to_ascii_uppercase().as_bytes())
+        .map_err(|_| UriError::Malformed)?;
+    decode(&bytes).map_err(|_| UriError::Malformed)
+}
+
+/// Splits history into chunks whose encoded size stays within [`HISTORY_CHUNK_BYTES`].
+pub fn chunk_history(items: Vec<HistoryItem>) -> Vec<Vec<HistoryItem>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0;
+    for item in items {
+        let item_bytes = encode(&item).len();
+        if !current.is_empty() && current_bytes + item_bytes > HISTORY_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += item_bytes;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_chunks_respect_budget() {
+        let item = |index: u8| HistoryItem {
+            contact: [index; 32],
+            outgoing: true,
+            message: ChatMessage { id: [index; 16], sent_at_ms: 1, body: Body::Text("x".repeat(10_000)) },
+        };
+        let chunks = chunk_history((0..10).map(item).collect());
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 10);
+        assert!(chunks.iter().all(|chunk| encode(chunk).len() <= HISTORY_CHUNK_BYTES + 16));
+    }
 }

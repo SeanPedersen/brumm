@@ -14,6 +14,8 @@ rusqlite.workspace = true
 ed25519-dalek.workspace = true
 bip39.workspace = true
 vodozemac.workspace = true
+nostr-sdk.workspace = true
+nostr.workspace = true
 rand.workspace = true
 blake3.workspace = true
 data-encoding.workspace = true
@@ -21,3 +23,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+nostr-sdk = { workspace = true, features = ["local-relay"] }

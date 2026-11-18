@@ -3,10 +3,12 @@
 
 pub mod add_contact;
 pub mod chat;
+pub mod devices;
 pub mod errors;
 pub mod main_screen;
 pub mod onboarding;
 pub mod qr;
+pub mod revoked;
 pub mod seed_phrase;
 pub mod sidebar;
 pub mod starting;
@@ -21,5 +23,6 @@ use brumm_core::identity::UserKey;
 pub struct ViewState {
     pub onboarding: onboarding::OnboardingView,
     pub add_contact: add_contact::AddContactView,
+    pub devices: devices::DevicesView,
     pub drafts: HashMap<UserKey, String>,
 }

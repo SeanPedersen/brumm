@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use brumm_core::{
-    api::{ContactView, Event, MessageView, ProfileView},
+    api::{ContactView, DeviceView, Event, MessageView, ProfileView},
     identity::UserKey,
 };
 
@@ -14,6 +14,7 @@ pub enum Phase {
     Starting,
     Onboarding,
     Main,
+    Revoked,
 }
 
 #[derive(Default)]
@@ -27,16 +28,23 @@ pub struct AppState {
     /// Shown once right after identity creation so the user can write it down.
     pub seed_phrase_to_show: Option<String>,
     pub invite_link: Option<String>,
+    /// Shown while this fresh device waits to be linked.
+    pub link_ticket: Option<String>,
+    pub devices: Vec<DeviceView>,
+    pub revoked: bool,
+    /// Conversations changed in bulk; the app reloads them from the core.
+    pub stale_conversations: Vec<UserKey>,
     pub connecting: bool,
     pub errors: Vec<String>,
 }
 
 impl AppState {
     pub fn phase(&self) -> Phase {
-        match (self.ready, &self.profile) {
-            (false, _) => Phase::Starting,
-            (true, None) => Phase::Onboarding,
-            (true, Some(_)) => Phase::Main,
+        match (self.ready, &self.profile, self.revoked) {
+            (false, _, _) => Phase::Starting,
+            (true, _, true) => Phase::Revoked,
+            (true, None, _) => Phase::Onboarding,
+            (true, Some(_), _) => Phase::Main,
         }
     }
 
@@ -49,6 +57,19 @@ impl AppState {
         self.unread.remove(&key);
     }
 
+    /// Adds or updates a contact; jumps to it only when the user just connected to it.
+    fn upsert_contact(&mut self, contact: ContactView) {
+        let key = contact.user_key;
+        match self.contacts.iter_mut().find(|known| known.user_key == key) {
+            Some(known) => *known = contact,
+            None => self.contacts.push(contact),
+        }
+        self.contacts.sort_by_key(|contact| contact.display_name.to_lowercase());
+        if std::mem::take(&mut self.connecting) {
+            self.select(key);
+        }
+    }
+
     pub fn apply(&mut self, event: Event) {
         match event {
             Event::Ready { profile, contacts } => {
@@ -58,19 +79,15 @@ impl AppState {
             }
             Event::IdentityCreated { profile, seed_phrase } => {
                 self.profile = Some(profile);
-                self.seed_phrase_to_show = Some(seed_phrase);
+                self.seed_phrase_to_show = seed_phrase;
+                self.link_ticket = None;
             }
+            Event::LinkTicket { link } => self.link_ticket = Some(link),
+            Event::Devices(devices) => self.devices = devices,
+            Event::DeviceRevoked => self.revoked = true,
             Event::InviteCreated { link } => self.invite_link = Some(link),
-            Event::ContactAdded(contact) => {
-                self.connecting = false;
-                let key = contact.user_key;
-                match self.contacts.iter_mut().find(|known| known.user_key == key) {
-                    Some(known) => *known = contact,
-                    None => self.contacts.push(contact),
-                }
-                self.contacts.sort_by_key(|contact| contact.display_name.to_lowercase());
-                self.select(key);
-            }
+            Event::ContactAdded(contact) => self.upsert_contact(contact),
+            Event::ConversationsChanged(contacts) => self.stale_conversations.extend(contacts),
             Event::Conversation { contact, messages } => {
                 self.conversations.insert(contact, messages);
             }

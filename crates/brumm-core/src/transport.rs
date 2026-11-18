@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::wire::{self, ALPN, Frame, MAX_FRAME_BYTES, Reply};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -84,7 +84,8 @@ impl Transport {
         self.connections.lock().expect("lock poisoned").remove(peer);
     }
 
-    pub async fn shutdown(self) {
+    /// Closes the endpoint; in-flight requests of background tasks fail promptly.
+    pub async fn shutdown(&self) {
         if let Err(err) = self.router.shutdown().await {
             tracing::warn!(?err, "router shutdown failed");
         }

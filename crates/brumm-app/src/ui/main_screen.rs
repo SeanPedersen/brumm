@@ -4,16 +4,17 @@ use brumm_core::api::Command;
 
 use crate::{
     state::AppState,
-    ui::{ViewState, add_contact, chat, seed_phrase, sidebar},
+    ui::{ViewState, add_contact, chat, devices, seed_phrase, sidebar},
 };
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut ViewState, commands: &mut Vec<Command>) {
-    sidebar::show(ui, state, &mut view.add_contact, commands);
+    sidebar::show(ui, state, view, commands);
     egui::CentralPanel::default().show(ui, |ui| match state.selected {
         Some(contact) => chat::show(ui, state, contact, view.drafts.entry(contact).or_default(), commands),
         None => empty_state(ui),
     });
     add_contact::show(ui, state, &mut view.add_contact, commands);
+    devices::show(ui, state, &mut view.devices, commands);
     seed_phrase::show(ui, state);
 }
 

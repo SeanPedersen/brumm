@@ -4,12 +4,12 @@ use brumm_core::api::Command;
 
 use crate::{
     state::AppState,
-    ui::{add_contact::AddContactView, theme},
+    ui::{ViewState, theme},
 };
 
 const SIDEBAR_WIDTH: f32 = 260.0;
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState, add_contact: &mut AddContactView, commands: &mut Vec<Command>) {
+pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut ViewState, commands: &mut Vec<Command>) {
     egui::Panel::left("contacts")
         .resizable(true)
         .default_size(SIDEBAR_WIDTH)
@@ -21,9 +21,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, add_contact: &mut AddContac
                     .on_hover_text("Your fingerprint — compare it with contacts to verify each other");
             }
             ui.add_space(6.0);
-            if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("＋ Add contact")).clicked() {
-                add_contact.open = true;
-            }
+            ui.horizontal(|ui| {
+                let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                if ui.add_sized([half, 28.0], egui::Button::new("＋ Add contact")).clicked() {
+                    view.add_contact.open = true;
+                }
+                let devices = format!("💻 Devices ({})", state.devices.len());
+                if ui.add_sized([half, 28.0], egui::Button::new(devices)).clicked() {
+                    view.devices.open = true;
+                }
+            });
             ui.separator();
 
             let mut clicked = None;
