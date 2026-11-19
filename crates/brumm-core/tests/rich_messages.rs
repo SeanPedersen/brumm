@@ -45,6 +45,7 @@ async fn file_round_trip_and_size_limit() {
     bob.send(Command::LoadAttachment {
         contact: alice_key,
         id,
+        max_edge: 960,
     });
     let received = bob
         .expect(|event| match event {

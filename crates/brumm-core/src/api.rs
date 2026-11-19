@@ -55,11 +55,22 @@ pub enum Command {
     SetAvatar {
         image: Vec<u8>,
     },
-    /// Fetches a file message so the UI can show a preview. A large photo is scaled down and
-    /// the original is not kept.
+    /// Fetches a file message so the UI can show a preview. A stored preview is returned when
+    /// it was built for at least `max_edge` physical pixels; otherwise the original bytes are
+    /// sent and the UI scales them down off the UI thread.
     LoadAttachment {
         contact: UserKey,
         id: MessageId,
+        max_edge: u32,
+    },
+    /// Remembers a bubble-sized preview so the next open does not decode the original again.
+    StoreImagePreview {
+        contact: UserKey,
+        id: MessageId,
+        width: u32,
+        height: u32,
+        max_edge: u32,
+        bytes: Vec<u8>,
     },
     /// Writes a file message to `path` from the database. The bytes are dropped after the write.
     SaveAttachment {
@@ -133,6 +144,15 @@ pub enum Event {
         contact: UserKey,
         id: MessageId,
         data: Arc<Vec<u8>>,
+    },
+    /// Bubble preview already encoded. The UI shows it without decoding the original.
+    ImagePreview {
+        contact: UserKey,
+        id: MessageId,
+        /// Source pixel size, used for the bubble's aspect ratio.
+        width: u32,
+        height: u32,
+        bytes: Arc<Vec<u8>>,
     },
     ReactionsChanged {
         contact: UserKey,

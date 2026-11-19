@@ -5,6 +5,7 @@
 
 mod app;
 mod bridge;
+mod preview;
 mod state;
 mod ui;
 mod window_size;

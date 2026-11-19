@@ -3,6 +3,8 @@
 //! Startup stays cheap: the core sends one [`ConversationPreview`] per chat instead of the full
 //! history. A conversation's messages are loaded only when it is opened, and caches for
 //! conversations and file bytes are bounded so long chats cannot grow RAM without limit.
+//! Photo bytes are not decoded here. An attachment event is queued and a background thread
+//! builds the preview.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -79,6 +81,16 @@ pub struct AppState {
     pub stale_conversations: Vec<UserKey>,
     pub connecting: bool,
     pub errors: Vec<String>,
+    /// Originals waiting for the background preview thread. The UI thread does not decode them.
+    pub(crate) pending_previews: VecDeque<PendingPreview>,
+}
+
+/// One photo whose bytes arrived and still need a bubble-sized preview.
+pub(crate) struct PendingPreview {
+    pub contact: UserKey,
+    pub id: MessageId,
+    pub bytes: Arc<Vec<u8>>,
+    pub max_edge: u32,
 }
 
 impl AppState {
@@ -284,41 +296,28 @@ impl AppState {
                 }
             },
             Event::Attachment { contact, id, data } => {
-                let source_len = data.len();
-                let prepared = crate::ui::files::prepare_chat_image(
-                    data.as_slice(),
-                    crate::ui::files::preview_max_edge(ctx.pixels_per_point()),
+                self.pending_previews.push_back(PendingPreview {
+                    contact,
+                    id,
+                    bytes: data,
+                    max_edge: crate::ui::files::preview_max_edge(ctx.pixels_per_point()),
+                });
+            }
+            Event::ImagePreview {
+                contact,
+                id,
+                width,
+                height,
+                bytes,
+            } => {
+                self.remember_attachment(
+                    (contact, id),
+                    LoadedAttachment {
+                        bytes: arc_bytes(bytes),
+                        image_size: Some((width, height)),
+                    },
+                    ctx,
                 );
-                // A scaled preview replaces the original. Small images are already the display bytes.
-                let discard_original = prepared
-                    .as_ref()
-                    .is_none_or(|image| image.preview.is_some());
-                let loaded = match prepared {
-                    Some(image) => {
-                        let bytes = match image.preview {
-                            Some(preview) => {
-                                drop(data);
-                                Arc::from(preview)
-                            }
-                            None => arc_bytes(data),
-                        };
-                        LoadedAttachment {
-                            bytes,
-                            image_size: Some(image.size),
-                        }
-                    }
-                    None => {
-                        drop(data);
-                        LoadedAttachment {
-                            bytes: Arc::from([]),
-                            image_size: None,
-                        }
-                    }
-                };
-                if discard_original && source_len >= HEAP_TRIM_BYTES {
-                    release_freed_heap();
-                }
-                self.remember_attachment((contact, id), loaded, ctx);
             }
             Event::Error(error) => {
                 self.connecting = false;
@@ -363,6 +362,19 @@ impl AppState {
         }
     }
 
+    pub(crate) fn take_pending_preview(&mut self) -> Option<PendingPreview> {
+        self.pending_previews.pop_front()
+    }
+
+    pub(crate) fn install_attachment(
+        &mut self,
+        key: (UserKey, MessageId),
+        loaded: LoadedAttachment,
+        ctx: &egui::Context,
+    ) {
+        self.remember_attachment(key, loaded, ctx);
+    }
+
     fn forget_attachment(&mut self, key: (UserKey, MessageId), ctx: &egui::Context) {
         if let Some(dropped) = self.attachments.remove(&key) {
             self.attachment_bytes = self.attachment_bytes.saturating_sub(dropped.bytes.len());
@@ -372,24 +384,10 @@ impl AppState {
     }
 }
 
-/// Freed allocations at least this large are worth returning to the OS. A 4K decode is much bigger.
-const HEAP_TRIM_BYTES: usize = 64 * 1024;
-
 fn arc_bytes(data: Arc<Vec<u8>>) -> Arc<[u8]> {
     match Arc::try_unwrap(data) {
         Ok(bytes) => Arc::from(bytes),
         Err(bytes) => Arc::from(&bytes[..]),
-    }
-}
-
-/// glibc keeps a freed multi-megabyte image in the heap. This returns those pages.
-fn release_freed_heap() {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        malloc_trim(0);
     }
 }
 
@@ -488,13 +486,29 @@ mod tests {
         let mut state = AppState::default();
         let contact = [3; 32];
         let id = [4; 16];
+        let ctx = egui::Context::default();
         state.apply(
             Event::Attachment {
                 contact,
                 id,
                 data: Arc::new(png),
             },
-            &egui::Context::default(),
+            &ctx,
+        );
+        assert!(state.attachments.is_empty());
+        let job = state.take_pending_preview().expect("queued");
+        assert_eq!(job.bytes.len(), source_len);
+        let prepared = crate::ui::files::prepare_chat_image(job.bytes.as_slice(), job.max_edge)
+            .expect("image");
+        let preview = prepared.preview.expect("downscaled");
+        assert!(preview.len() < source_len);
+        state.install_attachment(
+            (contact, id),
+            LoadedAttachment {
+                bytes: Arc::from(preview),
+                image_size: Some(prepared.size),
+            },
+            &ctx,
         );
         let loaded = state.attachments.get(&(contact, id)).expect("cached");
         assert_eq!(loaded.image_size, Some((2000, 1000)));

@@ -20,8 +20,8 @@ use crate::{
     wire::{self, Body, ChatMessage, EnvelopeId, HistoryItem, InviteSecret, MessageId},
 };
 
-const SCHEMA_VERSION: i64 = 6;
-/// Oldest schema that [`SCHEMA`] upgrades in place (v5 and v6 only added tables).
+const SCHEMA_VERSION: i64 = 7;
+/// Oldest schema that [`SCHEMA`] upgrades in place (v5–v7 only added tables).
 const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -84,6 +84,15 @@ CREATE TABLE IF NOT EXISTS reactions (
     emoji      TEXT NOT NULL,
     at_ms      INTEGER NOT NULL,
     PRIMARY KEY (contact, message_id, mine)
+);
+CREATE TABLE IF NOT EXISTS image_previews (
+    contact  BLOB NOT NULL,
+    id       BLOB NOT NULL,
+    width    INTEGER NOT NULL,
+    height   INTEGER NOT NULL,
+    max_edge INTEGER NOT NULL,
+    bytes    BLOB NOT NULL,
+    PRIMARY KEY (contact, id)
 );
 CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     hash        BLOB PRIMARY KEY,
@@ -808,6 +817,7 @@ impl Store {
             }
         }
         self.purge_orphan_reactions()?;
+        self.purge_orphan_previews()?;
         Ok(removed)
     }
 
@@ -888,8 +898,85 @@ impl Store {
             params![cutoff_ms as i64, keep],
         )?;
         self.purge_orphan_reactions()?;
+        self.purge_orphan_previews()?;
         Ok(removed)
     }
+
+    /// Bubble-sized preview for a photo, when one was stored for at least `min_edge` physical
+    /// pixels (or the source itself is no larger than the stored edge).
+    pub fn image_preview(
+        &self,
+        contact: &UserKey,
+        id: &MessageId,
+        min_edge: u32,
+    ) -> Result<Option<ImagePreview>> {
+        let row: Option<(i64, i64, i64, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT width, height, max_edge, bytes FROM image_previews
+                 WHERE contact = ?1 AND id = ?2
+                   AND (max_edge >= ?3 OR (width <= max_edge AND height <= max_edge))",
+                params![contact.as_slice(), id.as_slice(), i64::from(min_edge)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((width, height, _, bytes)) = row else {
+            return Ok(None);
+        };
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return Ok(None);
+        };
+        if width == 0 || height == 0 || bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ImagePreview {
+            width,
+            height,
+            bytes,
+        }))
+    }
+
+    pub fn set_image_preview(
+        &self,
+        contact: &UserKey,
+        id: &MessageId,
+        width: u32,
+        height: u32,
+        max_edge: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO image_previews (contact, id, width, height, max_edge, bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                contact.as_slice(),
+                id.as_slice(),
+                i64::from(width),
+                i64::from(height),
+                i64::from(max_edge),
+                bytes
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn purge_orphan_previews(&self) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM image_previews WHERE NOT EXISTS (
+                 SELECT 1 FROM messages
+                 WHERE messages.contact = image_previews.contact AND messages.id = image_previews.id
+             )",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+/// A stored chat-photo preview. `width` and `height` are the source pixels.
+pub struct ImagePreview {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1213,5 +1300,41 @@ mod tests {
         assert_eq!(store.conversation(&contact).unwrap().len(), 2);
         assert_eq!(store.prune_messages_before(150, &[0; 32]).unwrap(), 1);
         assert_eq!(store.prune_messages_before(1000, &contact).unwrap(), 0);
+    }
+
+    #[test]
+    fn image_preview_is_reused_until_the_message_is_gone() {
+        let store = Store::open_in_memory().unwrap();
+        let contact = [5; 32];
+        let id = [3; 16];
+        store
+            .insert_message(
+                &contact,
+                &ChatMessage {
+                    id,
+                    sent_at_ms: 100,
+                    body: Body::File {
+                        name: "photo.jpg".into(),
+                        data: vec![1, 2, 3],
+                    },
+                },
+                Direction::Outgoing,
+                DeliveryStatus::Delivered,
+                None,
+            )
+            .unwrap();
+        store
+            .set_image_preview(&contact, &id, 3840, 2160, 960, &[9, 9, 9])
+            .unwrap();
+        let hit = store
+            .image_preview(&contact, &id, 320)
+            .unwrap()
+            .expect("hit");
+        assert_eq!((hit.width, hit.height), (3840, 2160));
+        assert_eq!(hit.bytes, vec![9, 9, 9]);
+        assert!(store.image_preview(&contact, &id, 1920).unwrap().is_none());
+
+        store.delete_messages(&contact, &[id], None).unwrap();
+        assert!(store.image_preview(&contact, &id, 320).unwrap().is_none());
     }
 }

@@ -59,7 +59,19 @@ impl Node {
                 for_everyone,
             } => self.delete_messages(contact, ids, for_everyone),
             Command::SetAvatar { image } => self.set_avatar(image),
-            Command::LoadAttachment { contact, id } => self.load_attachment(contact, id),
+            Command::LoadAttachment {
+                contact,
+                id,
+                max_edge,
+            } => self.load_attachment(contact, id, max_edge),
+            Command::StoreImagePreview {
+                contact,
+                id,
+                width,
+                height,
+                max_edge,
+                bytes,
+            } => self.store_image_preview(contact, id, width, height, max_edge, bytes),
             Command::SaveAttachment { contact, id, path } => {
                 self.save_attachment(contact, id, path)
             }
@@ -249,7 +261,17 @@ impl Node {
         self.flush_outbox()
     }
 
-    fn load_attachment(&mut self, contact: UserKey, id: MessageId) -> Result<()> {
+    fn load_attachment(&mut self, contact: UserKey, id: MessageId, max_edge: u32) -> Result<()> {
+        if let Some(preview) = self.store.image_preview(&contact, &id, max_edge)? {
+            self.events.emit(Event::ImagePreview {
+                contact,
+                id,
+                width: preview.width,
+                height: preview.height,
+                bytes: Arc::new(preview.bytes),
+            });
+            return Ok(());
+        }
         if let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? {
             self.events.emit(Event::Attachment {
                 contact,
@@ -258,6 +280,25 @@ impl Node {
             });
         }
         Ok(())
+    }
+
+    /// Ignores a preview that does not belong to a stored message or is larger than a bubble image.
+    fn store_image_preview(
+        &mut self,
+        contact: UserKey,
+        id: MessageId,
+        width: u32,
+        height: u32,
+        max_edge: u32,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        if !preview_is_storable(width, height, max_edge, bytes.len())
+            || !self.store.message_exists(&contact, &id)?
+        {
+            return Ok(());
+        }
+        self.store
+            .set_image_preview(&contact, &id, width, height, max_edge, &bytes)
     }
 
     /// Reads the file from the database and writes it on another thread. The buffer dies with that thread.
@@ -315,6 +356,21 @@ impl Node {
         });
         Ok(())
     }
+}
+
+/// A preview is a small re-encode. Anything larger is the original, which stays in `messages`.
+const MAX_STORED_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_STORED_PREVIEW_EDGE: u32 = 4096;
+
+fn preview_is_storable(width: u32, height: u32, max_edge: u32, len: usize) -> bool {
+    width > 0
+        && height > 0
+        && max_edge > 0
+        && width <= MAX_STORED_PREVIEW_EDGE
+        && height <= MAX_STORED_PREVIEW_EDGE
+        && max_edge <= MAX_STORED_PREVIEW_EDGE
+        && len > 0
+        && len <= MAX_STORED_PREVIEW_BYTES
 }
 
 pub(super) fn message_view(

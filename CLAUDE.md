@@ -82,6 +82,7 @@ crates/brumm-app/         eframe binary `brumm`
   src/bridge.rs           tokio runtime thread (2 workers) + channels; repaint on event;
                           detached thread, closing the command channel stops the core
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
+  src/preview.rs          background thread: scale a chat photo, then the UI stores the preview
   src/window_size.rs      8-byte window size (`window-size`), read before the window is created
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
@@ -133,10 +134,13 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
   A note longer than 8 KiB shapes only the lines that meet the viewport, so one multi-megabyte
   message does not allocate a text layout per line.
 - **Chat image previews.** A photo larger than the bubble (`IMAGE_BUBBLE_EDGE`, 320 logical
-  pixels, times the screen scale, capped at 960 physical pixels) is decoded once and re-encoded
-  as a preview. The UI keeps that preview only. The original stays in SQLite. Save As reads it
-  back on a short-lived thread and drops it after the write. After the decode, `malloc_trim`
-  returns the freed bitmap pages to the OS.
+  pixels, times the screen scale, capped at 960 physical pixels) is decoded on a background
+  thread (`preview.rs`) and re-encoded as a preview. JPEG uses a scaled IDCT (1/2, 1/4, 1/8),
+  so a 4K photo is not decoded at full size and the UI thread keeps scrolling. The preview is
+  stored in `image_previews` (schema v7) and reused on the next open. The UI keeps that preview
+  only. The original stays in SQLite. Save As reads it back on a short-lived thread and drops it
+  after the write. After a large decode, `malloc_trim` on the preview thread returns the freed
+  bitmap pages to the OS.
 - **Chat scroll.** Scrollbar thumbs keep a minimum length (`SCROLLBAR_MIN_LENGTH`) so a long
   history stays grabbable. On the message list, later wheel notches in a burst scroll further,
   and a faster two-finger swipe scrolls further than a slow one. After the gesture ends the list

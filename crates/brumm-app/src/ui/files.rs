@@ -1,6 +1,7 @@
 //! Native file dialogs (run on helper threads so the UI never blocks) and the file/image
 //! preparation that goes with them: reading an attachment, shrinking a profile photo, and
-//! building a bubble-sized preview so a large photo is not decoded at full resolution.
+//! building a bubble-sized preview. JPEG previews are scaled during decode. Callers run
+//! `prepare_chat_image` off the UI thread.
 
 use std::{
     io::Cursor,
@@ -231,9 +232,87 @@ pub fn preview_max_edge(pixels_per_point: f32) -> u32 {
 }
 
 /// Reads an image header and, when the photo is larger than `max_edge`, re-encodes a preview.
-/// The full-resolution bitmap is dropped before this returns. `None` means the bytes are not an image.
+/// JPEG is scaled during the IDCT (1/2, 1/4 or 1/8), so a 4K photo never becomes a full-size
+/// bitmap. The bitmap is dropped before this returns. `None` means the bytes are not an image.
 pub fn prepare_chat_image(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
     let max_edge = max_edge.max(1);
+    if bytes.starts_with(JPEG_MAGIC)
+        && let Some(image) = prepare_jpeg(bytes, max_edge)
+    {
+        return Some(image);
+    }
+    prepare_generic(bytes, max_edge)
+}
+
+const JPEG_MAGIC: &[u8] = &[0xFF, 0xD8];
+
+/// JPEG thumbnail via scaled IDCT. `None` means "not a JPEG we can scale"; the caller falls back.
+fn prepare_jpeg(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
+    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    let (width, height) = (u32::from(info.width), u32::from(info.height));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if width.max(height) <= max_edge {
+        return Some(ChatImage {
+            size: (width, height),
+            preview: None,
+        });
+    }
+    if !matches!(
+        info.pixel_format,
+        jpeg_decoder::PixelFormat::RGB24 | jpeg_decoder::PixelFormat::L8
+    ) {
+        return None;
+    }
+    let (scaled_w, scaled_h) = decoder
+        .scale(
+            max_edge.min(u32::from(u16::MAX)) as u16,
+            max_edge.min(u32::from(u16::MAX)) as u16,
+        )
+        .ok()?;
+    let pixels = decoder.decode().ok()?;
+    let decoded = image_from_jpeg(info.pixel_format, scaled_w, scaled_h, pixels)?;
+    let (target_w, target_h) = fit_edge(width, height, max_edge);
+    let resized = if decoded.width() == target_w && decoded.height() == target_h {
+        decoded
+    } else {
+        decoded.thumbnail(target_w, target_h)
+    };
+    Some(ChatImage {
+        size: (width, height),
+        preview: Some(encode_preview(resized)?),
+    })
+}
+
+fn image_from_jpeg(
+    format: jpeg_decoder::PixelFormat,
+    width: u16,
+    height: u16,
+    pixels: Vec<u8>,
+) -> Option<DynamicImage> {
+    let (width, height) = (u32::from(width), u32::from(height));
+    match format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
+        }
+        _ => None,
+    }
+}
+
+fn fit_edge(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    let scale = max_edge as f32 / width.max(height) as f32;
+    let target_w = ((width as f32 * scale).round() as u32).max(1);
+    let target_h = ((height as f32 * scale).round() as u32).max(1);
+    (target_w, target_h)
+}
+
+fn prepare_generic(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
     let (width, height) = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
@@ -248,9 +327,7 @@ pub fn prepare_chat_image(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
             preview: None,
         });
     }
-    let scale = max_edge as f32 / width.max(height) as f32;
-    let target_w = ((width as f32 * scale).round() as u32).max(1);
-    let target_h = ((height as f32 * scale).round() as u32).max(1);
+    let (target_w, target_h) = fit_edge(width, height, max_edge);
     // Scope the decode so the full bitmap is freed before the preview is encoded.
     let resized = {
         let decoded = image::load_from_memory(bytes).ok()?;
@@ -261,6 +338,17 @@ pub fn prepare_chat_image(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
         size: (width, height),
         preview: Some(preview),
     })
+}
+
+/// glibc keeps a freed multi-megabyte image in the heap. Call this on the decode thread.
+pub(crate) fn release_freed_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        malloc_trim(0);
+    }
 }
 
 /// JPEG for opaque photos, PNG when the source has alpha (a JPEG would turn it black).
@@ -448,6 +536,25 @@ mod tests {
             .unwrap();
         assert_eq!((width, height), (320, 160));
         assert!(preview.len() < 64 * 1024);
+    }
+
+    #[test]
+    fn large_jpegs_are_scaled_down_to_the_bubble() {
+        let pixels = image::RgbImage::from_pixel(2000, 1000, image::Rgb([40, 90, 140]));
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 85)
+            .write_image(pixels.as_raw(), 2000, 1000, image::ExtendedColorType::Rgb8)
+            .expect("encode jpeg");
+        let prepared = prepare_chat_image(&bytes, 320).expect("image");
+        assert_eq!(prepared.size, (2000, 1000));
+        let preview = prepared.preview.expect("downscaled");
+        assert!(preview.len() < bytes.len());
+        let (width, height) = image::ImageReader::new(Cursor::new(preview.as_slice()))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!((width, height), (320, 160));
     }
 
     #[test]

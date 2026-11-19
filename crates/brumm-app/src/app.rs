@@ -7,6 +7,7 @@ use brumm_core::api::Command;
 
 use crate::{
     bridge::CoreBridge,
+    preview::PreviewLoader,
     state::{AppState, Phase},
     ui,
     window_size::WindowSize,
@@ -17,6 +18,7 @@ pub struct BrummApp {
     state: AppState,
     view: ui::ViewState,
     window_size: WindowSize,
+    previews: PreviewLoader,
 }
 
 impl BrummApp {
@@ -35,6 +37,7 @@ impl BrummApp {
             state: AppState::default(),
             view: ui::ViewState::default(),
             window_size,
+            previews: PreviewLoader::start(),
         }
     }
 }
@@ -50,6 +53,24 @@ impl eframe::App for BrummApp {
                 self.view.onboarding.allow_retry();
             }
             self.state.apply(event, ctx);
+        }
+        while let Some(job) = self.state.take_pending_preview() {
+            self.previews
+                .submit(job.contact, job.id, job.bytes, job.max_edge, ctx.clone());
+        }
+        for ready in self.previews.poll() {
+            if let (Some(bytes), Some((width, height))) = (ready.persist, ready.source_size) {
+                self.core.send(brumm_core::api::Command::StoreImagePreview {
+                    contact: ready.contact,
+                    id: ready.id,
+                    width,
+                    height,
+                    max_edge: ready.max_edge,
+                    bytes,
+                });
+            }
+            self.state
+                .install_attachment((ready.contact, ready.id), ready.loaded, ctx);
         }
     }
 

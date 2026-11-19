@@ -203,6 +203,8 @@ pub fn show(
     // Selection never outlives its conversation or deleted messages.
     chat.selection
         .retain(|id| messages.iter().any(|message| message.id == *id));
+    chat.requested_attachments
+        .retain(|(key, _)| *key == contact);
     chat.search.note_open_chat(Some(contact));
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         if chat.is_selecting() {
@@ -1015,7 +1017,14 @@ fn paint_rows(
         });
 
         let attachment = state.attachments.get(&(contact, message.id));
-        request_preview(chat, contact, message, attachment.is_some(), commands);
+        request_preview(
+            chat,
+            contact,
+            message,
+            attachment.is_some(),
+            files::preview_max_edge(ui.pixels_per_point()),
+            commands,
+        );
         let highlight = chat.search.highlighted() == Some(message.id);
         let band = highlight.then(|| ui.painter().add(egui::Shape::Noop));
         let bubble_top = ui.cursor().min.y;
@@ -1209,6 +1218,7 @@ fn request_preview(
     contact: UserKey,
     message: &MessageView,
     loaded: bool,
+    max_edge: u32,
     commands: &mut Vec<Command>,
 ) {
     let is_image = message
@@ -1219,6 +1229,7 @@ fn request_preview(
         commands.push(Command::LoadAttachment {
             contact,
             id: message.id,
+            max_edge,
         });
     }
 }
