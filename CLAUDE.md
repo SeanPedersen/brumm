@@ -64,6 +64,7 @@ crates/brumm-app/         eframe binary `brumm`
   src/bridge.rs           tokio runtime thread (2 workers) + channels; repaint on event;
                           detached thread, closing the command channel stops the core
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
+  src/window_size.rs      8-byte window size (`window-size`), read before the window is created
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
                           Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
@@ -100,6 +101,10 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
   from a single primary-key read and does not load the history. The UI selects the chat if it
   still exists (including Notes) and then sends `LoadConversation`. Opening a different chat
   sends `RememberOpenChat`, which writes the same row. Restoring does not write it again.
+- **Window size** is not in SQLite. `window-size` in the profile dir is 8 bytes (width and height,
+  little-endian `u32` points). `main` reads it once before the window is created; a missing or
+  implausible file falls back to 960×680. A resize is written after it settles, and again on exit.
+  Do not turn on eframe's `persistence` feature for this: that also parses the whole egui memory.
 - **Bound the caches.** `AppState` keeps only the selected conversation and at most
   `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of file bytes (LRU, `ctx.forget_image` on
   eviction). Inline files are stored in full, so an unbounded cache is a real leak.
@@ -117,7 +122,7 @@ cargo run -- --profile alice                 # separate data dir per profile
 cargo run -- --profile bob                   # 2nd instance to chat locally
 scripts/install-desktop.sh [binary]          # user-level desktop entry + hicolor icon + ~/.local/bin/brumm
 ```
-Data dir: `~/.local/share/brumm/profiles/<profile>/brumm.db` (Linux).
+Data dir: `~/.local/share/brumm/profiles/<profile>/` (Linux): `brumm.db`, `window-size`.
 
 ## Stack
 Rust 2024 · iroh 1.4 · eframe/egui 0.37 · tokio · rusqlite (bundled) · postcard · ed25519-dalek 3 ·

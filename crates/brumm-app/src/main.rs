@@ -7,6 +7,7 @@ mod app;
 mod bridge;
 mod state;
 mod ui;
+mod window_size;
 
 use std::path::PathBuf;
 
@@ -18,8 +19,6 @@ const DEFAULT_LOG_FILTER: &str = "brumm=info,brumm_core=info,warn";
 /// Matches `brumm.desktop` so Wayland/X11 shells pick up the icon for the taskbar.
 const APP_ID: &str = "brumm";
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
-const WINDOW_SIZE: [f32; 2] = [960.0, 680.0];
-const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 400.0];
 
 fn main() -> Result<()> {
     init_tracing();
@@ -27,11 +26,13 @@ fn main() -> Result<()> {
     let data_dir = data_dir(&profile)?;
     tracing::info!(profile, data_dir = %data_dir.display(), "starting brumm");
 
+    // Eight bytes, before the window exists. SQLite is not open yet.
+    let (window_size, size) = window_size::WindowSize::load(&data_dir);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(window_title(&profile))
         .with_app_id(APP_ID)
-        .with_inner_size(WINDOW_SIZE)
-        .with_min_inner_size(MIN_WINDOW_SIZE);
+        .with_inner_size(size)
+        .with_min_inner_size(window_size::MIN_SIZE);
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "brumm",
         options,
-        Box::new(move |cc| Ok(Box::new(app::BrummApp::new(cc, data_dir)))),
+        Box::new(move |cc| Ok(Box::new(app::BrummApp::new(cc, data_dir, window_size)))),
     )
     .map_err(|err| anyhow::anyhow!("ui failed: {err}"))
 }

@@ -358,6 +358,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Cheap content fingerprint (FNV-1a) so a changed photo gets a fresh image-cache uri.
+fn checksum(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use brumm_core::api::{ContactView, ProfileView, Trust};
@@ -419,13 +428,4 @@ mod tests {
         assert_eq!(state.selected, None);
         assert!(state.stale_conversations.is_empty());
     }
-}
-
-/// Cheap content fingerprint (FNV-1a) so a changed photo gets a fresh image-cache uri.
-fn checksum(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0100_0000_01b3;
-    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    })
 }
