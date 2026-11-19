@@ -1009,11 +1009,6 @@ fn apply_action(
             let Some(attachment) = &message.attachment else {
                 return;
             };
-            chat.requested_attachments.insert((contact, message.id));
-            commands.push(Command::LoadAttachment {
-                contact,
-                id: message.id,
-            });
             chat.dialogs
                 .pick_save_path(ui.ctx(), contact, message.id, attachment.name.clone());
         }

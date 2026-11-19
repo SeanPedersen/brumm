@@ -76,7 +76,8 @@ crates/brumm-app/         eframe binary `brumm`
                           (jiff 1.0 local time)
                           bubble.rs (text/image/file-card bubble + clickable links + selection chrome + context menu),
                           composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
-                          cursor), files.rs (rfd dialogs on threads, avatar shrink to JPEG, size limits)
+                          cursor), files.rs (rfd dialogs on threads, avatar shrink to JPEG, chat image
+                          previews, size limits)
 ```
 
 ## Conventions
@@ -112,13 +113,18 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
   small overscan). Off-screen rows keep an estimated height and are not shaped into galleys.
   A note longer than 8 KiB shapes only the lines that meet the viewport, so one multi-megabyte
   message does not allocate a text layout per line.
+- **Chat image previews.** A photo larger than the bubble (`IMAGE_BUBBLE_EDGE`, 320 logical
+  pixels, times the screen scale, capped at 960 physical pixels) is decoded once and re-encoded
+  as a preview. The UI keeps that preview only. The original stays in SQLite. Save As reads it
+  back on a short-lived thread and drops it after the write. After the decode, `malloc_trim`
+  returns the freed bitmap pages to the OS.
 - **Chat scroll.** Scrollbar thumbs keep a minimum length (`SCROLLBAR_MIN_LENGTH`) so a long
   history stays grabbable. On the message list, later wheel notches in a burst scroll further,
   and a faster two-finger swipe scrolls further than a slow one. After the gesture ends the list
   glides a short distance and eases to a stop.
 - **Bound the caches.** `AppState` keeps only the selected conversation and at most
-  `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of file bytes (LRU, `ctx.forget_image` on
-  eviction). Inline files are stored in full, so an unbounded cache is a real leak.
+  `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of preview bytes (LRU, `ctx.forget_image`
+  on eviction). Large originals are not cached; they stay in the database.
 - SQLite runs `WAL` + `synchronous = NORMAL`; the schema batch only runs when `user_version`
   differs. Keep single-row lookups keyed (e.g. `outbox_item`) instead of scanning a list.
 - Ship builds with `cargo build --profile dist` (fat LTO, `codegen-units = 1`, `panic = abort`):

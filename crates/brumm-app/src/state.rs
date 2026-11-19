@@ -6,7 +6,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    io::Cursor,
     sync::Arc,
 };
 
@@ -37,7 +36,10 @@ pub struct AvatarImage {
     pub bytes: Arc<[u8]>,
 }
 
-/// Bytes of a file message, fetched on demand, plus the pixel size if it is an image.
+/// Bubble-sized image bytes, fetched on demand, plus the source pixel size.
+///
+/// A photo larger than the bubble is re-encoded down to that size. The original stays in the
+/// database; Save As reads it back and does not leave it in this cache.
 #[derive(Clone)]
 pub struct LoadedAttachment {
     pub bytes: Arc<[u8]>,
@@ -282,16 +284,41 @@ impl AppState {
                 }
             },
             Event::Attachment { contact, id, data } => {
-                let image_size = image::ImageReader::new(Cursor::new(data.as_slice()))
-                    .with_guessed_format()
-                    .ok()
-                    .and_then(|reader| reader.into_dimensions().ok());
-                let bytes: Arc<[u8]> = data.as_slice().into();
-                self.remember_attachment(
-                    (contact, id),
-                    LoadedAttachment { bytes, image_size },
-                    ctx,
+                let source_len = data.len();
+                let prepared = crate::ui::files::prepare_chat_image(
+                    data.as_slice(),
+                    crate::ui::files::preview_max_edge(ctx.pixels_per_point()),
                 );
+                // A scaled preview replaces the original. Small images are already the display bytes.
+                let discard_original = prepared
+                    .as_ref()
+                    .is_none_or(|image| image.preview.is_some());
+                let loaded = match prepared {
+                    Some(image) => {
+                        let bytes = match image.preview {
+                            Some(preview) => {
+                                drop(data);
+                                Arc::from(preview)
+                            }
+                            None => arc_bytes(data),
+                        };
+                        LoadedAttachment {
+                            bytes,
+                            image_size: Some(image.size),
+                        }
+                    }
+                    None => {
+                        drop(data);
+                        LoadedAttachment {
+                            bytes: Arc::from([]),
+                            image_size: None,
+                        }
+                    }
+                };
+                if discard_original && source_len >= HEAP_TRIM_BYTES {
+                    release_freed_heap();
+                }
+                self.remember_attachment((contact, id), loaded, ctx);
             }
             Event::Error(error) => {
                 self.connecting = false;
@@ -342,6 +369,27 @@ impl AppState {
             self.attachment_order.retain(|entry| *entry != key);
             ctx.forget_image(&attachment_uri(&key.1));
         }
+    }
+}
+
+/// Freed allocations at least this large are worth returning to the OS. A 4K decode is much bigger.
+const HEAP_TRIM_BYTES: usize = 64 * 1024;
+
+fn arc_bytes(data: Arc<Vec<u8>>) -> Arc<[u8]> {
+    match Arc::try_unwrap(data) {
+        Ok(bytes) => Arc::from(bytes),
+        Err(bytes) => Arc::from(&bytes[..]),
+    }
+}
+
+/// glibc keeps a freed multi-megabyte image in the heap. This returns those pages.
+fn release_freed_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        malloc_trim(0);
     }
 }
 
@@ -427,5 +475,30 @@ mod tests {
         ready(&mut state, me, Vec::new(), Some([9; 32]));
         assert_eq!(state.selected, None);
         assert!(state.stale_conversations.is_empty());
+    }
+
+    #[test]
+    fn a_large_photo_keeps_only_the_preview() {
+        let pixels = image::RgbImage::from_pixel(2000, 1000, image::Rgb([40, 90, 140]));
+        let mut png = Vec::new();
+        pixels
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let source_len = png.len();
+        let mut state = AppState::default();
+        let contact = [3; 32];
+        let id = [4; 16];
+        state.apply(
+            Event::Attachment {
+                contact,
+                id,
+                data: Arc::new(png),
+            },
+            &egui::Context::default(),
+        );
+        let loaded = state.attachments.get(&(contact, id)).expect("cached");
+        assert_eq!(loaded.image_size, Some((2000, 1000)));
+        assert!(loaded.bytes.len() < 64 * 1024);
+        assert!(loaded.bytes.len() < source_len);
     }
 }

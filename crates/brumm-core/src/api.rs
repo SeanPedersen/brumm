@@ -1,7 +1,7 @@
 //! Public boundary between the core and any UI: commands in, events out.
 //! Views are plain data so a UI can mirror state without touching storage or networking.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use tokio::sync::mpsc;
 
@@ -55,10 +55,17 @@ pub enum Command {
     SetAvatar {
         image: Vec<u8>,
     },
-    /// Fetches the bytes of a file message; answered with [`Event::Attachment`].
+    /// Fetches a file message so the UI can show a preview. A large photo is scaled down and
+    /// the original is not kept.
     LoadAttachment {
         contact: UserKey,
         id: MessageId,
+    },
+    /// Writes a file message to `path` from the database. The bytes are dropped after the write.
+    SaveAttachment {
+        contact: UserKey,
+        id: MessageId,
+        path: PathBuf,
     },
     /// Sets our reaction to a message (empty `emoji` removes it).
     React {
@@ -188,7 +195,9 @@ pub struct ReactionsView {
     pub theirs: Option<String>,
 }
 
-/// Metadata of a file message; the bytes are fetched on demand with `Command::LoadAttachment`.
+/// Metadata of a file message. A preview is fetched with `Command::LoadAttachment`.
+/// Saving the original uses `Command::SaveAttachment`, which reads the database and does not
+/// keep the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentView {
     pub name: String,

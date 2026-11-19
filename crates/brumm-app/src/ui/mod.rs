@@ -35,6 +35,4 @@ pub struct ViewState {
     pub drafts: HashMap<UserKey, String>,
     pub search: String,
     pub remove_avatar_requested: bool,
-    /// Save-as targets waiting for the attachment bytes to arrive from the core.
-    pub pending_saves: Vec<main_screen::PendingSave>,
 }

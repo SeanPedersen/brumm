@@ -60,6 +60,9 @@ impl Node {
             } => self.delete_messages(contact, ids, for_everyone),
             Command::SetAvatar { image } => self.set_avatar(image),
             Command::LoadAttachment { contact, id } => self.load_attachment(contact, id),
+            Command::SaveAttachment { contact, id, path } => {
+                self.save_attachment(contact, id, path)
+            }
             Command::React { contact, id, emoji } => self.react(contact, id, emoji),
         }
     }
@@ -254,6 +257,25 @@ impl Node {
                 data: Arc::new(data),
             });
         }
+        Ok(())
+    }
+
+    /// Reads the file from the database and writes it on another thread. The buffer dies with that thread.
+    fn save_attachment(
+        &mut self,
+        contact: UserKey,
+        id: MessageId,
+        path: std::path::PathBuf,
+    ) -> Result<()> {
+        let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? else {
+            bail!("message has no file");
+        };
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = std::fs::write(&path, data) {
+                events.emit(Event::Error(format!("could not save file: {err}")));
+            }
+        });
         Ok(())
     }
 
