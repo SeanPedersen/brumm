@@ -18,30 +18,37 @@ const CATEGORIES: [(&str, &str); 5] = [
 
 /// Shows the popup anchored to `button`; returns an emoji if one was clicked.
 pub fn picker(button: &Response) -> Option<&'static str> {
-    let mut chosen = None;
     Popup::from_toggle_button_response(button)
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .width(POPUP_WIDTH)
         .show(|ui| {
             ui.set_min_size(egui::vec2(POPUP_WIDTH, POPUP_HEIGHT));
-            egui::ScrollArea::vertical().max_height(POPUP_HEIGHT).show(ui, |ui| {
-                for (title, emojis) in CATEGORIES {
-                    ui.label(RichText::new(title).small().color(crate::ui::theme::MUTED_TEXT));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                        for emoji in emojis.split(' ') {
-                            let cell = egui::Button::new(RichText::new(emoji).size(EMOJI_SIZE))
-                                .frame(false)
-                                .min_size(egui::vec2(EMOJI_CELL, EMOJI_CELL));
-                            if ui.add(cell).clicked() {
-                                chosen = Some(emoji);
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
+            grid(ui)
+        })
+        .and_then(|response| response.inner)
+}
+
+/// Scrollable emoji grid grouped by category; returns the clicked emoji.
+pub fn grid(ui: &mut egui::Ui) -> Option<&'static str> {
+    let mut chosen = None;
+    egui::ScrollArea::vertical().max_height(POPUP_HEIGHT).show(ui, |ui| {
+        ui.set_min_width(POPUP_WIDTH);
+        for (title, emojis) in CATEGORIES {
+            ui.label(RichText::new(title).small().color(crate::ui::theme::MUTED_TEXT));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                for emoji in emojis.split(' ') {
+                    let cell = egui::Button::new(RichText::new(emoji).size(EMOJI_SIZE))
+                        .frame(false)
+                        .min_size(egui::vec2(EMOJI_CELL, EMOJI_CELL));
+                    if ui.add(cell).clicked() {
+                        chosen = Some(emoji);
+                    }
                 }
             });
-        });
+            ui.add_space(6.0);
+        }
+    });
     chosen
 }
 

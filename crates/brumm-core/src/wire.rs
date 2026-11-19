@@ -21,6 +21,7 @@ pub const MAX_FILE_NAME_CHARS: usize = 255;
 /// Small enough to also fit into a Nostr mailbox letter.
 pub const MAX_AVATAR_BYTES: usize = 24 * 1024;
 pub const MAX_DELETE_IDS: usize = 256;
+pub const MAX_REACTION_BYTES: usize = 32;
 /// Plaintext budget per history chunk, leaving room for Olm + framing overhead.
 pub const HISTORY_CHUNK_BYTES: usize = 32 * 1024;
 
@@ -84,6 +85,25 @@ pub enum Payload {
     /// A profile photo. From a contact it must describe the contact itself; own devices also
     /// use it to sync contacts' photos to a freshly linked device.
     Avatar(Avatar),
+    /// The sender's user reacts to one of the messages in this conversation.
+    Reaction(Reaction),
+    /// Own-device sync: "I reacted in the conversation with `contact`".
+    ReactionSync { contact: UserKey, reaction: Reaction },
+}
+
+/// One user's reaction to a message; at most one per user and message (last write wins).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub message_id: MessageId,
+    /// A single emoji; empty removes the reaction.
+    pub emoji: String,
+    pub at_ms: u64,
+}
+
+impl Reaction {
+    pub fn is_valid(&self) -> bool {
+        self.emoji.len() <= MAX_REACTION_BYTES && !self.emoji.chars().any(|c| c.is_control() || c.is_whitespace())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -89,6 +89,8 @@ impl Node {
             (Payload::ContactSync(record), true) => self.receive_contact_sync(record)?,
             (Payload::Delete(ids), false) => self.receive_delete(owner, ids)?,
             (Payload::DeleteSync { contact, ids }, true) => self.receive_delete_sync(contact, ids)?,
+            (Payload::Reaction(reaction), false) => self.receive_reaction(owner, reaction, false)?,
+            (Payload::ReactionSync { contact, reaction }, true) => self.receive_reaction(contact, reaction, true)?,
             (Payload::Avatar(avatar), from_own) => self.receive_avatar(owner, avatar, from_own)?,
             (Payload::History(items), true) => self.receive_history(items)?,
             (payload, _) => {
@@ -143,6 +145,21 @@ impl Node {
         let removed = self.store.delete_messages(&contact, &ids, None)?;
         if !removed.is_empty() {
             self.events.emit(Event::MessagesDeleted { contact, ids: removed });
+        }
+        Ok(true)
+    }
+
+    /// `contact` is the conversation; `mine` tells whose reaction it is. Reactions to messages we do
+    /// not have (yet) are acknowledged and dropped.
+    fn receive_reaction(&mut self, contact: UserKey, reaction: wire::Reaction, mine: bool) -> Result<bool> {
+        if !reaction.is_valid() {
+            return Ok(false);
+        }
+        if !self.store.message_exists(&contact, &reaction.message_id)? {
+            return Ok(true);
+        }
+        if let Some(reactions) = self.store.set_reaction(&contact, &reaction, mine)? {
+            self.events.emit(Event::ReactionsChanged { contact, id: reaction.message_id, reactions });
         }
         Ok(true)
     }

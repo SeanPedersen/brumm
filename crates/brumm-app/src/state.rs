@@ -134,6 +134,15 @@ impl AppState {
                     self.attachments.remove(&(contact, *id));
                 }
             }
+            Event::ReactionsChanged { contact, id, reactions } => {
+                let message = self
+                    .conversations
+                    .get_mut(&contact)
+                    .and_then(|messages| messages.iter_mut().rev().find(|message| message.id == id));
+                if let Some(message) = message {
+                    message.reactions = reactions;
+                }
+            }
             Event::AvatarChanged { user, image } => match image {
                 Some(bytes) => {
                     let uri = format!("bytes://avatar/{}-{}", hex_prefix(&user), checksum(&bytes));

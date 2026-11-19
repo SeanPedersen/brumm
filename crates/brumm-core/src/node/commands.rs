@@ -7,7 +7,7 @@ use iroh::SecretKey;
 
 use super::{Me, Node, next_seq, profile_view};
 use crate::{
-    api::{AttachmentView, Command, DeliveryStatus, Direction, Event, MessageView},
+    api::{AttachmentView, Command, ReactionsView, DeliveryStatus, Direction, Event, MessageView},
     clock::now_ms,
     e2ee::DeviceCrypto,
     identity::{DeviceEntry, Profile, UserIdentity, UserKey, default_device_label, normalize_display_name},
@@ -15,7 +15,7 @@ use crate::{
     mailbox,
     store::StoredIdentity,
     transport::Transport,
-    wire::{Avatar, Body, ChatMessage, MAX_DELETE_IDS, MessageId, Payload},
+    wire::{Avatar, Body, ChatMessage, MAX_DELETE_IDS, MessageId, Payload, Reaction},
 };
 
 impl Node {
@@ -43,6 +43,7 @@ impl Node {
             Command::DeleteMessages { contact, ids, for_everyone } => self.delete_messages(contact, ids, for_everyone),
             Command::SetAvatar { image } => self.set_avatar(image),
             Command::LoadAttachment { contact, id } => self.load_attachment(contact, id),
+            Command::React { contact, id, emoji } => self.react(contact, id, emoji),
         }
     }
 
@@ -142,6 +143,20 @@ impl Node {
         self.flush_outbox()
     }
 
+    fn react(&mut self, contact: UserKey, id: MessageId, emoji: String) -> Result<()> {
+        self.active_me()?;
+        let reaction = Reaction { message_id: id, emoji, at_ms: now_ms() };
+        if !reaction.is_valid() || !self.store.message_exists(&contact, &id)? {
+            bail!("cannot react to this message");
+        }
+        if let Some(reactions) = self.store.set_reaction(&contact, &reaction, true)? {
+            self.events.emit(Event::ReactionsChanged { contact, id, reactions });
+        }
+        self.enqueue_to_user(&contact, rand::random(), Payload::Reaction(reaction.clone()), None)?;
+        self.enqueue_to_own_devices(Payload::ReactionSync { contact, reaction })?;
+        self.flush_outbox()
+    }
+
     fn load_attachment(&mut self, contact: UserKey, id: MessageId) -> Result<()> {
         if let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? {
             self.events.emit(Event::Attachment { contact, id, data: Arc::new(data) });
@@ -182,6 +197,7 @@ pub(super) fn message_view(contact: UserKey, message: &ChatMessage, direction: D
         direction,
         text,
         attachment,
+        reactions: ReactionsView::default(),
         sent_at_ms: message.sent_at_ms,
         status,
     }

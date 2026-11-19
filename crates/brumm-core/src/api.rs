@@ -27,6 +27,8 @@ pub enum Command {
     SetAvatar { image: Vec<u8> },
     /// Fetches the bytes of a file message; answered with [`Event::Attachment`].
     LoadAttachment { contact: UserKey, id: MessageId },
+    /// Sets our reaction to a message (empty `emoji` removes it).
+    React { contact: UserKey, id: MessageId, emoji: String },
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,7 @@ pub enum Event {
     /// A profile photo changed (own or a contact's); `None` means it was removed.
     AvatarChanged { user: UserKey, image: Option<Vec<u8>> },
     Attachment { contact: UserKey, id: MessageId, data: Arc<Vec<u8>> },
+    ReactionsChanged { contact: UserKey, id: MessageId, reactions: ReactionsView },
     Error(String),
 }
 
@@ -101,8 +104,16 @@ pub struct MessageView {
     /// Empty for file messages.
     pub text: String,
     pub attachment: Option<AttachmentView>,
+    pub reactions: ReactionsView,
     pub sent_at_ms: u64,
     pub status: DeliveryStatus,
+}
+
+/// Who reacted with what; each user has at most one reaction per message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReactionsView {
+    pub mine: Option<String>,
+    pub theirs: Option<String>,
 }
 
 /// Metadata of a file message; the bytes are fetched on demand with `Command::LoadAttachment`.

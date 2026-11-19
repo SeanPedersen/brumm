@@ -10,15 +10,15 @@ use iroh::{EndpointId, SecretKey};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
-    api::{AttachmentView, ContactView, DeliveryStatus, Direction, MessageView, Trust},
+    api::{AttachmentView, ContactView, DeliveryStatus, Direction, MessageView, ReactionsView, Trust},
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
     crypto::Sealed,
     wire::{self, Body, ChatMessage, EnvelopeId, HistoryItem, InviteSecret, MessageId},
 };
 
-const SCHEMA_VERSION: i64 = 5;
-/// Oldest schema that [`SCHEMA`] upgrades in place (v5 only added the `avatars` table).
+const SCHEMA_VERSION: i64 = 6;
+/// Oldest schema that [`SCHEMA`] upgrades in place (v5 and v6 only added tables).
 const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE TABLE IF NOT EXISTS avatars (
     user_key BLOB PRIMARY KEY,
     image    BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reactions (
+    contact    BLOB NOT NULL,
+    message_id BLOB NOT NULL,
+    mine       INTEGER NOT NULL,
+    emoji      TEXT NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    PRIMARY KEY (contact, message_id, mine)
 );
 CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     hash        BLOB PRIMARY KEY,
@@ -530,7 +538,52 @@ impl Store {
              WHERE contact = ?1 ORDER BY sent_at_ms, rowid",
         )?;
         let rows = stmt.query_map(params![contact.as_slice()], message_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut messages: Vec<MessageView> = rows.collect::<Result<_, _>>()?;
+        let mut reactions = self.conversation_reactions(contact)?;
+        for message in &mut messages {
+            message.reactions = reactions.remove(&message.id).unwrap_or_default();
+        }
+        Ok(messages)
+    }
+
+    fn conversation_reactions(&self, contact: &UserKey) -> Result<std::collections::HashMap<MessageId, ReactionsView>> {
+        let mut stmt = self.db.prepare("SELECT message_id, mine, emoji FROM reactions WHERE contact = ?1 AND emoji != ''")?;
+        let rows = stmt.query_map(params![contact.as_slice()], |row| Ok((blob_array::<16>(row, 0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))?;
+        let mut by_message = std::collections::HashMap::<MessageId, ReactionsView>::new();
+        for row in rows {
+            let (id, mine, emoji) = row?;
+            let entry = by_message.entry(id).or_default();
+            if mine == 1 { entry.mine = Some(emoji) } else { entry.theirs = Some(emoji) }
+        }
+        Ok(by_message)
+    }
+
+    pub fn message_exists(&self, contact: &UserKey, id: &MessageId) -> Result<bool> {
+        Ok(self.message_status(contact, id)?.is_some())
+    }
+
+    /// Stores a reaction unless a newer one for the same user and message is already there.
+    /// Returns the message's resulting reactions if it changed anything.
+    pub fn set_reaction(&self, contact: &UserKey, reaction: &wire::Reaction, mine: bool) -> Result<Option<ReactionsView>> {
+        let changed = self.db.execute(
+            "INSERT INTO reactions (contact, message_id, mine, emoji, at_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (contact, message_id, mine) DO UPDATE SET emoji = excluded.emoji, at_ms = excluded.at_ms
+             WHERE excluded.at_ms > reactions.at_ms",
+            params![contact.as_slice(), reaction.message_id.as_slice(), mine as i64, reaction.emoji, reaction.at_ms as i64],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.conversation_reactions(contact)?.remove(&reaction.message_id).unwrap_or_default()))
+    }
+
+    fn purge_orphan_reactions(&self) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM reactions WHERE NOT EXISTS
+             (SELECT 1 FROM messages WHERE messages.contact = reactions.contact AND messages.id = reactions.message_id)",
+            [],
+        )?;
+        Ok(())
     }
 
     /// All messages sent at or after `since_ms`, oldest first (for syncing a linked device).
@@ -571,6 +624,7 @@ impl Store {
                 removed.push(*id);
             }
         }
+        self.purge_orphan_reactions()?;
         Ok(removed)
     }
 
@@ -637,9 +691,11 @@ impl Store {
     pub fn prune_messages_before(&self, cutoff_ms: u64) -> Result<usize> {
         self.db
             .execute("DELETE FROM seen_ciphertexts WHERE seen_at_ms < ?1", params![cutoff_ms as i64])?;
-        Ok(self
+        let removed = self
             .db
-            .execute("DELETE FROM messages WHERE sent_at_ms < ?1", params![cutoff_ms as i64])?)
+            .execute("DELETE FROM messages WHERE sent_at_ms < ?1", params![cutoff_ms as i64])?;
+        self.purge_orphan_reactions()?;
+        Ok(removed)
     }
 }
 
@@ -703,6 +759,7 @@ fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         direction: direction_from_code(row.get(2)?),
         text,
         attachment,
+        reactions: ReactionsView::default(),
         sent_at_ms: row.get::<_, i64>(4)? as u64,
         status: status_from_code(row.get(5)?),
     })

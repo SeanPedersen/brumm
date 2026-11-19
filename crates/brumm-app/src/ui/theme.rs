@@ -43,7 +43,6 @@ pub const BUBBLE_RADIUS: u8 = 16;
 pub const BUBBLE_TAIL_RADIUS: u8 = 4;
 pub const BUBBLE_PADDING: egui::Vec2 = egui::vec2(12.0, 7.0);
 pub const BUBBLE_MAX_WIDTH: f32 = 460.0;
-pub const MESSAGE_COLUMN_MAX_WIDTH: f32 = 760.0;
 pub const GROUP_GAP: f32 = 2.0;
 pub const SENDER_CHANGE_GAP: f32 = 8.0;
 pub const INPUT_RADIUS: CornerRadius = CornerRadius::same(22);

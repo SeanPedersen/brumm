@@ -117,6 +117,7 @@ mod tests {
             direction,
             text: text.to_owned(),
             attachment,
+            reactions: Default::default(),
             sent_at_ms: 1_700_000_000_000 + u64::from(index) * 3_600_000,
             status: DeliveryStatus::Delivered,
         }

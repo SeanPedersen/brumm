@@ -16,7 +16,9 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   the recipient answers with `Payload::Receipt` → Delivered ✔✔.
 - **Rich messages done:** inline files (`Body::File`, ≤ 1 MiB, one sealed envelope; > mailbox letter limit
   is only delivered while both are online), "delete for everyone" (`Payload::Delete` / own-device `DeleteSync`),
-  profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place).
+  profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place),
+  emoji reactions (`Payload::Reaction` / own-device `ReactionSync`, one per user and message, last write wins by
+  `at_ms`, `reactions` table; schema v6 upgrades v4/v5 in place). Reactions are not part of history sync.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.

@@ -22,9 +22,10 @@ use crate::{
     },
 };
 
-const MIN_COLUMN_PADDING: f32 = 12.0;
-/// Always-reserved right gutter that holds the selection markers, so selecting never shifts bubbles.
-const SELECTION_GUTTER: f32 = 48.0;
+/// Fixed side padding of the message list, independent of the window width. The right side also
+/// holds the selection markers, so selecting never shifts the bubbles.
+const COLUMN_PADDING_LEFT: f32 = 17.0;
+const COLUMN_PADDING_RIGHT: f32 = 22.0;
 const DAY_PILL_PADDING: Vec2 = egui::vec2(12.0, 4.0);
 const DAY_PILL_MARGIN: f32 = 10.0;
 const COPY_SEPARATOR: &str = "\n";
@@ -124,10 +125,9 @@ pub fn show(
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::CHAT_BG)).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
-            let column_padding = ((ui.available_width() - theme::MESSAGE_COLUMN_MAX_WIDTH) / 2.0).max(MIN_COLUMN_PADDING);
             let margin = egui::Margin {
-                left: column_padding as i8,
-                right: column_padding.max(SELECTION_GUTTER) as i8,
+                left: COLUMN_PADDING_LEFT as i8,
+                right: COLUMN_PADDING_RIGHT as i8,
                 top: 10,
                 bottom: 10,
             };
@@ -407,6 +407,11 @@ fn apply_action(
     commands: &mut Vec<Command>,
 ) {
     match action {
+        Action::React(emoji) => {
+            // Picking the emoji you already reacted with removes the reaction, like Telegram.
+            let emoji = if message.reactions.mine.as_deref() == Some(emoji.as_str()) { String::new() } else { emoji };
+            commands.push(Command::React { contact, id: message.id, emoji });
+        }
         Action::ToggleSelect => chat.toggle(message.id),
         Action::Copy => ui.ctx().copy_text(message.text.clone()),
         Action::SaveAs => {
@@ -457,6 +462,7 @@ mod tests {
                 direction: if index % 2 == 0 { Direction::Outgoing } else { Direction::Incoming },
                 text: format!("message {index}"),
                 attachment: None,
+                reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
             })
@@ -470,23 +476,25 @@ mod tests {
         state: AppState,
         chat: ChatView,
         draft: String,
+        sent: Vec<Command>,
     }
 
     impl Harness {
         fn new() -> Self {
             let ctx = egui::Context::default();
             crate::ui::theme::apply(&ctx);
-            Self { ctx, state: state(), chat: ChatView::default(), draft: String::new() }
+            Self { ctx, state: state(), chat: ChatView::default(), draft: String::new(), sent: Vec::new() }
         }
 
         fn frame(&mut self, mut events: Vec<egui::Event>, modifiers: egui::Modifiers) {
             events.insert(0, egui::Event::ModifiersChanged(modifiers));
             let screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0)));
             let input = egui::RawInput { screen_rect, events, ..Default::default() };
-            let Self { ctx, state, chat, draft } = self;
+            let Self { ctx, state, chat, draft, sent } = self;
             let mut output = ctx.run_ui(input, |ui| {
                 let mut commands = Vec::new();
                 show(ui, state, chat, CONTACT, draft, &mut commands);
+                sent.extend(commands);
             });
             output.textures_delta.clear();
         }
@@ -559,5 +567,25 @@ mod tests {
         harness.press(fifth, shift);
         harness.release(fifth, shift);
         assert_eq!(harness.selected(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn clicking_own_reaction_chip_removes_it() {
+        let mut harness = Harness::new();
+        harness.state.conversations.get_mut(&CONTACT).expect("conversation")[2].reactions =
+            brumm_core::api::ReactionsView { mine: Some("❤".into()), theirs: None };
+        for _ in 0..3 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        let bubble = harness.chat.row_rects[2];
+        // The chip row sits under the text, left-aligned inside the bubble's padding.
+        let chip = egui::pos2(bubble.left() + 12.0 + 14.0, bubble.bottom() - 7.0 - 12.0);
+        harness.press(chip, egui::Modifiers::NONE);
+        harness.release(chip, egui::Modifiers::NONE);
+        let removal = harness.sent.iter().any(|command| {
+            matches!(command, Command::React { id, emoji, .. } if *id == [3; 16] && emoji.is_empty())
+        });
+        assert!(removal, "expected a removal, got {:?}", harness.sent);
+        assert!(harness.selected().is_empty(), "chip click must not select");
     }
 }

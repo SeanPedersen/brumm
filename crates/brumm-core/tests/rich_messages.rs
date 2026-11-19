@@ -80,3 +80,34 @@ async fn avatar_reaches_contact() {
         .await;
     assert_eq!(seen, Some(image));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reactions_sync_both_ways_and_can_be_removed() {
+    let (mut alice, mut bob, alice_key, bob_key) = connected_pair("reactions").await;
+    let sent = alice.send_text(bob_key, "react to me").await;
+    assert_eq!(bob.received_text().await, "react to me");
+
+    bob.send(Command::React { contact: alice_key, id: sent, emoji: "👍".into() });
+    let theirs = |event: &Event| match event {
+        Event::ReactionsChanged { id, reactions, .. } if *id == sent => Some(reactions.clone()),
+        _ => None,
+    };
+    let on_bob = bob.expect(theirs).await;
+    assert_eq!((on_bob.mine.as_deref(), on_bob.theirs.as_deref()), (Some("👍"), None));
+    let on_alice = alice.expect(theirs).await;
+    assert_eq!((on_alice.mine.as_deref(), on_alice.theirs.as_deref()), (None, Some("👍")));
+
+    // Alice reacts too, Bob removes his own.
+    alice.send(Command::React { contact: bob_key, id: sent, emoji: "❤".into() });
+    let both = bob.expect(theirs).await;
+    assert_eq!((both.mine.as_deref(), both.theirs.as_deref()), (Some("👍"), Some("❤")));
+    bob.send(Command::React { contact: alice_key, id: sent, emoji: String::new() });
+    // Alice also gets the event for her own reaction first; wait for the removal.
+    let removed = alice
+        .expect(|event| theirs(event).filter(|reactions| reactions.theirs.is_none()))
+        .await;
+    assert_eq!((removed.mine.as_deref(), removed.theirs.as_deref()), (Some("❤"), None));
+
+    bob.send(Command::React { contact: alice_key, id: sent, emoji: "two words".into() });
+    bob.expect_error().await;
+}
