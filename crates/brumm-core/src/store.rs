@@ -10,10 +10,13 @@ use iroh::{EndpointId, SecretKey};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
-    api::{AttachmentView, ContactView, ConversationPreview, DeliveryStatus, Direction, MessageView, ReactionsView, Trust},
+    api::{
+        AttachmentView, ContactView, ConversationPreview, DeliveryStatus, Direction, MessageView,
+        ReactionsView, Trust,
+    },
+    crypto::Sealed,
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
-    crypto::Sealed,
     wire::{self, Body, ChatMessage, EnvelopeId, HistoryItem, InviteSecret, MessageId},
 };
 
@@ -95,6 +98,7 @@ const META_PROFILE: &str = "profile";
 const META_OLM_ACCOUNT: &str = "olm_account";
 const META_REVOKED: &str = "revoked";
 const META_MAILBOX_SINCE: &str = "mailbox_since_secs";
+const META_LAST_OPENED: &str = "last_opened";
 
 /// Own identity as persisted on this device.
 pub struct StoredIdentity {
@@ -142,7 +146,9 @@ impl Store {
             bail!("database schema v{version} is newer than this brumm build");
         }
         if version != 0 && version < MIN_UPGRADABLE_SCHEMA_VERSION {
-            bail!("this profile was created by an incompatible pre-release build (schema v{version}); delete its data folder to start fresh");
+            bail!(
+                "this profile was created by an incompatible pre-release build (schema v{version}); delete its data folder to start fresh"
+            );
         }
         if version != SCHEMA_VERSION {
             db.execute_batch(SCHEMA)?;
@@ -203,10 +209,22 @@ impl Store {
     }
 
     pub fn advance_mailbox_since(&self, posted_at_secs: u64) -> Result<()> {
-        if self.mailbox_since()?.is_some_and(|since| since >= posted_at_secs) {
+        if self
+            .mailbox_since()?
+            .is_some_and(|since| since >= posted_at_secs)
+        {
             return Ok(());
         }
         set_meta(&self.db, META_MAILBOX_SINCE, &posted_at_secs.to_le_bytes())
+    }
+
+    /// User key of the chat open on this device, if one was saved. A short or corrupt value is ignored.
+    pub fn last_opened(&self) -> Result<Option<UserKey>> {
+        Ok(get_meta(&self.db, META_LAST_OPENED)?.and_then(|bytes| bytes.try_into().ok()))
+    }
+
+    pub fn set_last_opened(&self, contact: &UserKey) -> Result<()> {
+        set_meta(&self.db, META_LAST_OPENED, contact.as_slice())
     }
 
     // ── invites ─────────────────────────────────────────────────────────────
@@ -236,7 +254,12 @@ impl Store {
 
     /// Inserts or updates a contact and replaces its devices with `profile.devices`.
     /// Returns the contact and the device ids that are no longer part of the list.
-    pub fn upsert_contact(&self, profile: &Profile, trust: Trust, added_at_ms: u64) -> Result<(ContactView, Vec<EndpointId>)> {
+    pub fn upsert_contact(
+        &self,
+        profile: &Profile,
+        trust: Trust,
+        added_at_ms: u64,
+    ) -> Result<(ContactView, Vec<EndpointId>)> {
         let tx = self.db.unchecked_transaction()?;
         let user_key = profile.user_key();
         tx.execute(
@@ -246,7 +269,9 @@ impl Store {
         )?;
         let removed = replace_devices(&tx, &user_key, &profile.devices.entries)?;
         tx.commit()?;
-        let contact = self.contact(&user_key)?.context("contact vanished after insert")?;
+        let contact = self
+            .contact(&user_key)?
+            .context("contact vanished after insert")?;
         Ok((contact, removed))
     }
 
@@ -292,8 +317,13 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        row.map(|(display_name, list)| Ok(Profile { display_name, devices: wire::decode(&list)? }))
-            .transpose()
+        row.map(|(display_name, list)| {
+            Ok(Profile {
+                display_name,
+                devices: wire::decode(&list)?,
+            })
+        })
+        .transpose()
     }
 
     /// Stores a newer device list for a contact; returns removed device ids.
@@ -311,7 +341,11 @@ impl Store {
     // ── devices (any user, including our own other devices) ─────────────────
 
     /// Replaces the stored devices of `user_key`; returns removed device ids.
-    pub fn replace_devices(&self, user_key: &UserKey, entries: &[DeviceEntry]) -> Result<Vec<EndpointId>> {
+    pub fn replace_devices(
+        &self,
+        user_key: &UserKey,
+        entries: &[DeviceEntry],
+    ) -> Result<Vec<EndpointId>> {
         let tx = self.db.unchecked_transaction()?;
         let removed = replace_devices(&tx, user_key, entries)?;
         tx.commit()?;
@@ -343,8 +377,11 @@ impl Store {
     }
 
     pub fn devices_of(&self, user_key: &UserKey) -> Result<Vec<DeviceEntry>> {
-        let mut stmt = self.db.prepare("SELECT entry FROM devices WHERE user_key = ?1")?;
-        let entries = stmt.query_map(params![user_key.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT entry FROM devices WHERE user_key = ?1")?;
+        let entries =
+            stmt.query_map(params![user_key.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
         let mut devices = Vec::new();
         for entry in entries {
             devices.push(wire::decode(&entry?)?);
@@ -356,16 +393,22 @@ impl Store {
 
     /// `(session_id, pickle, last_used_ms)` for every session with `device_id`.
     pub fn sessions_of(&self, device_id: &EndpointId) -> Result<Vec<(String, String, u64)>> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT session_id, pickle, last_used_ms FROM olm_sessions WHERE device_id = ?1")?;
+        let mut stmt = self.db.prepare(
+            "SELECT session_id, pickle, last_used_ms FROM olm_sessions WHERE device_id = ?1",
+        )?;
         let rows = stmt.query_map(params![device_id.as_bytes().as_slice()], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as u64))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn save_session(&self, device_id: &EndpointId, session_id: &str, pickle: &str, last_used_ms: u64) -> Result<()> {
+    pub fn save_session(
+        &self,
+        device_id: &EndpointId,
+        session_id: &str,
+        pickle: &str,
+        last_used_ms: u64,
+    ) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO olm_sessions (device_id, session_id, pickle, last_used_ms) VALUES (?1, ?2, ?3, ?4)",
             params![device_id.as_bytes().as_slice(), session_id, pickle, last_used_ms as i64],
@@ -391,7 +434,15 @@ impl Store {
 
     // ── outbox ──────────────────────────────────────────────────────────────
 
-    pub fn enqueue(&self, device: &EndpointId, envelope_id: &EnvelopeId, sealed: &Sealed, chat_contact: Option<&UserKey>, is_receipt: bool, now_ms: u64) -> Result<()> {
+    pub fn enqueue(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+        sealed: &Sealed,
+        chat_contact: Option<&UserKey>,
+        is_receipt: bool,
+        now_ms: u64,
+    ) -> Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO outbox (device_id, envelope_id, sealed, chat_contact, is_receipt, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -407,7 +458,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn outbox_item(&self, device: &EndpointId, envelope_id: &EnvelopeId) -> Result<Option<OutboxItem>> {
+    pub fn outbox_item(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+    ) -> Result<Option<OutboxItem>> {
         let row = self
             .db
             .query_row(
@@ -437,7 +492,11 @@ impl Store {
     }
 
     /// Chat contact of a queued envelope (if it is a chat message).
-    pub fn outbox_chat_contact(&self, device: &EndpointId, envelope_id: &EnvelopeId) -> Result<Option<UserKey>> {
+    pub fn outbox_chat_contact(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+    ) -> Result<Option<UserKey>> {
         let contact: Option<Option<Vec<u8>>> = self
             .db
             .query_row(
@@ -446,7 +505,9 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(contact.flatten().and_then(|contact| contact.try_into().ok()))
+        Ok(contact
+            .flatten()
+            .and_then(|contact| contact.try_into().ok()))
     }
 
     pub fn outbox(&self) -> Result<Vec<OutboxItem>> {
@@ -457,7 +518,13 @@ impl Store {
             let device: [u8; 32] = blob_array(row, 0)?;
             let envelope_id: EnvelopeId = blob_array(row, 1)?;
             let sealed: Vec<u8> = row.get(2)?;
-            Ok((device, envelope_id, sealed, row.get::<_, bool>(3)?, row.get::<_, bool>(4)?))
+            Ok((
+                device,
+                envelope_id,
+                sealed,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
         })?;
         let mut items = Vec::new();
         for row in rows {
@@ -474,7 +541,11 @@ impl Store {
     }
 
     /// Removes an acked envelope. `None` if it was not queued; otherwise its chat contact.
-    pub fn dequeue(&self, device: &EndpointId, envelope_id: &EnvelopeId) -> Result<Option<Option<UserKey>>> {
+    pub fn dequeue(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+    ) -> Result<Option<Option<UserKey>>> {
         let removed: Option<Option<Vec<u8>>> = self
             .db
             .query_row(
@@ -487,7 +558,10 @@ impl Store {
     }
 
     pub fn drop_outbox_for(&self, device: &EndpointId) -> Result<()> {
-        self.db.execute("DELETE FROM outbox WHERE device_id = ?1", params![device.as_bytes().as_slice()])?;
+        self.db.execute(
+            "DELETE FROM outbox WHERE device_id = ?1",
+            params![device.as_bytes().as_slice()],
+        )?;
         Ok(())
     }
 
@@ -506,7 +580,12 @@ impl Store {
         Ok(id.and_then(|id| id.try_into().ok()))
     }
 
-    pub fn remember_ciphertext(&self, hash: &[u8; 32], envelope_id: &EnvelopeId, now_ms: u64) -> Result<()> {
+    pub fn remember_ciphertext(
+        &self,
+        hash: &[u8; 32],
+        envelope_id: &EnvelopeId,
+        now_ms: u64,
+    ) -> Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO seen_ciphertexts (hash, envelope_id, seen_at_ms) VALUES (?1, ?2, ?3)",
             params![hash.as_slice(), envelope_id.as_slice(), now_ms as i64],
@@ -517,7 +596,14 @@ impl Store {
     // ── messages ────────────────────────────────────────────────────────────
 
     /// Returns `false` if the message was already stored (duplicate delivery or sync).
-    pub fn insert_message(&self, contact: &UserKey, message: &ChatMessage, direction: Direction, status: DeliveryStatus, received_at_ms: Option<u64>) -> Result<bool> {
+    pub fn insert_message(
+        &self,
+        contact: &UserKey,
+        message: &ChatMessage,
+        direction: Direction,
+        status: DeliveryStatus,
+        received_at_ms: Option<u64>,
+    ) -> Result<bool> {
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (contact, id, direction, body, sent_at_ms, received_at_ms, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -534,7 +620,12 @@ impl Store {
         Ok(inserted == 1)
     }
 
-    pub fn set_status(&self, contact: &UserKey, id: &MessageId, status: DeliveryStatus) -> Result<()> {
+    pub fn set_status(
+        &self,
+        contact: &UserKey,
+        id: &MessageId,
+        status: DeliveryStatus,
+    ) -> Result<()> {
         self.db.execute(
             "UPDATE messages SET status = ?3 WHERE contact = ?1 AND id = ?2",
             params![contact.as_slice(), id.as_slice(), status_code(status)],
@@ -542,7 +633,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn message_status(&self, contact: &UserKey, id: &MessageId) -> Result<Option<DeliveryStatus>> {
+    pub fn message_status(
+        &self,
+        contact: &UserKey,
+        id: &MessageId,
+    ) -> Result<Option<DeliveryStatus>> {
         let status: Option<i64> = self
             .db
             .query_row(
@@ -605,14 +700,29 @@ impl Store {
             .optional()?)
     }
 
-    fn conversation_reactions(&self, contact: &UserKey) -> Result<std::collections::HashMap<MessageId, ReactionsView>> {
-        let mut stmt = self.db.prepare("SELECT message_id, mine, emoji FROM reactions WHERE contact = ?1 AND emoji != ''")?;
-        let rows = stmt.query_map(params![contact.as_slice()], |row| Ok((blob_array::<16>(row, 0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))?;
+    fn conversation_reactions(
+        &self,
+        contact: &UserKey,
+    ) -> Result<std::collections::HashMap<MessageId, ReactionsView>> {
+        let mut stmt = self.db.prepare(
+            "SELECT message_id, mine, emoji FROM reactions WHERE contact = ?1 AND emoji != ''",
+        )?;
+        let rows = stmt.query_map(params![contact.as_slice()], |row| {
+            Ok((
+                blob_array::<16>(row, 0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         let mut by_message = std::collections::HashMap::<MessageId, ReactionsView>::new();
         for row in rows {
             let (id, mine, emoji) = row?;
             let entry = by_message.entry(id).or_default();
-            if mine == 1 { entry.mine = Some(emoji) } else { entry.theirs = Some(emoji) }
+            if mine == 1 {
+                entry.mine = Some(emoji)
+            } else {
+                entry.theirs = Some(emoji)
+            }
         }
         Ok(by_message)
     }
@@ -623,7 +733,12 @@ impl Store {
 
     /// Stores a reaction unless a newer one for the same user and message is already there.
     /// Returns the message's resulting reactions if it changed anything.
-    pub fn set_reaction(&self, contact: &UserKey, reaction: &wire::Reaction, mine: bool) -> Result<Option<ReactionsView>> {
+    pub fn set_reaction(
+        &self,
+        contact: &UserKey,
+        reaction: &wire::Reaction,
+        mine: bool,
+    ) -> Result<Option<ReactionsView>> {
         let changed = self.db.execute(
             "INSERT INTO reactions (contact, message_id, mine, emoji, at_ms) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (contact, message_id, mine) DO UPDATE SET emoji = excluded.emoji, at_ms = excluded.at_ms
@@ -633,7 +748,11 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
-        Ok(Some(self.conversation_reactions(contact)?.remove(&reaction.message_id).unwrap_or_default()))
+        Ok(Some(
+            self.conversation_reactions(contact)?
+                .remove(&reaction.message_id)
+                .unwrap_or_default(),
+        ))
     }
 
     fn purge_orphan_reactions(&self) -> Result<()> {
@@ -666,7 +785,12 @@ impl Store {
 
     /// Removes messages of one conversation; `only` restricts it to one direction (a contact may
     /// only delete what they sent). Returns the ids that were actually removed.
-    pub fn delete_messages(&self, contact: &UserKey, ids: &[MessageId], only: Option<Direction>) -> Result<Vec<MessageId>> {
+    pub fn delete_messages(
+        &self,
+        contact: &UserKey,
+        ids: &[MessageId],
+        only: Option<Direction>,
+    ) -> Result<Vec<MessageId>> {
         let mut removed = Vec::new();
         for id in ids {
             let deleted = match only {
@@ -708,7 +832,10 @@ impl Store {
     /// Drops queued envelopes whose id equals a deleted message id (unsent copies).
     pub fn drop_outbox_envelopes(&self, ids: &[MessageId]) -> Result<()> {
         for id in ids {
-            self.db.execute("DELETE FROM outbox WHERE envelope_id = ?1", params![id.as_slice()])?;
+            self.db.execute(
+                "DELETE FROM outbox WHERE envelope_id = ?1",
+                params![id.as_slice()],
+            )?;
         }
         Ok(())
     }
@@ -730,7 +857,10 @@ impl Store {
     /// Empty `image` removes the avatar.
     pub fn set_avatar(&self, user: &UserKey, image: &[u8]) -> Result<()> {
         if image.is_empty() {
-            self.db.execute("DELETE FROM avatars WHERE user_key = ?1", params![user.as_slice()])?;
+            self.db.execute(
+                "DELETE FROM avatars WHERE user_key = ?1",
+                params![user.as_slice()],
+            )?;
             return Ok(());
         }
         self.db.execute(
@@ -749,11 +879,14 @@ impl Store {
     /// Deletes messages (and dedupe records) older than `cutoff_ms`, except the `keep` conversation
     /// (the Notes chat). Returns messages removed.
     pub fn prune_messages_before(&self, cutoff_ms: u64, keep: &UserKey) -> Result<usize> {
-        self.db
-            .execute("DELETE FROM seen_ciphertexts WHERE seen_at_ms < ?1", params![cutoff_ms as i64])?;
-        let removed = self
-            .db
-            .execute("DELETE FROM messages WHERE sent_at_ms < ?1 AND contact != ?2", params![cutoff_ms as i64, keep])?;
+        self.db.execute(
+            "DELETE FROM seen_ciphertexts WHERE seen_at_ms < ?1",
+            params![cutoff_ms as i64],
+        )?;
+        let removed = self.db.execute(
+            "DELETE FROM messages WHERE sent_at_ms < ?1 AND contact != ?2",
+            params![cutoff_ms as i64, keep],
+        )?;
         self.purge_orphan_reactions()?;
         Ok(removed)
     }
@@ -761,7 +894,11 @@ impl Store {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn replace_devices(db: &Connection, user_key: &UserKey, entries: &[DeviceEntry]) -> Result<Vec<EndpointId>> {
+fn replace_devices(
+    db: &Connection,
+    user_key: &UserKey,
+    entries: &[DeviceEntry],
+) -> Result<Vec<EndpointId>> {
     let mut stmt = db.prepare("SELECT device_id FROM devices WHERE user_key = ?1")?;
     let existing = stmt
         .query_map(params![user_key.as_slice()], |row| blob_array::<32>(row, 0))?
@@ -770,14 +907,21 @@ fn replace_devices(db: &Connection, user_key: &UserKey, entries: &[DeviceEntry])
     for device in existing {
         let device = EndpointId::from_bytes(&device)?;
         if !entries.iter().any(|entry| entry.device_id() == device) {
-            db.execute("DELETE FROM devices WHERE device_id = ?1", params![device.as_bytes().as_slice()])?;
+            db.execute(
+                "DELETE FROM devices WHERE device_id = ?1",
+                params![device.as_bytes().as_slice()],
+            )?;
             removed.push(device);
         }
     }
     for entry in entries {
         db.execute(
             "INSERT OR REPLACE INTO devices (device_id, user_key, entry) VALUES (?1, ?2, ?3)",
-            params![entry.device_id().as_bytes().as_slice(), user_key.as_slice(), wire::encode(entry)],
+            params![
+                entry.device_id().as_bytes().as_slice(),
+                user_key.as_slice(),
+                wire::encode(entry)
+            ],
         )?;
     }
     Ok(removed)
@@ -793,7 +937,11 @@ fn set_meta(db: &Connection, key: &str, value: &[u8]) -> Result<()> {
 
 fn get_meta(db: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
     Ok(db
-        .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| row.get(0))
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
         .optional()?)
 }
 
@@ -811,7 +959,13 @@ fn contact_from_row(row: &rusqlite::Row) -> rusqlite::Result<ContactView> {
 fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
     let (text, attachment) = match body_from_blob(row, 3)? {
         Body::Text(text) => (text, None),
-        Body::File { name, data } => (String::new(), Some(AttachmentView { name, size: data.len() })),
+        Body::File { name, data } => (
+            String::new(),
+            Some(AttachmentView {
+                name,
+                size: data.len(),
+            }),
+        ),
     };
     Ok(MessageView {
         contact: blob_array(row, 0)?,
@@ -861,7 +1015,11 @@ fn direction_code(direction: Direction) -> i64 {
 }
 
 fn direction_from_code(code: i64) -> Direction {
-    if code == 0 { Direction::Incoming } else { Direction::Outgoing }
+    if code == 0 {
+        Direction::Incoming
+    } else {
+        Direction::Outgoing
+    }
 }
 
 fn status_code(status: DeliveryStatus) -> i64 {
@@ -888,8 +1046,14 @@ mod tests {
     use crate::identity::{UserIdentity, tests::entry};
 
     fn profile(identity: &UserIdentity, devices: &[EndpointId]) -> Profile {
-        let entries = devices.iter().map(|device| entry(identity, *device)).collect();
-        Profile { display_name: "bob".into(), devices: identity.sign_device_list(1, entries) }
+        let entries = devices
+            .iter()
+            .map(|device| entry(identity, *device))
+            .collect();
+        Profile {
+            display_name: "bob".into(),
+            devices: identity.sign_device_list(1, entries),
+        }
     }
 
     #[test]
@@ -907,20 +1071,37 @@ mod tests {
     fn contact_devices_are_replaced() {
         let store = Store::open_in_memory().unwrap();
         let bob = UserIdentity::generate();
-        let (laptop, phone) = (SecretKey::generate().public(), SecretKey::generate().public());
-        let (contact, removed) = store.upsert_contact(&profile(&bob, &[laptop, phone]), Trust::Verified, 0).unwrap();
+        let (laptop, phone) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+        let (contact, removed) = store
+            .upsert_contact(&profile(&bob, &[laptop, phone]), Trust::Verified, 0)
+            .unwrap();
         assert!(removed.is_empty());
         assert_eq!(store.devices_of(&contact.user_key).unwrap().len(), 2);
         assert_eq!(store.device_owner(&phone).unwrap(), Some(bob.public()));
 
-        let (_, removed) = store.upsert_contact(&profile(&bob, &[laptop]), Trust::Verified, 0).unwrap();
+        let (_, removed) = store
+            .upsert_contact(&profile(&bob, &[laptop]), Trust::Verified, 0)
+            .unwrap();
         assert_eq!(removed, vec![phone]);
         assert_eq!(store.device_owner(&phone).unwrap(), None);
 
         let newer = bob.sign_device_list(2, vec![entry(&bob, phone)]);
         assert_eq!(store.set_contact_device_list(&newer).unwrap(), vec![laptop]);
-        assert_eq!(store.contact_device_list(&bob.public()).unwrap(), Some(newer.clone()));
-        assert_eq!(store.contact_profile(&bob.public()).unwrap().unwrap().devices, newer);
+        assert_eq!(
+            store.contact_device_list(&bob.public()).unwrap(),
+            Some(newer.clone())
+        );
+        assert_eq!(
+            store
+                .contact_profile(&bob.public())
+                .unwrap()
+                .unwrap()
+                .devices,
+            newer
+        );
     }
 
     #[test]
@@ -933,17 +1114,27 @@ mod tests {
         store.delete_session(&device, "a").unwrap();
         assert_eq!(store.sessions_of(&device).unwrap().len(), 1);
 
-        let sealed = Sealed { message_type: 0, ciphertext: vec![1, 2, 3] };
+        let sealed = Sealed {
+            message_type: 0,
+            ciphertext: vec![1, 2, 3],
+        };
         let id = [7; 16];
-        store.enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0).unwrap();
-        store.enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0).unwrap();
+        store
+            .enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0)
+            .unwrap();
+        store
+            .enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0)
+            .unwrap();
         let outbox = store.outbox().unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].sealed, sealed);
         assert!(!outbox[0].mailboxed);
         store.mark_mailboxed(&device, &id).unwrap();
         assert!(store.outbox_item(&device, &id).unwrap().unwrap().mailboxed);
-        assert_eq!(store.outbox_chat_contact(&device, &id).unwrap(), Some([9; 32]));
+        assert_eq!(
+            store.outbox_chat_contact(&device, &id).unwrap(),
+            Some([9; 32])
+        );
 
         assert_eq!(store.mailbox_since().unwrap(), None);
         store.advance_mailbox_since(50).unwrap();
@@ -951,6 +1142,12 @@ mod tests {
         assert_eq!(store.mailbox_since().unwrap(), Some(50));
         assert_eq!(store.dequeue(&device, &id).unwrap(), Some(Some([9; 32])));
         assert_eq!(store.dequeue(&device, &id).unwrap(), None);
+
+        assert_eq!(store.last_opened().unwrap(), None);
+        store.set_last_opened(&[4; 32]).unwrap();
+        assert_eq!(store.last_opened().unwrap(), Some([4; 32]));
+        set_meta(&store.db, META_LAST_OPENED, &[1, 2, 3]).unwrap();
+        assert_eq!(store.last_opened().unwrap(), None);
 
         store.remember_ciphertext(&[1; 32], &id, 5).unwrap();
         assert_eq!(store.seen_ciphertext(&[1; 32]).unwrap(), Some(id));
@@ -962,14 +1159,55 @@ mod tests {
     fn messages_dedupe_history_and_prune() {
         let store = Store::open_in_memory().unwrap();
         let contact = [5; 32];
-        let message = ChatMessage { id: [3; 16], sent_at_ms: 100, body: Body::Text("hi".into()) };
-        assert!(store.insert_message(&contact, &message, Direction::Incoming, DeliveryStatus::Delivered, Some(101)).unwrap());
-        assert!(!store.insert_message(&contact, &message, Direction::Incoming, DeliveryStatus::Delivered, Some(102)).unwrap());
+        let message = ChatMessage {
+            id: [3; 16],
+            sent_at_ms: 100,
+            body: Body::Text("hi".into()),
+        };
+        assert!(
+            store
+                .insert_message(
+                    &contact,
+                    &message,
+                    Direction::Incoming,
+                    DeliveryStatus::Delivered,
+                    Some(101)
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_message(
+                    &contact,
+                    &message,
+                    Direction::Incoming,
+                    DeliveryStatus::Delivered,
+                    Some(102)
+                )
+                .unwrap()
+        );
 
-        let outgoing = ChatMessage { id: [4; 16], sent_at_ms: 200, body: Body::Text("yo".into()) };
-        store.insert_message(&contact, &outgoing, Direction::Outgoing, DeliveryStatus::Pending, None).unwrap();
-        store.set_status(&contact, &outgoing.id, DeliveryStatus::Delivered).unwrap();
-        assert_eq!(store.message_status(&contact, &outgoing.id).unwrap(), Some(DeliveryStatus::Delivered));
+        let outgoing = ChatMessage {
+            id: [4; 16],
+            sent_at_ms: 200,
+            body: Body::Text("yo".into()),
+        };
+        store
+            .insert_message(
+                &contact,
+                &outgoing,
+                Direction::Outgoing,
+                DeliveryStatus::Pending,
+                None,
+            )
+            .unwrap();
+        store
+            .set_status(&contact, &outgoing.id, DeliveryStatus::Delivered)
+            .unwrap();
+        assert_eq!(
+            store.message_status(&contact, &outgoing.id).unwrap(),
+            Some(DeliveryStatus::Delivered)
+        );
 
         assert_eq!(store.history_since(150).unwrap().len(), 1);
         assert_eq!(store.conversation(&contact).unwrap().len(), 2);

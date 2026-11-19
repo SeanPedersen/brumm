@@ -64,7 +64,11 @@ impl NodeConfig {
 }
 
 /// Runs the node until the command channel closes.
-pub async fn run(config: NodeConfig, mut commands: mpsc::UnboundedReceiver<Command>, events: EventSink) {
+pub async fn run(
+    config: NodeConfig,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    events: EventSink,
+) {
     let mut node = match Node::open(&config, events.clone()) {
         Ok(node) => node,
         Err(err) => {
@@ -141,10 +145,24 @@ struct PendingLink {
 
 /// Results of network work spawned off the actor loop.
 enum Outcome {
-    Hello { invite: Box<Invite>, reply: Result<Reply> },
-    Link { device: EndpointId, reply: Result<Reply> },
-    Delivery { device: EndpointId, envelope_id: EnvelopeId, reply: Result<Reply> },
-    Mailboxed { device: EndpointId, envelope_id: EnvelopeId, result: Result<()> },
+    Hello {
+        invite: Box<Invite>,
+        reply: Result<Reply>,
+    },
+    Link {
+        device: EndpointId,
+        reply: Result<Reply>,
+    },
+    Delivery {
+        device: EndpointId,
+        envelope_id: EnvelopeId,
+        reply: Result<Reply>,
+    },
+    Mailboxed {
+        device: EndpointId,
+        envelope_id: EnvelopeId,
+        result: Result<()>,
+    },
     MailboxReady(Arc<Mailbox>),
 }
 
@@ -206,7 +224,10 @@ impl Node {
                 Ok(mailbox) => {
                     let _ = outcomes.send(Outcome::MailboxReady(mailbox));
                 }
-                Err(err) => tracing::warn!(?err, "mailbox unavailable; offline delivery disabled for this session"),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "mailbox unavailable; offline delivery disabled for this session"
+                ),
             }
         });
     }
@@ -218,7 +239,14 @@ impl Node {
         let contacts = self.store.contacts().unwrap_or_default();
         let previews = self.store.conversation_previews().unwrap_or_default();
         let profile = self.me.as_ref().map(|me| profile_view(&me.profile));
-        self.events.emit(Event::Ready { profile, contacts, previews });
+        // One primary-key read. The conversation itself loads later, after Ready.
+        let last_opened = self.store.last_opened().unwrap_or(None);
+        self.events.emit(Event::Ready {
+            profile,
+            contacts,
+            previews,
+            last_opened,
+        });
         for (user, image) in self.store.avatars().unwrap_or_default() {
             self.emit_avatar(&user, &image);
         }
@@ -310,7 +338,10 @@ impl Node {
 
     fn prune(&self) -> Result<()> {
         let Some(me) = &self.me else { return Ok(()) };
-        let removed = self.store.prune_messages_before(crate::clock::now_ms().saturating_sub(RETENTION_MS), &me.user_key())?;
+        let removed = self.store.prune_messages_before(
+            crate::clock::now_ms().saturating_sub(RETENTION_MS),
+            &me.user_key(),
+        )?;
         if removed > 0 {
             tracing::info!(removed, "pruned messages past retention");
         }
@@ -321,8 +352,16 @@ impl Node {
         match outcome {
             Outcome::Hello { invite, reply } => self.finish_hello(*invite, reply),
             Outcome::Link { device, reply } => self.finish_link(device, reply),
-            Outcome::Delivery { device, envelope_id, reply } => self.finish_delivery(device, envelope_id, reply),
-            Outcome::Mailboxed { device, envelope_id, result } => self.finish_mailboxing(device, envelope_id, result),
+            Outcome::Delivery {
+                device,
+                envelope_id,
+                reply,
+            } => self.finish_delivery(device, envelope_id, reply),
+            Outcome::Mailboxed {
+                device,
+                envelope_id,
+                result,
+            } => self.finish_mailboxing(device, envelope_id, result),
             Outcome::MailboxReady(mailbox) => {
                 if let Some(me) = self.me.as_mut() {
                     me.mailbox = Some(mailbox);

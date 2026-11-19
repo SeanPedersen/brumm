@@ -59,6 +59,8 @@ pub struct AppState {
     pub profile: Option<ProfileView>,
     pub contacts: Vec<ContactView>,
     pub selected: Option<UserKey>,
+    /// Chat the user just opened. The app sends [`brumm_core::api::Command::RememberOpenChat`] once.
+    pub remember_open: Option<UserKey>,
     /// Messages of opened chats only.
     pub conversations: HashMap<UserKey, Vec<MessageView>>,
     /// Newest message per chat, for the sidebar's preview and ordering.
@@ -89,7 +91,9 @@ impl AppState {
 
     /// The "Notes" chat is the conversation with our own user key.
     pub fn is_notes(&self, key: &UserKey) -> bool {
-        self.profile.as_ref().is_some_and(|profile| &profile.user_key == key)
+        self.profile
+            .as_ref()
+            .is_some_and(|profile| &profile.user_key == key)
     }
 
     /// Lists the Notes chat as a pseudo-contact so it appears in the chat list from the start.
@@ -109,11 +113,27 @@ impl AppState {
     }
 
     pub fn contact(&self, key: &UserKey) -> Option<&ContactView> {
-        self.contacts.iter().find(|contact| &contact.user_key == key)
+        self.contacts
+            .iter()
+            .find(|contact| &contact.user_key == key)
     }
 
     /// Selects a chat and drops cached data of the previous one; only one chat is shown at a time.
+    /// A changed selection is remembered on this device.
     pub fn select(&mut self, key: UserKey, ctx: &egui::Context) {
+        self.open(key, ctx, true);
+    }
+
+    /// Shows `key` without writing it back. Used when restoring the chat saved at the last run.
+    fn restore(&mut self, key: UserKey, ctx: &egui::Context) {
+        self.open(key, ctx, false);
+        self.stale_conversations.push(key);
+    }
+
+    fn open(&mut self, key: UserKey, ctx: &egui::Context, remember: bool) {
+        if remember && self.selected != Some(key) {
+            self.remember_open = Some(key);
+        }
         self.selected = Some(key);
         self.unread.remove(&key);
         self.conversations.retain(|cached, _| *cached == key);
@@ -135,7 +155,8 @@ impl AppState {
             Some(known) => *known = contact,
             None => self.contacts.push(contact),
         }
-        self.contacts.sort_by_key(|contact| contact.display_name.to_lowercase());
+        self.contacts
+            .sort_by_key(|contact| contact.display_name.to_lowercase());
         if std::mem::take(&mut self.connecting) {
             self.select(key, ctx);
         }
@@ -143,7 +164,12 @@ impl AppState {
 
     pub fn apply(&mut self, event: Event, ctx: &egui::Context) {
         match event {
-            Event::Ready { profile, contacts, previews } => {
+            Event::Ready {
+                profile,
+                contacts,
+                previews,
+                last_opened,
+            } => {
                 self.ready = true;
                 self.profile = profile;
                 self.previews = previews
@@ -152,8 +178,15 @@ impl AppState {
                     .collect();
                 self.contacts = contacts;
                 self.ensure_notes_contact();
+                // History loads on the next frame via LoadConversation, so Ready stays a few keyed reads.
+                if let Some(contact) = last_opened.filter(|key| self.contact(key).is_some()) {
+                    self.restore(contact, ctx);
+                }
             }
-            Event::IdentityCreated { profile, seed_phrase } => {
+            Event::IdentityCreated {
+                profile,
+                seed_phrase,
+            } => {
                 self.profile = Some(profile);
                 self.seed_phrase_to_show = seed_phrase;
                 self.ensure_notes_contact();
@@ -192,15 +225,21 @@ impl AppState {
                     *self.unread.entry(contact).or_default() += 1;
                 }
                 if self.selected == Some(contact) {
-                    self.conversations.entry(contact).or_default().push(message.clone());
+                    self.conversations
+                        .entry(contact)
+                        .or_default()
+                        .push(message.clone());
                 }
                 self.remember_preview(message);
             }
-            Event::MessageStatusChanged { contact, id, status } => {
-                let message = self
-                    .conversations
-                    .get_mut(&contact)
-                    .and_then(|messages| messages.iter_mut().rev().find(|message| message.id == id));
+            Event::MessageStatusChanged {
+                contact,
+                id,
+                status,
+            } => {
+                let message = self.conversations.get_mut(&contact).and_then(|messages| {
+                    messages.iter_mut().rev().find(|message| message.id == id)
+                });
                 if let Some(message) = message {
                     message.status = status;
                 }
@@ -213,11 +252,14 @@ impl AppState {
                     self.forget_attachment((contact, *id), ctx);
                 }
             }
-            Event::ReactionsChanged { contact, id, reactions } => {
-                let message = self
-                    .conversations
-                    .get_mut(&contact)
-                    .and_then(|messages| messages.iter_mut().rev().find(|message| message.id == id));
+            Event::ReactionsChanged {
+                contact,
+                id,
+                reactions,
+            } => {
+                let message = self.conversations.get_mut(&contact).and_then(|messages| {
+                    messages.iter_mut().rev().find(|message| message.id == id)
+                });
                 if let Some(message) = message {
                     message.reactions = reactions;
                 }
@@ -225,7 +267,13 @@ impl AppState {
             Event::AvatarChanged { user, image } => match image {
                 Some(bytes) => {
                     let uri = format!("bytes://avatar/{}-{}", hex_prefix(&user), checksum(&bytes));
-                    self.avatars.insert(user, AvatarImage { uri, bytes: bytes.into() });
+                    self.avatars.insert(
+                        user,
+                        AvatarImage {
+                            uri,
+                            bytes: bytes.into(),
+                        },
+                    );
                 }
                 None => {
                     if let Some(old) = self.avatars.remove(&user) {
@@ -239,7 +287,11 @@ impl AppState {
                     .ok()
                     .and_then(|reader| reader.into_dimensions().ok());
                 let bytes: Arc<[u8]> = data.as_slice().into();
-                self.remember_attachment((contact, id), LoadedAttachment { bytes, image_size }, ctx);
+                self.remember_attachment(
+                    (contact, id),
+                    LoadedAttachment { bytes, image_size },
+                    ctx,
+                );
             }
             Event::Error(error) => {
                 self.connecting = false;
@@ -261,13 +313,22 @@ impl AppState {
         }
     }
 
-    fn remember_attachment(&mut self, key: (UserKey, MessageId), loaded: LoadedAttachment, ctx: &egui::Context) {
+    fn remember_attachment(
+        &mut self,
+        key: (UserKey, MessageId),
+        loaded: LoadedAttachment,
+        ctx: &egui::Context,
+    ) {
         self.forget_attachment(key, ctx);
         self.attachment_bytes += loaded.bytes.len();
         self.attachments.insert(key, loaded);
         self.attachment_order.push_back(key);
-        while self.attachments.len() > ATTACHMENT_CACHE_ENTRIES || self.attachment_bytes > ATTACHMENT_CACHE_BYTES {
-            let Some(oldest) = self.attachment_order.pop_front() else { break };
+        while self.attachments.len() > ATTACHMENT_CACHE_ENTRIES
+            || self.attachment_bytes > ATTACHMENT_CACHE_BYTES
+        {
+            let Some(oldest) = self.attachment_order.pop_front() else {
+                break;
+            };
             if let Some(dropped) = self.attachments.remove(&oldest) {
                 self.attachment_bytes = self.attachment_bytes.saturating_sub(dropped.bytes.len());
                 ctx.forget_image(&attachment_uri(&oldest.1));
@@ -287,16 +348,84 @@ impl AppState {
 const HEX_PREFIX_BYTES: usize = 4;
 
 fn hex_prefix(key: &UserKey) -> String {
-    key[..HEX_PREFIX_BYTES].iter().map(|byte| format!("{byte:02x}")).collect()
+    key[..HEX_PREFIX_BYTES]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use brumm_core::api::{ContactView, ProfileView, Trust};
+
+    use super::*;
+
+    fn contact(user_key: UserKey, name: &str) -> ContactView {
+        ContactView {
+            user_key,
+            display_name: name.to_owned(),
+            fingerprint: "ab".into(),
+            trust: Trust::Verified,
+            added_at_ms: 0,
+        }
+    }
+
+    fn ready(
+        state: &mut AppState,
+        me: UserKey,
+        contacts: Vec<ContactView>,
+        last_opened: Option<UserKey>,
+    ) {
+        state.apply(
+            Event::Ready {
+                profile: Some(ProfileView {
+                    user_key: me,
+                    display_name: "Ada".into(),
+                    fingerprint: "cd".into(),
+                }),
+                contacts,
+                previews: Vec::new(),
+                last_opened,
+            },
+            &egui::Context::default(),
+        );
+    }
+
+    #[test]
+    fn ready_reopens_saved_chat_without_writing_it_again() {
+        let mut state = AppState::default();
+        let me = [1; 32];
+        let bob = [2; 32];
+        ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
+        assert_eq!(state.selected, Some(bob));
+        assert_eq!(state.stale_conversations, vec![bob]);
+        assert_eq!(state.remember_open, None);
+    }
+
+    #[test]
+    fn ready_reopens_notes_and_skips_unknown_keys() {
+        let mut state = AppState::default();
+        let me = [1; 32];
+        ready(&mut state, me, Vec::new(), Some(me));
+        assert_eq!(state.selected, Some(me));
+        assert!(state.is_notes(&me));
+
+        let mut state = AppState::default();
+        ready(&mut state, me, Vec::new(), Some([9; 32]));
+        assert_eq!(state.selected, None);
+        assert!(state.stale_conversations.is_empty());
+    }
+}
+
 /// Cheap content fingerprint (FNV-1a) so a changed photo gets a fresh image-cache uri.
 fn checksum(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0100_0000_01b3;
-    bytes.iter().fold(FNV_OFFSET, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME))
+    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
 }

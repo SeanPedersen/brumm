@@ -7,10 +7,12 @@ use iroh::SecretKey;
 
 use super::{Me, Node, next_seq, profile_view};
 use crate::{
-    api::{AttachmentView, Command, ReactionsView, DeliveryStatus, Direction, Event, MessageView},
+    api::{AttachmentView, Command, DeliveryStatus, Direction, Event, MessageView, ReactionsView},
     clock::now_ms,
     e2ee::DeviceCrypto,
-    identity::{DeviceEntry, Profile, UserIdentity, UserKey, default_device_label, normalize_display_name},
+    identity::{
+        DeviceEntry, Profile, UserIdentity, UserKey, default_device_label, normalize_display_name,
+    },
     invite::Invite,
     mailbox,
     store::StoredIdentity,
@@ -22,9 +24,13 @@ impl Node {
     pub(super) async fn handle_command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::CreateIdentity { display_name } => {
-                self.create_identity(UserIdentity::generate(), &display_name, true).await
+                self.create_identity(UserIdentity::generate(), &display_name, true)
+                    .await
             }
-            Command::RestoreIdentity { phrase, display_name } => {
+            Command::RestoreIdentity {
+                phrase,
+                display_name,
+            } => {
                 let user = UserIdentity::from_phrase(&phrase).context("invalid seed phrase")?;
                 self.create_identity(user, &display_name, false).await
             }
@@ -38,20 +44,37 @@ impl Node {
                 self.events.emit(Event::Conversation { contact, messages });
                 Ok(())
             }
-            Command::SendText { contact, text } => self.send_text(contact, Body::Text(text.trim().to_owned())),
-            Command::SendFile { contact, name, data } => self.send_text(contact, Body::File { name, data }),
-            Command::DeleteMessages { contact, ids, for_everyone } => self.delete_messages(contact, ids, for_everyone),
+            Command::RememberOpenChat { contact } => self.store.set_last_opened(&contact),
+            Command::SendText { contact, text } => {
+                self.send_text(contact, Body::Text(text.trim().to_owned()))
+            }
+            Command::SendFile {
+                contact,
+                name,
+                data,
+            } => self.send_text(contact, Body::File { name, data }),
+            Command::DeleteMessages {
+                contact,
+                ids,
+                for_everyone,
+            } => self.delete_messages(contact, ids, for_everyone),
             Command::SetAvatar { image } => self.set_avatar(image),
             Command::LoadAttachment { contact, id } => self.load_attachment(contact, id),
             Command::React { contact, id, emoji } => self.react(contact, id, emoji),
         }
     }
 
-    async fn create_identity(&mut self, user: UserIdentity, display_name: &str, is_new: bool) -> Result<()> {
+    async fn create_identity(
+        &mut self,
+        user: UserIdentity,
+        display_name: &str,
+        is_new: bool,
+    ) -> Result<()> {
         if self.me.is_some() || self.link_target.is_some() {
             bail!("this device already has (or is joining) an identity");
         }
-        let display_name = normalize_display_name(display_name).context("display name is empty or invalid")?;
+        let display_name =
+            normalize_display_name(display_name).context("display name is empty or invalid")?;
         let device_secret = SecretKey::generate();
         let (crypto, fallback_key) = DeviceCrypto::generate(&device_secret.to_bytes());
         let entry = DeviceEntry {
@@ -73,7 +96,10 @@ impl Node {
         let transport = Transport::start(device_secret.clone(), self.inbound_tx.clone());
         self.start_mailbox(&device_secret, self.mailbox_relays.clone());
         let seed_phrase = is_new.then(|| user.phrase());
-        self.events.emit(Event::IdentityCreated { profile: profile_view(&profile), seed_phrase });
+        self.events.emit(Event::IdentityCreated {
+            profile: profile_view(&profile),
+            seed_phrase,
+        });
         self.me = Some(Me {
             user,
             profile,
@@ -90,7 +116,9 @@ impl Node {
     fn create_invite(&mut self) -> Result<()> {
         self.active_me()?;
         let secret: [u8; 16] = rand::random();
-        let Self { store, me, events, .. } = self;
+        let Self {
+            store, me, events, ..
+        } = self;
         let me = me.as_mut().expect("checked by active_me");
         let one_time_key = me.crypto.new_one_time_key(store)?;
         store.add_invite(&secret, now_ms())?;
@@ -102,7 +130,9 @@ impl Node {
             match transport.addr().await {
                 Ok(addr) => {
                     let invite = Invite::new(display_name, cert, addr, secret, one_time_key);
-                    events.emit(Event::InviteCreated { link: invite.to_link() });
+                    events.emit(Event::InviteCreated {
+                        link: invite.to_link(),
+                    });
                 }
                 Err(err) => events.emit(Event::Error(format!("could not create invite: {err:#}"))),
             }
@@ -117,22 +147,46 @@ impl Node {
         if !is_notes {
             self.store.contact(&contact)?.context("unknown contact")?;
         }
-        let message = ChatMessage { id: rand::random(), sent_at_ms: now_ms(), body };
+        let message = ChatMessage {
+            id: rand::random(),
+            sent_at_ms: now_ms(),
+            body,
+        };
         if !message.body.is_valid() {
             bail!("message is empty, too long or the file is too large");
         }
         // Notes never leave our own devices, so there is no delivery to wait for.
-        let status = if is_notes { DeliveryStatus::Delivered } else { DeliveryStatus::Pending };
-        self.store.insert_message(&contact, &message, Direction::Outgoing, status, None)?;
-        self.events.emit(Event::MessageAdded(message_view(contact, &message, Direction::Outgoing, status)));
-        self.enqueue_to_user(&contact, message.id, Payload::Chat(message.clone()), Some(&contact))?;
+        let status = if is_notes {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Pending
+        };
+        self.store
+            .insert_message(&contact, &message, Direction::Outgoing, status, None)?;
+        self.events.emit(Event::MessageAdded(message_view(
+            contact,
+            &message,
+            Direction::Outgoing,
+            status,
+        )));
+        self.enqueue_to_user(
+            &contact,
+            message.id,
+            Payload::Chat(message.clone()),
+            Some(&contact),
+        )?;
         self.enqueue_to_own_devices(Payload::SentTranscript { contact, message })?;
         self.flush_outbox()
     }
 }
 
 impl Node {
-    fn delete_messages(&mut self, contact: UserKey, ids: Vec<MessageId>, for_everyone: bool) -> Result<()> {
+    fn delete_messages(
+        &mut self,
+        contact: UserKey,
+        ids: Vec<MessageId>,
+        for_everyone: bool,
+    ) -> Result<()> {
         self.active_me()?;
         if ids.is_empty() || ids.len() > MAX_DELETE_IDS {
             bail!("nothing to delete or too many messages at once");
@@ -144,33 +198,61 @@ impl Node {
         if removed.is_empty() {
             return Ok(());
         }
-        self.events.emit(Event::MessagesDeleted { contact, ids: removed.clone() });
+        self.events.emit(Event::MessagesDeleted {
+            contact,
+            ids: removed.clone(),
+        });
         self.emit_preview(&contact)?;
         if for_everyone {
             self.store.drop_outbox_envelopes(&removed)?;
-            self.enqueue_to_user(&contact, rand::random(), Payload::Delete(removed.clone()), None)?;
+            self.enqueue_to_user(
+                &contact,
+                rand::random(),
+                Payload::Delete(removed.clone()),
+                None,
+            )?;
         }
-        self.enqueue_to_own_devices(Payload::DeleteSync { contact, ids: removed })?;
+        self.enqueue_to_own_devices(Payload::DeleteSync {
+            contact,
+            ids: removed,
+        })?;
         self.flush_outbox()
     }
 
     fn react(&mut self, contact: UserKey, id: MessageId, emoji: String) -> Result<()> {
         self.active_me()?;
-        let reaction = Reaction { message_id: id, emoji, at_ms: now_ms() };
+        let reaction = Reaction {
+            message_id: id,
+            emoji,
+            at_ms: now_ms(),
+        };
         if !reaction.is_valid() || !self.store.message_exists(&contact, &id)? {
             bail!("cannot react to this message");
         }
         if let Some(reactions) = self.store.set_reaction(&contact, &reaction, true)? {
-            self.events.emit(Event::ReactionsChanged { contact, id, reactions });
+            self.events.emit(Event::ReactionsChanged {
+                contact,
+                id,
+                reactions,
+            });
         }
-        self.enqueue_to_user(&contact, rand::random(), Payload::Reaction(reaction.clone()), None)?;
+        self.enqueue_to_user(
+            &contact,
+            rand::random(),
+            Payload::Reaction(reaction.clone()),
+            None,
+        )?;
         self.enqueue_to_own_devices(Payload::ReactionSync { contact, reaction })?;
         self.flush_outbox()
     }
 
     fn load_attachment(&mut self, contact: UserKey, id: MessageId) -> Result<()> {
         if let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? {
-            self.events.emit(Event::Attachment { contact, id, data: Arc::new(data) });
+            self.events.emit(Event::Attachment {
+                contact,
+                id,
+                data: Arc::new(data),
+            });
         }
         Ok(())
     }
@@ -185,7 +267,12 @@ impl Node {
         self.store.set_avatar(&me, &avatar.image)?;
         self.emit_avatar(&me, &avatar.image);
         for contact in self.store.contacts()? {
-            self.enqueue_to_user(&contact.user_key, rand::random(), Payload::Avatar(avatar.clone()), None)?;
+            self.enqueue_to_user(
+                &contact.user_key,
+                rand::random(),
+                Payload::Avatar(avatar.clone()),
+                None,
+            )?;
         }
         self.enqueue_to_own_devices(Payload::Avatar(avatar))?;
         self.flush_outbox()
@@ -193,21 +280,36 @@ impl Node {
 
     pub(super) fn emit_avatar(&self, user: &UserKey, image: &[u8]) {
         let image = (!image.is_empty()).then(|| image.to_vec());
-        self.events.emit(Event::AvatarChanged { user: *user, image });
+        self.events
+            .emit(Event::AvatarChanged { user: *user, image });
     }
 
     /// Tells the UI the new last message after a bulk change (delete, history sync).
     pub(super) fn emit_preview(&self, contact: &UserKey) -> Result<()> {
         let last = self.store.last_message(contact)?;
-        self.events.emit(Event::PreviewChanged { contact: *contact, last });
+        self.events.emit(Event::PreviewChanged {
+            contact: *contact,
+            last,
+        });
         Ok(())
     }
 }
 
-pub(super) fn message_view(contact: UserKey, message: &ChatMessage, direction: Direction, status: DeliveryStatus) -> MessageView {
+pub(super) fn message_view(
+    contact: UserKey,
+    message: &ChatMessage,
+    direction: Direction,
+    status: DeliveryStatus,
+) -> MessageView {
     let (text, attachment) = match &message.body {
         Body::Text(text) => (text.clone(), None),
-        Body::File { name, data } => (String::new(), Some(AttachmentView { name: name.clone(), size: data.len() })),
+        Body::File { name, data } => (
+            String::new(),
+            Some(AttachmentView {
+                name: name.clone(),
+                size: data.len(),
+            }),
+        ),
     };
     MessageView {
         id: message.id,

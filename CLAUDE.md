@@ -96,6 +96,10 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
 - **Never load every conversation at startup.** `Store::conversation_previews` returns one
   `MessageView` per chat for the sidebar; `Command::LoadConversation` loads a full history only
   when a chat is opened. Bulk changes emit `Event::PreviewChanged` instead of a full reload.
+- **Last opened chat** is one `meta` row (`last_opened`, the user key). `Ready` carries that key
+  from a single primary-key read and does not load the history. The UI selects the chat if it
+  still exists (including Notes) and then sends `LoadConversation`. Opening a different chat
+  sends `RememberOpenChat`, which writes the same row. Restoring does not write it again.
 - **Bound the caches.** `AppState` keeps only the selected conversation and at most
   `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of file bytes (LRU, `ctx.forget_image` on
   eviction). Inline files are stored in full, so an unbounded cache is a real leak.

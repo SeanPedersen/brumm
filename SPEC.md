@@ -250,7 +250,7 @@ and `relay.primal.net` (each device publishes its own list, max 3).
 - At rest today: OS disk encryption, plus Olm pickles encrypted with the pickle key.
 - [M5] SQLCipher with a random DB key held in the **OS keychain** (Signal Desktop style), so there is still no prompt.
   Optional app lock later.
-- Tables: `meta` (seed phrase, device secret, profile, Olm account), `contacts`, `devices`,
+- Tables: `meta` (seed phrase, device secret, profile, Olm account, last opened chat), `contacts`, `devices`,
   `olm_sessions`, `messages`, `invites`. `PRAGMA user_version` = schema version; pre-release
   schemas are rejected with a "delete profile" hint.
 - **Retention**: messages older than 60 days (configurable) are pruned at startup and every 6 h.

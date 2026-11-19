@@ -9,26 +9,63 @@ use crate::{identity::UserKey, wire::MessageId};
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    CreateIdentity { display_name: String },
-    RestoreIdentity { phrase: String, display_name: String },
+    CreateIdentity {
+        display_name: String,
+    },
+    RestoreIdentity {
+        phrase: String,
+        display_name: String,
+    },
     /// Fresh install: become a new device of an existing identity (shows a link ticket).
     StartLinking,
     CreateInvite,
-    AcceptInvite { link: String },
+    AcceptInvite {
+        link: String,
+    },
     /// Add the device that shows `link` to our identity.
-    LinkDevice { link: String },
-    RemoveDevice { device_id: DeviceId },
-    LoadConversation { contact: UserKey },
-    SendText { contact: UserKey, text: String },
-    SendFile { contact: UserKey, name: String, data: Vec<u8> },
+    LinkDevice {
+        link: String,
+    },
+    RemoveDevice {
+        device_id: DeviceId,
+    },
+    LoadConversation {
+        contact: UserKey,
+    },
+    /// Remembers which chat was open on this device. A single meta-row write; it does not load history.
+    RememberOpenChat {
+        contact: UserKey,
+    },
+    SendText {
+        contact: UserKey,
+        text: String,
+    },
+    SendFile {
+        contact: UserKey,
+        name: String,
+        data: Vec<u8>,
+    },
     /// `for_everyone` additionally asks the contact's devices to remove our own messages.
-    DeleteMessages { contact: UserKey, ids: Vec<MessageId>, for_everyone: bool },
+    DeleteMessages {
+        contact: UserKey,
+        ids: Vec<MessageId>,
+        for_everyone: bool,
+    },
     /// Replaces our profile photo (empty `image` removes it) and shares it with contacts.
-    SetAvatar { image: Vec<u8> },
+    SetAvatar {
+        image: Vec<u8>,
+    },
     /// Fetches the bytes of a file message; answered with [`Event::Attachment`].
-    LoadAttachment { contact: UserKey, id: MessageId },
+    LoadAttachment {
+        contact: UserKey,
+        id: MessageId,
+    },
     /// Sets our reaction to a message (empty `emoji` removes it).
-    React { contact: UserKey, id: MessageId, emoji: String },
+    React {
+        contact: UserKey,
+        id: MessageId,
+        emoji: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +77,8 @@ pub enum Event {
         /// Latest message per conversation, for chat-list ordering and previews; full
         /// conversations are loaded on demand with [`Command::LoadConversation`].
         previews: Vec<ConversationPreview>,
+        /// Chat this device had open last time. One meta-row read; the history itself is not loaded yet.
+        last_opened: Option<UserKey>,
     },
     /// `seed_phrase` is set only for brand-new identities (to show once for backup).
     IdentityCreated {
@@ -47,11 +86,15 @@ pub enum Event {
         seed_phrase: Option<String>,
     },
     /// Shown on a device waiting to be linked.
-    LinkTicket { link: String },
+    LinkTicket {
+        link: String,
+    },
     Devices(Vec<DeviceView>),
     /// Another device of ours removed this one; it no longer sends or receives.
     DeviceRevoked,
-    InviteCreated { link: String },
+    InviteCreated {
+        link: String,
+    },
     ContactAdded(ContactView),
     Conversation {
         contact: UserKey,
@@ -70,11 +113,25 @@ pub enum Event {
         id: MessageId,
         status: DeliveryStatus,
     },
-    MessagesDeleted { contact: UserKey, ids: Vec<MessageId> },
+    MessagesDeleted {
+        contact: UserKey,
+        ids: Vec<MessageId>,
+    },
     /// A profile photo changed (own or a contact's); `None` means it was removed.
-    AvatarChanged { user: UserKey, image: Option<Vec<u8>> },
-    Attachment { contact: UserKey, id: MessageId, data: Arc<Vec<u8>> },
-    ReactionsChanged { contact: UserKey, id: MessageId, reactions: ReactionsView },
+    AvatarChanged {
+        user: UserKey,
+        image: Option<Vec<u8>>,
+    },
+    Attachment {
+        contact: UserKey,
+        id: MessageId,
+        data: Arc<Vec<u8>>,
+    },
+    ReactionsChanged {
+        contact: UserKey,
+        id: MessageId,
+        reactions: ReactionsView,
+    },
     Error(String),
 }
 

@@ -4,10 +4,12 @@
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
 use brumm_core::{
-    api::{Command, ContactView, DeliveryStatus, DeviceId, DeviceView, Direction, Event, EventSink},
+    api::{
+        Command, ContactView, DeliveryStatus, DeviceId, DeviceView, Direction, Event, EventSink,
+    },
     identity::UserKey,
-    wire::MessageId,
     node::{self, NodeConfig},
+    wire::MessageId,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -33,8 +35,14 @@ impl TestNode {
 
     /// Node whose mailbox lives on `relays`.
     pub fn spawn_with(name: &str, relays: Vec<String>) -> Self {
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        Self::spawn_in(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{unique}")), relays)
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self::spawn_in(
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{unique}")),
+            relays,
+        )
     }
 
     pub fn spawn_in(data_dir: PathBuf, relays: Vec<String>) -> Self {
@@ -49,8 +57,19 @@ impl TestNode {
             mailbox_relays: relays.clone(),
             ..NodeConfig::new(data_dir.clone())
         };
-        let task = tokio::spawn(node::run(config, command_rx, EventSink::new(event_tx, || {})));
-        Self { data_dir, relays, commands: command_tx, events: event_rx, buffered: VecDeque::new(), task }
+        let task = tokio::spawn(node::run(
+            config,
+            command_rx,
+            EventSink::new(event_tx, || {}),
+        ));
+        Self {
+            data_dir,
+            relays,
+            commands: command_tx,
+            events: event_rx,
+            buffered: VecDeque::new(),
+            task,
+        }
     }
 
     /// Stops the node (graceful iroh shutdown) and starts a fresh one on the same data dir.
@@ -60,7 +79,13 @@ impl TestNode {
 
     /// Stops the node ("goes offline"); keep the result to start it again later.
     pub async fn stop(self) -> Stopped {
-        let Self { data_dir, relays, commands, task, .. } = self;
+        let Self {
+            data_dir,
+            relays,
+            commands,
+            task,
+            ..
+        } = self;
         drop(commands);
         task.await.expect("node task panicked");
         Stopped { data_dir, relays }
@@ -106,10 +131,17 @@ impl TestNode {
 
     /// Sends a text and returns its message id.
     pub async fn send_text(&mut self, contact: UserKey, text: &str) -> MessageId {
-        self.send(Command::SendText { contact, text: text.into() });
+        self.send(Command::SendText {
+            contact,
+            text: text.into(),
+        });
         let text = text.to_owned();
         self.expect(|event| match event {
-            Event::MessageAdded(message) if message.direction == Direction::Outgoing && message.text == text => Some(message.id),
+            Event::MessageAdded(message)
+                if message.direction == Direction::Outgoing && message.text == text =>
+            {
+                Some(message.id)
+            }
             _ => None,
         })
         .await
@@ -121,19 +153,35 @@ impl TestNode {
 
     pub async fn status(&mut self, id: MessageId, status: DeliveryStatus) {
         self.expect(|event| match event {
-            Event::MessageStatusChanged { id: changed, status: new, .. } if *changed == id && *new == status => Some(()),
+            Event::MessageStatusChanged {
+                id: changed,
+                status: new,
+                ..
+            } if *changed == id && *new == status => Some(()),
             _ => None,
         })
         .await
     }
 
     pub async fn ready(&mut self) {
-        self.expect(|event| matches!(event, Event::Ready { .. }).then_some(())).await;
+        self.expect(|event| matches!(event, Event::Ready { .. }).then_some(()))
+            .await;
+    }
+
+    /// The chat recorded on [`Event::Ready`] after a restart.
+    pub async fn ready_last_opened(&mut self) -> Option<UserKey> {
+        self.expect(|event| match event {
+            Event::Ready { last_opened, .. } => Some(*last_opened),
+            _ => None,
+        })
+        .await
     }
 
     pub async fn create_identity(&mut self, name: &str) -> UserKey {
         self.ready().await;
-        self.send(Command::CreateIdentity { display_name: name.into() });
+        self.send(Command::CreateIdentity {
+            display_name: name.into(),
+        });
         self.expect(|event| match event {
             Event::IdentityCreated { profile, .. } => Some(profile.user_key),
             _ => None,
@@ -165,7 +213,9 @@ impl TestNode {
     /// Next message added in `direction` (outgoing ones arrive via own-device transcripts).
     pub async fn message_added(&mut self, direction: Direction) -> String {
         self.expect(|event| match event {
-            Event::MessageAdded(message) if message.direction == direction => Some(message.text.clone()),
+            Event::MessageAdded(message) if message.direction == direction => {
+                Some(message.text.clone())
+            }
             _ => None,
         })
         .await
@@ -173,7 +223,11 @@ impl TestNode {
 
     /// Links `new_device` (fresh node) to this node's identity; returns the user key and the
     /// new device's id once this node lists `expected_devices` devices.
-    pub async fn link(&mut self, new_device: &mut TestNode, expected_devices: usize) -> (UserKey, DeviceId) {
+    pub async fn link(
+        &mut self,
+        new_device: &mut TestNode,
+        expected_devices: usize,
+    ) -> (UserKey, DeviceId) {
         new_device.ready().await;
         new_device.send(Command::StartLinking);
         let link = new_device
@@ -185,7 +239,10 @@ impl TestNode {
         self.send(Command::LinkDevice { link });
         let user_key = new_device
             .expect(|event| match event {
-                Event::IdentityCreated { profile, seed_phrase: None } => Some(profile.user_key),
+                Event::IdentityCreated {
+                    profile,
+                    seed_phrase: None,
+                } => Some(profile.user_key),
                 _ => None,
             })
             .await;
@@ -201,7 +258,6 @@ impl TestNode {
         })
         .await
     }
-
 }
 
 /// A stopped node's data; `start` brings the same device back online.
@@ -218,7 +274,9 @@ impl Stopped {
 
 /// In-memory Nostr relay for mailbox tests; keep the handle alive for the test's duration.
 pub async fn local_relay() -> (nostr_sdk::prelude::MockRelay, Vec<String>) {
-    let relay = nostr_sdk::prelude::MockRelay::run().await.expect("start local relay");
+    let relay = nostr_sdk::prelude::MockRelay::run()
+        .await
+        .expect("start local relay");
     let url = relay.url().await.to_string();
     (relay, vec![url])
 }

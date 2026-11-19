@@ -44,14 +44,22 @@ impl eframe::App for BrummApp {
         ui::errors::show(ui, &mut self.state);
         match self.state.phase() {
             Phase::Starting => ui::starting::show(ui),
-            Phase::Onboarding => {
-                ui::onboarding::show(ui, &mut self.view.onboarding, self.state.link_ticket.as_deref(), &mut commands)
+            Phase::Onboarding => ui::onboarding::show(
+                ui,
+                &mut self.view.onboarding,
+                self.state.link_ticket.as_deref(),
+                &mut commands,
+            ),
+            Phase::Main => {
+                ui::main_screen::show(ui, &mut self.state, &mut self.view, &mut commands)
             }
-            Phase::Main => ui::main_screen::show(ui, &mut self.state, &mut self.view, &mut commands),
             Phase::Revoked => ui::revoked::show(ui),
         }
         for contact in self.state.stale_conversations.drain(..) {
             commands.push(Command::LoadConversation { contact });
+        }
+        if let Some(contact) = self.state.remember_open.take() {
+            commands.push(Command::RememberOpenChat { contact });
         }
         for command in commands {
             self.core.send(command);
