@@ -21,6 +21,10 @@ if [[ ! -x "$binary" ]]; then
     exit 1
 fi
 
+# Resolve to an absolute path first: both the desktop entry and the symlink must work
+# regardless of the caller's working directory.
+binary="$(realpath -- "$binary")"
+
 # The install rewrites `Exec=` to the absolute binary path: the shell's PATH is the
 # session's, not the login shell's, so a bare `Exec=brumm` is unlikely to resolve and
 # GNOME will then neither show nor launch the entry. The repo asset stays `Exec=brumm`
