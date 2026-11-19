@@ -16,6 +16,8 @@ const META_FONT_SIZE: f32 = 12.0;
 const BODY_FONT_SIZE: f32 = 15.0;
 const CARD_NAME_FONT_SIZE: f32 = 15.0;
 const META_GAP: f32 = 10.0;
+/// Fraction of a tick's width by which the second "delivered" tick is shifted over the first.
+const DOUBLE_TICK_SHIFT: f32 = 0.45;
 const BUBBLE_MAX_WIDTH_FRACTION: f32 = 0.85;
 const IMAGE_PADDING: f32 = 3.0;
 const IMAGE_MAX_SIZE: Vec2 = egui::vec2(320.0, 320.0);
@@ -89,13 +91,13 @@ pub fn show(ui: &mut egui::Ui, message: &MessageView, inputs: &Inputs) -> Output
         (true, _) => theme::OUTGOING_META,
         (false, _) => theme::MUTED_TEXT,
     };
-    let meta = ui.painter().layout_no_wrap(meta_text(message), FontId::proportional(META_FONT_SIZE), meta_color);
+    let meta = layout_meta(ui, message, meta_color);
 
     let content = measure_content(ui, message, inputs.attachment, max_inner_width);
     let is_image = matches!(content, Content::Image { .. });
     let body = body_block(&content);
     let chip_layout = layout_chips(ui, chips(&message.reactions), max_inner_width);
-    let layout = bubble_layout(&body, &chip_layout, meta.size(), max_inner_width, is_image);
+    let layout = bubble_layout(&body, &chip_layout, meta.size, max_inner_width, is_image);
     let bubble_size = layout.bubble_size;
 
     let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), bubble_size.y), Sense::hover());
@@ -279,19 +281,51 @@ fn paint_image(ui: &egui::Ui, rect: Rect, loaded: Option<&LoadedAttachment>, uri
 }
 
 /// Time + ticks: inline on the last text line, as an overlay pill on images, else on its own line.
-fn paint_meta(ui: &egui::Ui, bubble: Rect, meta: Arc<Galley>, is_image: bool) {
-    let meta_size = meta.size();
+fn paint_meta(ui: &egui::Ui, bubble: Rect, meta: Meta, is_image: bool) {
+    let meta_size = meta.size;
     if is_image {
         let pill = Rect::from_min_size(
             bubble.max - Vec2::splat(IMAGE_PADDING + 6.0) - meta_size - META_PILL_PADDING,
             meta_size + META_PILL_PADDING * 2.0,
         );
         ui.painter().rect_filled(pill, pill.height() / 2.0, theme::SERVICE_PILL);
-        ui.painter().galley(pill.min + META_PILL_PADDING, meta, Color32::WHITE);
+        meta.paint(ui, pill.min + META_PILL_PADDING, Color32::WHITE);
         return;
     }
-    let position = bubble.max - theme::BUBBLE_PADDING - meta_size;
-    ui.painter().galley(position, meta, theme::MUTED_TEXT);
+    meta.paint(ui, bubble.max - theme::BUBBLE_PADDING - meta_size, theme::MUTED_TEXT);
+}
+
+/// Time + status tick(s). A delivered message draws its second tick overlapping the first
+/// because a "✓✓" string is spaced too widely by the fallback font.
+struct Meta {
+    text: Arc<Galley>,
+    second_tick: Option<(Arc<Galley>, f32)>,
+    size: Vec2,
+}
+
+impl Meta {
+    fn paint(self, ui: &egui::Ui, origin: Pos2, fallback_color: Color32) {
+        let painter = ui.painter();
+        if let Some((tick, shift)) = self.second_tick {
+            let tick_x = origin.x + self.text.size().x - tick.size().x + shift;
+            painter.galley(Pos2::new(tick_x, origin.y), tick, fallback_color);
+        }
+        painter.galley(origin, self.text, fallback_color);
+    }
+}
+
+fn layout_meta(ui: &egui::Ui, message: &MessageView, color: Color32) -> Meta {
+    let font = FontId::proportional(META_FONT_SIZE);
+    let text = ui.painter().layout_no_wrap(meta_text(message), font.clone(), color);
+    let is_delivered = message.direction == Direction::Outgoing && message.status == DeliveryStatus::Delivered;
+    if !is_delivered {
+        let size = text.size();
+        return Meta { text, second_tick: None, size };
+    }
+    let tick = ui.painter().layout_no_wrap("✓".to_owned(), font, color);
+    let shift = tick.size().x * DOUBLE_TICK_SHIFT;
+    let size = text.size() + egui::vec2(shift, 0.0);
+    Meta { text, second_tick: Some((tick, shift)), size }
 }
 
 fn paint_check(ui: &egui::Ui, center: Pos2, selected: bool) {
@@ -344,7 +378,7 @@ fn status_marker(message: &MessageView) -> &'static str {
     match message.status {
         DeliveryStatus::Pending => "🕓",
         DeliveryStatus::Sent => "✓",
-        DeliveryStatus::Delivered => "✓✓",
+        DeliveryStatus::Delivered => "✓",
         DeliveryStatus::Failed => "⚠ not delivered",
     }
 }
