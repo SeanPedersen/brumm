@@ -92,12 +92,121 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>), String> {
     if !metadata.is_file() {
         return Err("only files can be sent".to_owned());
     }
-    if metadata.len() > MAX_FILE_BYTES as u64 {
-        return Err(format!("file is too large (limit {})", format_size(MAX_FILE_BYTES)));
-    }
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file").to_owned();
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        if !is_image_name(&name) {
+            return Err(format!("file is too large (limit {})", format_size(MAX_FILE_BYTES)));
+        }
+        let source = image::open(path).map_err(|err| format!("cannot open image: {err}"))?;
+        return shrink_to_fit(&source, Path::new(&name).file_stem().and_then(|stem| stem.to_str()).unwrap_or("image"));
+    }
     let data = std::fs::read(path).map_err(|err| format!("cannot read file: {err}"))?;
     Ok((name, data))
+}
+
+/// What a Ctrl+V found on the clipboard that egui itself cannot see.
+pub enum ClipboardItem {
+    File(PathBuf),
+    /// Encoded image bytes (PNG).
+    Image(Vec<u8>),
+}
+
+const URI_LIST_MIME: &str = "text/uri-list";
+const PNG_MIME: &str = "image/png";
+const FILE_URI_PREFIX: &str = "file://";
+
+/// Files copied in a file manager or an image copied as PNG. On Wayland the compositor may offer no
+/// data-control protocol (KDE), which arboard needs, so `wl-paste` is asked first there.
+pub fn clipboard_items() -> Vec<ClipboardItem> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return wl_paste_items();
+    }
+    let files = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get().file_list()).unwrap_or_default();
+    files.into_iter().map(ClipboardItem::File).collect()
+}
+
+fn wl_paste_items() -> Vec<ClipboardItem> {
+    if let Some(list) = wl_paste(URI_LIST_MIME) {
+        let files: Vec<_> = String::from_utf8_lossy(&list).lines().filter_map(path_from_uri).map(ClipboardItem::File).collect();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+    wl_paste(PNG_MIME).map(ClipboardItem::Image).into_iter().collect()
+}
+
+fn wl_paste(mime: &str) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("wl-paste").args(["--no-newline", "--type", mime]).output().inspect_err(|err| tracing::warn!(%err, "wl-paste failed to start")).ok()?;
+    tracing::debug!(mime, status = %output.status, bytes = output.stdout.len(), stderr = %String::from_utf8_lossy(&output.stderr), "wl-paste");
+    (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+}
+
+/// `file:///a/b%20c.png` -> `/a/b c.png`; comments and other schemes yield `None`.
+fn path_from_uri(line: &str) -> Option<PathBuf> {
+    let encoded = line.trim().strip_prefix(FILE_URI_PREFIX)?;
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut input = encoded.bytes();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let hex: Vec<u8> = input.by_ref().take(2).collect();
+        let decoded = std::str::from_utf8(&hex).ok().and_then(|digits| u8::from_str_radix(digits, 16).ok())?;
+        bytes.push(decoded);
+    }
+    Some(PathBuf::from(String::from_utf8(bytes).ok()?))
+}
+
+const PASTED_IMAGE_STEM: &str = "pasted-image";
+const PASTED_IMAGE_NAME: &str = "pasted-image.png";
+const SHRINK_SCALES: [f32; 7] = [1.0, 0.75, 0.55, 0.4, 0.3, 0.2, 0.12];
+const SHRUNK_JPEG_QUALITY: u8 = 85;
+
+/// Clipboard pixels as an attachment: PNG when it fits the file limit, otherwise a shrunken JPEG.
+pub fn attachment_from_pixels(image: &egui::ColorImage) -> Result<(String, Vec<u8>), String> {
+    let [width, height] = image.size;
+    let rgba = image::RgbaImage::from_raw(width as u32, height as u32, image.as_raw().to_vec())
+        .ok_or_else(|| "cannot read pasted image".to_owned())?;
+    attachment_from_decoded(DynamicImage::ImageRgba8(rgba))
+}
+
+/// Clipboard image file bytes (e.g. PNG) as an attachment, shrunk when over the file limit.
+pub fn attachment_from_encoded(bytes: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+    if bytes.len() <= MAX_FILE_BYTES {
+        return Ok((PASTED_IMAGE_NAME.to_owned(), bytes));
+    }
+    let decoded = image::load_from_memory(&bytes).map_err(|err| format!("cannot read pasted image: {err}"))?;
+    shrink_to_fit(&decoded, PASTED_IMAGE_STEM)
+}
+
+fn attachment_from_decoded(decoded: DynamicImage) -> Result<(String, Vec<u8>), String> {
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(decoded.as_bytes(), decoded.width(), decoded.height(), decoded.color().into())
+        .map_err(|err| format!("cannot encode pasted image: {err}"))?;
+    if png.len() <= MAX_FILE_BYTES {
+        return Ok((PASTED_IMAGE_NAME.to_owned(), png));
+    }
+    shrink_to_fit(&decoded, PASTED_IMAGE_STEM)
+}
+
+/// Re-encodes as JPEG at progressively smaller sizes until it fits the file limit.
+fn shrink_to_fit(source: &DynamicImage, stem: &str) -> Result<(String, Vec<u8>), String> {
+    let rgb = DynamicImage::ImageRgb8(source.to_rgb8());
+    for scale in SHRINK_SCALES {
+        let width = ((rgb.width() as f32 * scale) as u32).max(1);
+        let height = ((rgb.height() as f32 * scale) as u32).max(1);
+        let resized = if scale < 1.0 { rgb.resize_exact(width, height, FilterType::Lanczos3) } else { rgb.clone() };
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, SHRUNK_JPEG_QUALITY)
+            .write_image(resized.as_bytes(), width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|err| format!("cannot encode image: {err}"))?;
+        if encoded.len() <= MAX_FILE_BYTES {
+            return Ok((format!("{stem}.jpg"), encoded));
+        }
+    }
+    Err(format!("image could not be shrunk below {}", format_size(MAX_FILE_BYTES)))
 }
 
 /// Center-crops to a square and shrinks until the JPEG fits the avatar budget.
@@ -146,6 +255,20 @@ mod tests {
         assert!(is_image_name("Holiday.JPG"));
         assert!(!is_image_name("notes.txt"));
         assert!(!is_image_name("png"));
+    }
+
+    #[test]
+    fn oversized_images_are_shrunk_under_the_limit() {
+        let noise = image::RgbImage::from_fn(1600, 1600, |x, y| image::Rgb([((x * 7) ^ (y * 13)) as u8, (x * y) as u8, (x ^ y) as u8]));
+        let (name, data) = shrink_to_fit(&DynamicImage::ImageRgb8(noise), "big").expect("shrinks");
+        assert_eq!(name, "big.jpg");
+        assert!(data.len() <= MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn decodes_file_uris() {
+        assert_eq!(path_from_uri("file:///home/a/b%20c.png\r"), Some(PathBuf::from("/home/a/b c.png")));
+        assert_eq!(path_from_uri("# comment"), None);
     }
 
     #[test]

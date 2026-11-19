@@ -80,18 +80,35 @@ fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
                 budget.max.y = budget.min.y + PILL_MAX_TEXT_HEIGHT;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(budget).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(draft)
+                        let output = egui::TextEdit::multiline(draft)
                                 .id(input_id)
                                 .hint_text("Write a message…")
                                 .desired_rows(1)
                                 .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, text_margin)))
-                                .desired_width(f32::INFINITY),
-                        );
+                                .desired_width(f32::INFINITY)
+                                .show(ui);
+                        paste_menu(&output.response, input_id);
                     });
                 });
             });
         });
+}
+
+/// Marker in egui's temp data: the user chose "Paste" in the input's context menu.
+pub fn paste_menu_requested_id() -> egui::Id {
+    egui::Id::NULL.with("composer_paste_requested")
+}
+
+/// Right-click menu of the input. Paste is resolved in the main screen, which can also send copied files.
+fn paste_menu(response: &egui::Response, input_id: egui::Id) {
+    response.context_menu(|ui| {
+        if ui.button("Paste").clicked() {
+            ui.data_mut(|data| data.insert_temp(paste_menu_requested_id(), true));
+            ui.memory_mut(|memory| memory.request_focus(input_id));
+            ui.ctx().request_repaint();
+            ui.close();
+        }
+    });
 }
 
 /// Round icon button; `active` fills it with the accent color (used for "send").

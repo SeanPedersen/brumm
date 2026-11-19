@@ -14,7 +14,7 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **M3 mailbox done:** offline delivery via **public Nostr relays** (no own server). Unreachable
   device → the outbox ciphertext is posted once as a NIP-44 letter to its inbox key → status Sent ✔ →
   the recipient answers with `Payload::Receipt` → Delivered ✔✔.
-- **Rich messages done:** inline files (`Body::File`, ≤ 1 MiB, one sealed envelope; > mailbox letter limit
+- **Rich messages done:** inline files (`Body::File`, ≤ 10 MiB, one sealed envelope; > mailbox letter limit
   is only delivered while both are online), "delete for everyone" (`Payload::Delete` / own-device `DeleteSync`),
   profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place),
   emoji reactions (`Payload::Reaction` / own-device `ReactionSync`, one per user and message, last write wins by
@@ -23,6 +23,8 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
   devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning; included in history sync like any conversation.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
+- **Paste:** Ctrl+V sends clipboard images (`Event::PasteImage`) and copied files (`text/uri-list` via arboard). The latter needs the
+  `vendor/egui-winit` patch (Ctrl+V key event passes through when no text/image). Drag & drop does not work on Wayland (winit 0.30).
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.
 - The DB is plain SQLite (the seed phrase is readable on disk). Rely on OS disk encryption for now.

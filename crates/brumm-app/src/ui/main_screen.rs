@@ -7,7 +7,7 @@ use brumm_core::{api::Command, identity::UserKey, wire::MessageId};
 
 use crate::{
     state::AppState,
-    ui::{ViewState, add_contact, chat, devices, files, seed_phrase, sidebar, theme},
+    ui::{ViewState, add_contact, chat, composer, devices, files, seed_phrase, sidebar, theme},
 };
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut ViewState, commands: &mut Vec<Command>) {
@@ -34,6 +34,29 @@ fn handle_file_events(ui: &egui::Ui, state: &mut AppState, view: &mut ViewState,
     if let Some(contact) = state.selected {
         let dropped = ui.input(|input| input.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect::<Vec<_>>());
         picked.extend(dropped.into_iter().map(|path| files::Picked::Attachment { contact, path }));
+        let menu_paste = ui.data_mut(|data| data.remove_temp::<bool>(composer::paste_menu_requested_id())).unwrap_or(false);
+        let items = if paste_key_pressed(ui) || menu_paste { files::clipboard_items() } else { Vec::new() };
+        if menu_paste {
+            tracing::info!(found = items.len(), "paste requested from context menu");
+        }
+        if menu_paste && items.is_empty() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        }
+        for item in items {
+            match item {
+                files::ClipboardItem::File(path) => picked.push(files::Picked::Attachment { contact, path }),
+                files::ClipboardItem::Image(bytes) => match files::attachment_from_encoded(bytes) {
+                    Ok((name, data)) => commands.push(Command::SendFile { contact, name, data }),
+                    Err(message) => state.errors.push(message),
+                },
+            }
+        }
+        for image in pasted_images(ui) {
+            match files::attachment_from_pixels(&image) {
+                Ok((name, data)) => commands.push(Command::SendFile { contact, name, data }),
+                Err(message) => state.errors.push(message),
+            }
+        }
     }
     for item in picked {
         match item {
@@ -46,6 +69,25 @@ fn handle_file_events(ui: &egui::Ui, state: &mut AppState, view: &mut ViewState,
         }
     }
     write_ready_saves(state, view);
+}
+
+/// Images pasted with Ctrl+V (egui-winit only emits these when the clipboard holds no text).
+fn pasted_images(ui: &egui::Ui) -> Vec<std::sync::Arc<egui::ColorImage>> {
+    ui.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::PasteImage(image) => Some(image.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// Ctrl+V reaches the UI as a key event only when the clipboard has neither text nor image data.
+fn paste_key_pressed(ui: &egui::Ui) -> bool {
+    ui.input(|input| input.modifiers.command_only() && input.key_pressed(egui::Key::V))
 }
 
 fn send_file(state: &mut AppState, contact: UserKey, path: &std::path::Path, commands: &mut Vec<Command>) {

@@ -23,3 +23,4 @@ jiff.workspace = true
 egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }

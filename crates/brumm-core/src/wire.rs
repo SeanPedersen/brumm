@@ -12,11 +12,11 @@ use crate::{
 
 pub const ALPN: &[u8] = b"brumm/3";
 /// Largest sealed frame. Sized for a maximal file plus Olm and framing overhead.
-pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 /// Files travel inline in one sealed envelope (larger transfers wait for iroh-blobs, M4).
 /// Anything above the mailbox letter limit is only delivered while both devices are online.
-pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_FILE_NAME_CHARS: usize = 255;
 /// Small enough to also fit into a Nostr mailbox letter.
 pub const MAX_AVATAR_BYTES: usize = 24 * 1024;

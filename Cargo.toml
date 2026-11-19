@@ -32,3 +32,7 @@ eframe = "0.37.0"
 egui = "0.37.0"
 qrcode = { version = "0.14.1", default-features = false }
 jiff = "1.0.1"
+
+# Lets the app see Ctrl+V when the clipboard holds a copied file (see vendor/egui-winit/src/lib.rs, "brumm patch").
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
