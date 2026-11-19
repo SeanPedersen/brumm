@@ -30,6 +30,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.
 - The DB is plain SQLite (the seed phrase is readable on disk). Rely on OS disk encryption for now.
+- **Window buttons:** on Wayland the frame is client-drawn. `brumm-app` enables winit's
+  `wayland-csd-adwaita` (the same feature ZapFast uses) so minimize, maximize and close are
+  Adwaita buttons in the desktop's `button-layout`, themed dark with the UI. X11 keeps the
+  window manager's frame.
 - **Window icon / app identity:** the viewport sets `app_id = "brumm"` plus an embedded PNG. Wayland shells ignore a
   client-set icon and match `app_id` → `brumm.desktop` → `Icon=` in the icon theme, so the icon only appears after
   `scripts/install-desktop.sh` installed the entry and the hicolor PNG. That script also rewrites `Exec=` to the

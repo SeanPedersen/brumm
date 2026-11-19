@@ -35,3 +35,11 @@ egui_extras = { version = "0.37.0", default-features = false, features = ["image
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+
+# Adwaita window buttons on Wayland. GNOME leaves the frame to the client, and
+# eframe's `wayland` feature stops at winit's plain square buttons. This is the
+# feature ZapFast enables: rounded Adwaita min, max and close in the desktop's
+# button layout (`gsettings` `button-layout`). The feature unifies onto eframe's
+# winit. The UI theme is dark, and egui forwards that to the frame.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita"] }
