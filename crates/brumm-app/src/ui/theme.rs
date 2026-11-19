@@ -46,16 +46,33 @@ pub const BUBBLE_MAX_WIDTH: f32 = 460.0;
 pub const GROUP_GAP: f32 = 2.0;
 pub const SENDER_CHANGE_GAP: f32 = 8.0;
 pub const INPUT_RADIUS: CornerRadius = CornerRadius::same(22);
+/// Scrollbar thumb never shrinks below this, so a long history stays grabbable.
+pub const SCROLLBAR_MIN_LENGTH: f32 = 48.0;
+/// Width of the thumb while the pointer is over the list but not the bar.
+pub const SCROLLBAR_REST_WIDTH: f32 = 8.0;
+/// Width of the thumb while it is hovered or dragged.
+pub const SCROLLBAR_HOVER_WIDTH: f32 = 12.0;
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.global_style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(14.0, 7.0);
-        style.text_styles.insert(TextStyle::Body, FontId::proportional(15.0));
-        style.text_styles.insert(TextStyle::Button, FontId::proportional(15.0));
-        style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
-        style.text_styles.insert(TextStyle::Heading, FontId::proportional(20.0));
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(TextStyle::Heading, FontId::proportional(20.0));
+        style.spacing.scroll.handle_min_length = SCROLLBAR_MIN_LENGTH;
+        style.spacing.scroll.floating_width = SCROLLBAR_REST_WIDTH;
+        style.spacing.scroll.bar_width = SCROLLBAR_HOVER_WIDTH;
 
         let visuals = &mut style.visuals;
         visuals.panel_fill = CHAT_BG;
@@ -67,8 +84,13 @@ pub fn apply(ctx: &egui::Context) {
         visuals.selection.bg_fill = ACCENT.linear_multiply(0.5);
         visuals.hyperlink_color = ACCENT_LIGHT;
         visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x0B, 0x12, 0x1A));
-        for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active] {
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgb(0x0B, 0x12, 0x1A));
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
             widget.corner_radius = CornerRadius::same(8);
             widget.fg_stroke.color = TEXT;
         }

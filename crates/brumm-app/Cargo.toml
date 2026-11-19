@@ -23,6 +23,7 @@ eframe = { workspace = true, default-features = false, features = [
     "clipboard",
     "default_fonts",
     "glow",
+    "links",
     "system_fonts",
     "wayland",
     "x11",

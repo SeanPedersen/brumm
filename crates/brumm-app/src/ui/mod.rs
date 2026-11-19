@@ -10,6 +10,7 @@ pub mod devices;
 pub mod emoji;
 pub mod errors;
 pub mod files;
+mod links;
 pub mod main_screen;
 pub mod onboarding;
 pub mod qr;

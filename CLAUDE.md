@@ -23,6 +23,8 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
   devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning; included in history sync like any conversation.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
+- **Links:** `http`, `https`, `www.` and `mailto` in a message open with the system handler on click.
+  A long note only scans the lines on screen. A single precise click does not select the message.
 - **Paste:** Ctrl+V sends clipboard images (`Event::PasteImage`) and copied files (`text/uri-list` via arboard). The latter needs the
   `vendor/egui-winit` patch (Ctrl+V key event passes through when no text/image). Drag & drop does not work on Wayland (winit 0.30).
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
@@ -69,9 +71,10 @@ crates/brumm-app/         eframe binary `brumm`
                           revoked, chat, …); screens push Commands, never call core
                           Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
                           avatar.rs (initials circles), sidebar.rs (search, chat list sorted by last
-                          activity, unread badges), chat.rs (hand-painted bubbles with inline time/ticks,
-                          grouping, day pills, pill composer), time_fmt.rs (jiff 1.0 local time)
-                          bubble.rs (text/image/file-card bubble + selection chrome + context menu),
+                          activity, unread badges), chat.rs (windowed message list, hand-painted bubbles
+                          with inline time/ticks, grouping, day pills, pill composer), time_fmt.rs
+                          (jiff 1.0 local time)
+                          bubble.rs (text/image/file-card bubble + clickable links + selection chrome + context menu),
                           composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
                           cursor), files.rs (rfd dialogs on threads, avatar shrink to JPEG, size limits)
 ```
@@ -105,6 +108,14 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
   little-endian `u32` points). `main` reads it once before the window is created; a missing or
   implausible file falls back to 960×680. A resize is written after it settles, and again on exit.
   Do not turn on eframe's `persistence` feature for this: that also parses the whole egui memory.
+- **Window the open chat.** `chat.rs` lays out only the rows near the viewport (plus a
+  small overscan). Off-screen rows keep an estimated height and are not shaped into galleys.
+  A note longer than 8 KiB shapes only the lines that meet the viewport, so one multi-megabyte
+  message does not allocate a text layout per line.
+- **Chat scroll.** Scrollbar thumbs keep a minimum length (`SCROLLBAR_MIN_LENGTH`) so a long
+  history stays grabbable. On the message list, later wheel notches in a burst scroll further,
+  and a faster two-finger swipe scrolls further than a slow one. After the gesture ends the list
+  glides a short distance and eases to a stop.
 - **Bound the caches.** `AppState` keeps only the selected conversation and at most
   `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of file bytes (LRU, `ctx.forget_image` on
   eviction). Inline files are stored in full, so an unbounded cache is a real leak.
