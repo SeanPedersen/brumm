@@ -37,6 +37,8 @@ pub struct ChatView {
     /// Messages awaiting delete confirmation, and whether to also delete them for the contact.
     delete_dialog: Option<DeleteDialog>,
     requested_attachments: HashSet<(UserKey, MessageId)>,
+    /// Chat whose composer still has to receive focus after it was opened.
+    pending_focus: Option<UserKey>,
     focused_contact: Option<UserKey>,
     /// Pointer gesture in progress on the message list (click, shift/ctrl-click or drag-select).
     press: Option<Press>,
@@ -114,13 +116,19 @@ pub fn show(
     } else {
         header(ui, state, view);
     }
-    let grab_focus = chat.focused_contact != Some(contact);
+    if chat.focused_contact != Some(contact) {
+        chat.pending_focus = Some(contact);
+    }
     chat.focused_contact = Some(contact);
+    let grab_focus = chat.pending_focus == Some(contact);
     egui::Panel::bottom("composer")
         .frame(egui::Frame::new().fill(theme::SIDEBAR_BG).inner_margin(egui::Margin::symmetric(12, 8)))
         .show(ui, |ui| {
             let composer = Composer { contact, draft, dialogs: &chat.dialogs, grab_focus };
-            composer::show(ui, composer, commands);
+            let has_focus = composer::show(ui, composer, commands);
+            if has_focus && grab_focus {
+                chat.pending_focus = None;
+            }
         });
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::CHAT_BG)).show(ui, |ui| {

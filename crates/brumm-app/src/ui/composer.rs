@@ -15,14 +15,17 @@ pub struct Composer<'a> {
     pub contact: UserKey,
     pub draft: &'a mut String,
     pub dialogs: &'a FileDialogs,
-    /// Set for one frame after switching chats so typing can start immediately.
+    /// Set after switching chats until the input actually holds focus, so typing can start
+    /// immediately even if the click that opened the chat takes focus away on the same frame.
     pub grab_focus: bool,
 }
 
-pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) {
+/// Returns whether the input already held keyboard focus when the frame began.
+pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) -> bool {
     let Composer { contact, draft, dialogs, grab_focus } = composer;
     let input_id = ui.make_persistent_id(("composer", contact));
-    let enter_pressed = ui.memory(|memory| memory.has_focus(input_id))
+    let had_focus = ui.memory(|memory| memory.has_focus(input_id));
+    let enter_pressed = had_focus
         && ui.input_mut(|input| !input.modifiers.shift && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     if grab_focus {
         ui.memory_mut(|memory| memory.request_focus(input_id));
@@ -46,6 +49,7 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         draft.clear();
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
+    had_focus
 }
 
 fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
