@@ -1,6 +1,8 @@
 //! Chat view: header (or selection bar), message bubbles grouped by sender and day (stuck to the
 //! bottom), delete dialog and the composer. The message list is windowed: only rows near the
 //! viewport are shaped, and a very long note shapes only its visible lines.
+//! The header's search icon searches this room from the sidebar. A down button at the bottom right
+//! appears while the list is scrolled up and jumps back to the newest message.
 //! Message selection works Telegram-style: right-click → Select (or Ctrl+click), then click more
 //! messages; Copy / Delete act on the selection, Esc leaves.
 
@@ -18,6 +20,7 @@ use crate::{
     ui::{
         avatar,
         bubble::{self, Action},
+        chat_search::{self, Pending},
         composer::{self, Composer},
         files::{self, FileDialogs},
         theme, time_fmt,
@@ -71,6 +74,17 @@ const COAST_DECAY_S: f32 = 0.22;
 const COAST_STOP_DISTANCE: f32 = 0.5;
 /// A hitch must not turn one coast frame into a jump.
 const COAST_MAX_DT: f32 = 1.0 / 30.0;
+/// The jump-to-latest button stays hidden while the list is within this of the bottom.
+const BOTTOM_SLACK: f32 = 24.0;
+const JUMP_BUTTON_DIAMETER: f32 = 44.0;
+const JUMP_BUTTON_MARGIN: f32 = 14.0;
+/// Large upward content move. The scroll area clamps it to the exact end, which re-enables
+/// stick-to-bottom. A computed max offset can miss that equality by a fraction of a point.
+const JUMP_TO_END_DELTA: f32 = -1.0e6;
+/// Soft band behind the message a search result jumped to.
+/// Accent light at alpha 40, stored premultiplied so it can be a constant.
+const SEARCH_HIT_TINT: Color32 = Color32::from_rgba_premultiplied(0x21, 0x38, 0x4C, 80);
+const SEARCH_ICON_BUTTON: f32 = 36.0;
 
 /// View-local chat state: selection, delete confirmation and attachment bookkeeping.
 #[derive(Default)]
@@ -94,6 +108,12 @@ pub struct ChatView {
     rows_width: i32,
     /// Wheel and two-finger acceleration for the message list.
     wheel: WheelAccel,
+    /// In-chat search. While it is active the sidebar lists matches instead of contacts.
+    pub(crate) search: chat_search::Session,
+    #[cfg(test)]
+    jump_visible: bool,
+    #[cfg(test)]
+    jump_rect: Option<Rect>,
     #[cfg(test)]
     row_rects: Vec<Rect>,
     #[cfg(test)]
@@ -112,6 +132,8 @@ struct CachedRow {
     height: f32,
     /// Visual-line byte offsets for a long note. Empty for an ordinary message.
     line_starts: Vec<u32>,
+    /// True after this row has been laid out, so `height` is no longer an estimate.
+    measured: bool,
 }
 
 /// A primary-button press on a message; becomes a drag-selection once it reaches another row.
@@ -181,20 +203,32 @@ pub fn show(
     // Selection never outlives its conversation or deleted messages.
     chat.selection
         .retain(|id| messages.iter().any(|message| message.id == *id));
+    chat.search.note_open_chat(Some(contact));
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-        chat.clear_selection();
+        if chat.is_selecting() {
+            chat.clear_selection();
+        } else if chat.delete_dialog.is_none() && chat.search.is_active() {
+            chat.search.close();
+        }
+    }
+    let find_key = ui.input(|input| {
+        input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::F)
+    });
+    if find_key && !chat.is_selecting() && chat.delete_dialog.is_none() {
+        chat.search.open_or_focus(contact);
     }
 
     if chat.is_selecting() {
         selection_bar(ui, chat, messages);
     } else {
-        header(ui, state, view);
+        header(ui, state, chat, view);
     }
     if chat.focused_contact != Some(contact) {
         chat.pending_focus = Some(contact);
     }
     chat.focused_contact = Some(contact);
-    let grab_focus = chat.pending_focus == Some(contact);
+    // The sidebar search field owns the keyboard while a room search is open.
+    let grab_focus = chat.pending_focus == Some(contact) && !chat.search.is_active();
     egui::Panel::bottom("composer")
         .frame(
             egui::Frame::new()
@@ -217,8 +251,15 @@ pub fn show(
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::CHAT_BG))
         .show(ui, |ui| {
+            if chat.search.pending() != Pending::None {
+                // A jump replaces any glide left over from the previous gesture.
+                chat.wheel.coast = 0.0;
+            }
             apply_wheel_acceleration(ui, &mut chat.wheel);
-            egui::ScrollArea::vertical()
+            if chat.search.pending() != Pending::None {
+                chat.wheel.coast = 0.0;
+            }
+            let output = egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .animated(false)
                 .stick_to_bottom(true)
@@ -231,6 +272,7 @@ pub fn show(
                     let rows_height: f32 = chat.rows.iter().map(|row| row.height).sum();
                     let total_height = LIST_PADDING_TOP + rows_height + LIST_PADDING_BOTTOM;
                     ui.set_height(total_height);
+                    apply_pending_scroll(ui, chat, viewport.min.y, viewport.height(), total_height);
 
                     let (start, end, prefix) =
                         visible_span(&chat.rows, viewport.min.y, viewport.max.y);
@@ -254,11 +296,34 @@ pub fn show(
                         .inner;
                     handle_pointer(ui, chat, messages, &slots);
                 });
+            let jumped = chat.search.take_jumped();
+            chat.search
+                .note_offset(output.state.clamped_offset().y, jumped);
+            #[cfg(test)]
+            {
+                chat.jump_visible = false;
+                chat.jump_rect = None;
+            }
+            if away_from_bottom(
+                output.state.clamped_offset().y,
+                output.content_size.y,
+                output.inner_rect.height(),
+            ) {
+                let rect = jump_button_rect(output.inner_rect);
+                #[cfg(test)]
+                {
+                    chat.jump_visible = true;
+                    chat.jump_rect = Some(rect);
+                }
+                if jump_down_button(ui, rect).clicked() {
+                    chat.search.jump_to_latest();
+                }
+            }
         });
     delete_dialog(ui, chat, contact, &view.display_name, commands);
 }
 
-fn header(ui: &mut egui::Ui, state: &AppState, view: &ContactView) {
+fn header(ui: &mut egui::Ui, state: &AppState, chat: &mut ChatView, view: &ContactView) {
     egui::Panel::top("chat_header")
         .frame(
             egui::Frame::new()
@@ -295,10 +360,13 @@ fn header(ui: &mut egui::Ui, state: &AppState, view: &ContactView) {
                             .color(theme::MUTED_TEXT),
                     );
                 });
-                if is_notes {
-                    return;
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if search_button(ui, chat.search.is_active()) {
+                        chat.search.toggle(view.user_key);
+                    }
+                    if is_notes {
+                        return;
+                    }
                     ui.label(
                         egui::RichText::new(&view.fingerprint)
                             .monospace()
@@ -314,6 +382,165 @@ fn header(ui: &mut egui::Ui, state: &AppState, view: &ContactView) {
                 });
             });
         });
+}
+
+/// Magnifying glass at the top right of the room. Active means the sidebar is searching this room.
+fn search_button(ui: &mut egui::Ui, active: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SEARCH_ICON_BUTTON), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .circle_filled(rect.center(), SEARCH_ICON_BUTTON / 2.0, theme::ROW_HOVER);
+        ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if active || hovered {
+        theme::ACCENT_LIGHT
+    } else {
+        theme::MUTED_TEXT
+    };
+    let center = rect.center() + egui::vec2(-1.5, -1.5);
+    let radius = 6.5;
+    ui.painter()
+        .circle_stroke(center, radius, egui::Stroke::new(1.6, color));
+    let handle_from = center + egui::vec2(radius * 0.70, radius * 0.70);
+    let handle_to = handle_from + egui::vec2(5.0, 5.0);
+    ui.painter()
+        .line_segment([handle_from, handle_to], egui::Stroke::new(1.8, color));
+    let tip = if active {
+        "Close search"
+    } else {
+        "Search messages"
+    };
+    response.on_hover_text(tip).clicked()
+}
+
+/// Where the message sits in content space so a jump lands it in the viewport.
+fn jump_offset(row_top: f32, row_height: f32, viewport: f32, total: f32) -> f32 {
+    let max_offset = (total - viewport).max(0.0);
+    let desired = if row_height >= viewport {
+        row_top
+    } else {
+        row_top - (viewport - row_height) * 0.5
+    };
+    desired.clamp(0.0, max_offset)
+}
+
+fn away_from_bottom(offset: f32, content: f32, viewport: f32) -> bool {
+    let max_offset = (content - viewport).max(0.0);
+    max_offset - offset > BOTTOM_SLACK
+}
+
+fn apply_pending_scroll(
+    ui: &egui::Ui,
+    chat: &mut ChatView,
+    offset: f32,
+    viewport: f32,
+    total: f32,
+) {
+    match chat.search.pending() {
+        Pending::None => {}
+        Pending::Bottom => {
+            scroll_to_bottom(ui);
+            chat.search.finish_jump();
+        }
+        Pending::Message(id) => {
+            let Some(index) = chat.rows.iter().position(|row| row.id == id) else {
+                chat.search.finish_jump();
+                return;
+            };
+            let prefix: f32 = chat.rows[..index].iter().map(|row| row.height).sum();
+            let row_height = chat.rows[index].height;
+            let desired = jump_offset(LIST_PADDING_TOP + prefix, row_height, viewport, total);
+            let max_offset = (total - viewport).max(0.0);
+            if (desired - max_offset).abs() <= 1.0 {
+                scroll_to_bottom(ui);
+            } else {
+                scroll_content_to(ui, offset, desired);
+            }
+            let measured = chat.rows[index].measured;
+            if !chat.search.note_jump_attempt(measured) {
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+}
+
+/// `current` and `desired` are scroll offsets. Positive offset is further down the history.
+fn scroll_content_to(ui: &egui::Ui, current: f32, desired: f32) {
+    let delta = current - desired;
+    if delta.abs() < 0.5 {
+        return;
+    }
+    ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
+    ui.scroll_with_delta_animation(egui::vec2(0.0, delta), egui::style::ScrollAnimation::none());
+}
+
+fn scroll_to_bottom(ui: &egui::Ui) {
+    ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
+    ui.scroll_with_delta_animation(
+        egui::vec2(0.0, JUMP_TO_END_DELTA),
+        egui::style::ScrollAnimation::none(),
+    );
+}
+
+fn jump_button_rect(area: Rect) -> Rect {
+    let size = JUMP_BUTTON_DIAMETER;
+    // Sit just left of the scrollbar so the thumb stays grabbable.
+    let right_inset = JUMP_BUTTON_MARGIN + theme::SCROLLBAR_HOVER_WIDTH;
+    let mut rect = Rect::from_min_size(
+        egui::pos2(
+            area.right() - right_inset - size,
+            area.bottom() - JUMP_BUTTON_MARGIN - size,
+        ),
+        Vec2::splat(size),
+    );
+    if rect.top() < area.top() {
+        rect = rect.translate(egui::vec2(0.0, area.top() - rect.top()));
+    }
+    if rect.left() < area.left() {
+        rect = rect.translate(egui::vec2(area.left() - rect.left(), 0.0));
+    }
+    rect
+}
+
+fn jump_down_button(ui: &mut egui::Ui, rect: Rect) -> egui::Response {
+    let response = ui.interact(rect, ui.make_persistent_id("jump_latest"), Sense::click());
+    let center = rect.center();
+    let radius = rect.width() / 2.0;
+    ui.painter().circle_filled(
+        center + egui::vec2(0.0, 1.0),
+        radius,
+        Color32::from_black_alpha(90),
+    );
+    let fill = if response.hovered() {
+        Color32::from_rgb(0x2E, 0x3C, 0x4D)
+    } else {
+        theme::SIDEBAR_BG
+    };
+    ui.painter().circle_filled(center, radius, fill);
+    ui.painter().circle_stroke(
+        center,
+        radius - 0.5,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(28)),
+    );
+    let color = if response.hovered() {
+        theme::ACCENT_LIGHT
+    } else {
+        theme::TEXT
+    };
+    let mid = center + egui::vec2(0.0, 2.0);
+    ui.painter().add(egui::Shape::line(
+        vec![
+            mid + egui::vec2(-6.0, -3.5),
+            mid,
+            mid + egui::vec2(6.0, -3.5),
+        ],
+        egui::Stroke::new(2.0, color),
+    ));
+    if response.hovered() {
+        ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text("Jump to latest")
 }
 
 /// Replaces the header while messages are selected: count, Copy, Delete, close.
@@ -715,15 +942,21 @@ fn sync_row_heights(
     chat.rows.reserve(messages.len());
     for message in messages {
         let stamp = row_stamp(message);
-        let (height, line_starts) = match previous.remove(&message.id) {
-            Some(cached) if cached.stamp == stamp => (cached.height, cached.line_starts),
-            _ => estimate_row(prev_message, message, column_width),
+        let (height, line_starts, measured) = match previous.remove(&message.id) {
+            Some(cached) if cached.stamp == stamp => {
+                (cached.height, cached.line_starts, cached.measured)
+            }
+            _ => {
+                let (height, line_starts) = estimate_row(prev_message, message, column_width);
+                (height, line_starts, false)
+            }
         };
         chat.rows.push(CachedRow {
             id: message.id,
             stamp,
             height,
             line_starts,
+            measured,
         });
         prev_message = Some(message);
     }
@@ -783,6 +1016,9 @@ fn paint_rows(
 
         let attachment = state.attachments.get(&(contact, message.id));
         request_preview(chat, contact, message, attachment.is_some(), commands);
+        let highlight = chat.search.highlighted() == Some(message.id);
+        let band = highlight.then(|| ui.painter().add(egui::Shape::Noop));
+        let bubble_top = ui.cursor().min.y;
         let output = {
             let inputs = bubble::Inputs {
                 index,
@@ -794,6 +1030,13 @@ fn paint_rows(
             };
             bubble::show(ui, message, &inputs)
         };
+        if let Some(band) = band {
+            let rect =
+                Rect::from_x_y_ranges(ui.clip_rect().x_range(), bubble_top..=ui.cursor().min.y);
+            ui.painter()
+                .set(band, egui::Shape::rect_filled(rect, 0.0, SEARCH_HIT_TINT));
+        }
+        chat.rows[index].measured = true;
         let used = (ui.cursor().min.y - top).max(1.0);
         if (used - chat.rows[index].height).abs() > HEIGHT_EPSILON {
             chat.rows[index].height = used;
@@ -1525,6 +1768,144 @@ mod tests {
         assert!(
             harness.chat.painted.iter().all(|id| id[0] >= 200),
             "rows from the top of the history were shaped: {:?}",
+            harness
+                .chat
+                .painted
+                .iter()
+                .map(|id| id[0])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn jump_offset_centers_a_short_row_and_pins_a_tall_one() {
+        assert!((jump_offset(1000.0, 40.0, 600.0, 5000.0) - 720.0).abs() < 0.1);
+        assert!((jump_offset(100.0, 800.0, 600.0, 5000.0) - 100.0).abs() < 0.1);
+        assert_eq!(jump_offset(10.0, 40.0, 600.0, 200.0), 0.0);
+    }
+
+    #[test]
+    fn away_from_bottom_is_false_when_the_room_fits_or_is_near_the_end() {
+        assert!(away_from_bottom(0.0, 1000.0, 400.0));
+        assert!(!away_from_bottom(590.0, 1000.0, 400.0));
+        assert!(!away_from_bottom(0.0, 100.0, 400.0));
+    }
+
+    fn history(count: u8) -> Vec<MessageView> {
+        (0..count)
+            .map(|index| MessageView {
+                id: [index; 16],
+                contact: CONTACT,
+                direction: Direction::Incoming,
+                text: format!("message {index}"),
+                attachment: None,
+                reactions: Default::default(),
+                sent_at_ms: 1_700_000_000_000 + u64::from(index) * 1_000,
+                status: DeliveryStatus::Delivered,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn choosing_a_search_hit_scrolls_that_message_into_view() {
+        let mut harness = Harness::new();
+        harness.state.conversations.insert(CONTACT, history(60));
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            harness.chat.painted.iter().any(|id| id[0] == 59),
+            "expected the newest message, saw {:?}",
+            harness.chat.painted
+        );
+        assert!(
+            harness.chat.painted.iter().all(|id| id[0] != 0),
+            "the oldest message was already on screen"
+        );
+        harness.chat.search.reveal([0; 16]);
+        for _ in 0..6 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            harness.chat.painted.iter().any(|id| id[0] == 0),
+            "jump did not reach the oldest message: {:?}",
+            harness
+                .chat
+                .painted
+                .iter()
+                .map(|id| id[0])
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            harness.chat.painted.iter().all(|id| id[0] < 40),
+            "jump left the newest messages on screen: {:?}",
+            harness
+                .chat
+                .painted
+                .iter()
+                .map(|id| id[0])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn jump_button_shows_when_scrolled_up_and_returns_to_the_latest() {
+        let mut harness = Harness::new();
+        harness.state.conversations.insert(CONTACT, history(60));
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            !harness.chat.jump_visible,
+            "the button is hidden while stuck to the latest message"
+        );
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 3.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for _ in 0..6 {
+            harness.frame(
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(450.0, 300.0)),
+                    wheel.clone(),
+                ],
+                egui::Modifiers::NONE,
+            );
+        }
+        for _ in 0..2 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            harness.chat.jump_visible,
+            "scrolling up should show the jump button"
+        );
+        let at = harness.chat.jump_rect.expect("button rect").center();
+        assert!(
+            at.x > 600.0,
+            "jump button should sit on the right, center was {at:?}"
+        );
+        harness.frame(vec![egui::Event::PointerMoved(at)], egui::Modifiers::NONE);
+        harness.frame(
+            vec![button(at, true, egui::Modifiers::NONE)],
+            egui::Modifiers::NONE,
+        );
+        harness.frame(
+            vec![button(at, false, egui::Modifiers::NONE)],
+            egui::Modifiers::NONE,
+        );
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            !harness.chat.jump_visible,
+            "the button stays up after jumping to the latest message"
+        );
+        assert!(
+            harness.chat.painted.iter().any(|id| id[0] == 59),
+            "jump did not return to the newest message: {:?}",
             harness
                 .chat
                 .painted

@@ -5,6 +5,7 @@ pub mod add_contact;
 pub mod avatar;
 pub mod bubble;
 pub mod chat;
+mod chat_search;
 pub mod composer;
 pub mod devices;
 pub mod emoji;

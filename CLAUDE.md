@@ -29,6 +29,14 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   paint those codepoints grey. Letters and digits stay with the text font.
 - **Links:** `http`, `https`, `www.` and `mailto` in a message open with the system handler on click.
   A long note only scans the lines on screen. A single precise click does not select the message.
+- **In-chat search:** the magnifying glass at the right of the chat header (also Ctrl+F) switches the
+  sidebar to that room. The sidebar field searches message text and file names; the list shows the
+  newest 100 matches. A click scrolls the room to that message and tints it until the user scrolls.
+  Esc, the header icon, or the sidebar ✕ leaves search and restores the chat list (the contact
+  filter text is kept). Matching runs again only when the query or the conversation changes.
+- **Jump to latest:** when the open room is scrolled up, a down-chevron button overlays the bottom
+  right of the message list (just left of the scrollbar) and scrolls back to the newest message,
+  sticking there again.
 - **Paste:** Ctrl+V sends clipboard images (`Event::PasteImage`) and copied files (`text/uri-list` via arboard). The latter needs the
   `vendor/egui-winit` patch (Ctrl+V key event passes through when no text/image). Drag & drop does not work on Wayland (winit 0.30).
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
@@ -78,9 +86,11 @@ crates/brumm-app/         eframe binary `brumm`
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
                           Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
-                          avatar.rs (initials circles), sidebar.rs (search, chat list sorted by last
+                          avatar.rs (initials circles), sidebar.rs (contact search, or the open room's
+                          message hits while in-chat search is on; chat list sorted by last
                           activity, unread badges), chat.rs (windowed message list, hand-painted bubbles
-                          with inline time/ticks, grouping, day pills, pill composer), time_fmt.rs
+                          with inline time/ticks, grouping, day pills, pill composer, jump-to-latest),
+                          chat_search.rs (query, snippets, jump target), time_fmt.rs
                           (jiff 1.0 local time)
                           bubble.rs (text/image/file-card bubble + clickable links + selection chrome + context menu),
                           composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
