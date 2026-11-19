@@ -18,15 +18,19 @@ use data_encoding::BASE64;
 use iroh::EndpointId;
 use nostr::nips::nip44;
 use nostr_sdk::prelude::{
-    Client, ClientNotification, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, PublicKey, SecretKey, Tag,
-    Timestamp,
+    Client, ClientNotification, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, PublicKey,
+    SecretKey, Tag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{crypto::Sealed, wire};
 
-pub const DEFAULT_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"];
+pub const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+];
 pub const MAX_RELAYS: usize = 3;
 pub const MAX_RELAY_URL_CHARS: usize = 128;
 const INBOX_KEY_CONTEXT: &str = "brumm 2026 nostr inbox key v1";
@@ -49,20 +53,27 @@ impl MailboxAddress {
         !self.relays.is_empty()
             && self.relays.len() <= MAX_RELAYS
             && self.relays.iter().all(|relay| {
-                relay.len() <= MAX_RELAY_URL_CHARS && (relay.starts_with("wss://") || relay.starts_with("ws://"))
+                relay.len() <= MAX_RELAY_URL_CHARS
+                    && (relay.starts_with("wss://") || relay.starts_with("ws://"))
             })
             && PublicKey::from_slice(&self.inbox_key).is_ok()
     }
 }
 
 pub fn default_relays() -> Vec<String> {
-    DEFAULT_RELAYS.iter().map(|relay| (*relay).to_owned()).collect()
+    DEFAULT_RELAYS
+        .iter()
+        .map(|relay| (*relay).to_owned())
+        .collect()
 }
 
 /// The inbox key pair of the device with `device_secret`.
 pub fn inbox_keys(device_secret: &[u8; 32]) -> Keys {
     let secret = blake3::derive_key(INBOX_KEY_CONTEXT, device_secret);
-    Keys::new(SecretKey::from_slice(&secret).expect("blake3 output is a valid secp256k1 key with overwhelming probability"))
+    Keys::new(
+        SecretKey::from_slice(&secret)
+            .expect("blake3 output is a valid secp256k1 key with overwhelming probability"),
+    )
 }
 
 pub fn address(device_secret: &[u8; 32], relays: Vec<String>) -> MailboxAddress {
@@ -93,20 +104,33 @@ pub struct Mailbox {
 impl Mailbox {
     /// Connects to our relays and streams letters for our inbox (posted after `since_secs`)
     /// into `deliveries` until shut down.
-    pub async fn start(device_secret: &[u8; 32], relays: &[String], since_secs: Option<u64>, deliveries: mpsc::Sender<MailboxDelivery>) -> Result<Arc<Self>> {
+    pub async fn start(
+        device_secret: &[u8; 32],
+        relays: &[String],
+        since_secs: Option<u64>,
+        deliveries: mpsc::Sender<MailboxDelivery>,
+    ) -> Result<Arc<Self>> {
         let inbox = inbox_keys(device_secret);
         let client = Client::default();
         for relay in relays {
-            client.add_relay(relay.as_str()).await.with_context(|| format!("add relay {relay}"))?;
+            client
+                .add_relay(relay.as_str())
+                .await
+                .with_context(|| format!("add relay {relay}"))?;
         }
         client.connect().and_wait(CONNECT_WAIT).await;
 
         let mut notifications = client.notifications();
-        let mut filter = Filter::new().kind(Kind::GiftWrap).pubkey(inbox.public_key());
+        let mut filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(inbox.public_key());
         if let Some(since) = since_secs {
             filter = filter.since(Timestamp::from(since.saturating_sub(SINCE_MARGIN_SECS)));
         }
-        client.subscribe(filter).await.context("subscribe to inbox")?;
+        client
+            .subscribe(filter)
+            .await
+            .context("subscribe to inbox")?;
 
         tokio::spawn(async move {
             use nostr_sdk::prelude::StreamExt;
@@ -129,13 +153,29 @@ impl Mailbox {
 
     /// Posts `sealed` to the recipient's inbox; succeeds if at least one relay accepted it.
     pub async fn post(&self, to: &MailboxAddress, from: EndpointId, sealed: Sealed) -> Result<()> {
-        ensure!(sealed.ciphertext.len() <= MAX_LETTER_SEALED_BYTES, "too large for a mailbox letter");
-        let event = seal_letter(to, Letter { sender: from, sealed })?;
+        ensure!(
+            sealed.ciphertext.len() <= MAX_LETTER_SEALED_BYTES,
+            "too large for a mailbox letter"
+        );
+        let event = seal_letter(
+            to,
+            Letter {
+                sender: from,
+                sealed,
+            },
+        )?;
         for relay in &to.relays {
-            self.client.add_relay(relay.as_str()).await.with_context(|| format!("add relay {relay}"))?;
+            self.client
+                .add_relay(relay.as_str())
+                .await
+                .with_context(|| format!("add relay {relay}"))?;
         }
         self.client.connect().and_wait(CONNECT_WAIT).await;
-        let output = self.client.send_event(&event).to(to.relays.iter().map(String::as_str)).await?;
+        let output = self
+            .client
+            .send_event(&event)
+            .to(to.relays.iter().map(String::as_str))
+            .await?;
         if output.success.is_empty() {
             bail!("no relay accepted the letter: {:?}", output.failed);
         }
@@ -151,7 +191,12 @@ fn seal_letter(to: &MailboxAddress, letter: Letter) -> Result<Event> {
     let recipient = PublicKey::from_slice(&to.inbox_key)?;
     let ephemeral = Keys::generate();
     let plaintext = BASE64.encode(&wire::encode(&letter));
-    let content = nip44::encrypt(ephemeral.secret_key(), &recipient, plaintext, nip44::Version::V2)?;
+    let content = nip44::encrypt(
+        ephemeral.secret_key(),
+        &recipient,
+        plaintext,
+        nip44::Version::V2,
+    )?;
     let expires = Timestamp::now() + LETTER_TTL;
     Ok(EventBuilder::new(Kind::GiftWrap, content)
         .tags([Tag::public_key(recipient), Tag::expiration(expires)])
@@ -179,11 +224,25 @@ mod tests {
         let to = address(&device_secret, default_relays());
         assert!(to.is_valid());
         let sender = iroh::SecretKey::generate().public();
-        let sealed = Sealed { message_type: 1, ciphertext: b"olm-ciphertext".to_vec() };
-        let event = seal_letter(&to, Letter { sender, sealed: sealed.clone() }).unwrap();
+        let sealed = Sealed {
+            message_type: 1,
+            ciphertext: b"olm-ciphertext".to_vec(),
+        };
+        let event = seal_letter(
+            &to,
+            Letter {
+                sender,
+                sealed: sealed.clone(),
+            },
+        )
+        .unwrap();
 
         assert!(!event.content.contains("olm-ciphertext"));
-        assert_ne!(event.pubkey.to_bytes(), to.inbox_key, "signed by an ephemeral key");
+        assert_ne!(
+            event.pubkey.to_bytes(),
+            to.inbox_key,
+            "signed by an ephemeral key"
+        );
         let opened = open_letter(&inbox_keys(&device_secret), &event).unwrap();
         assert_eq!((opened.from, opened.sealed), (sender, sealed));
         assert!(open_letter(&inbox_keys(&[8; 32]), &event).is_err());

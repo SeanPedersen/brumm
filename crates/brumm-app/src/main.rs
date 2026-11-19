@@ -22,7 +22,8 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> Result<()> {
     init_tracing();
-    let profile = profile_from_args(std::env::args().skip(1)).unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
+    let profile =
+        profile_from_args(std::env::args().skip(1)).unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
     let data_dir = data_dir(&profile)?;
     tracing::info!(profile, data_dir = %data_dir.display(), "starting brumm");
 
@@ -68,14 +69,19 @@ fn profile_from_args(mut args: impl Iterator<Item = String>) -> Option<String> {
 }
 
 fn data_dir(profile: &str) -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("chat", "brumm", "brumm").context("no home directory")?;
+    let dirs =
+        directories::ProjectDirs::from("chat", "brumm", "brumm").context("no home directory")?;
     Ok(dirs.data_dir().join("profiles").join(profile))
 }
 
 fn window_icon() -> Option<egui::IconData> {
     let rgba = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
     let (width, height) = rgba.dimensions();
-    Some(egui::IconData { rgba: rgba.into_raw(), width, height })
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
 }
 
 fn window_title(profile: &str) -> String {
@@ -91,13 +97,22 @@ mod tests {
     use super::*;
 
     fn args(raw: &[&str]) -> impl Iterator<Item = String> {
-        raw.iter().map(|arg| arg.to_string()).collect::<Vec<_>>().into_iter()
+        raw.iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[test]
     fn parses_profile_flag_forms() {
-        assert_eq!(profile_from_args(args(&["--profile", "bob"])), Some("bob".into()));
-        assert_eq!(profile_from_args(args(&["--profile=alice"])), Some("alice".into()));
+        assert_eq!(
+            profile_from_args(args(&["--profile", "bob"])),
+            Some("bob".into())
+        );
+        assert_eq!(
+            profile_from_args(args(&["--profile=alice"])),
+            Some("alice".into())
+        );
         assert_eq!(profile_from_args(args(&[])), None);
     }
 }

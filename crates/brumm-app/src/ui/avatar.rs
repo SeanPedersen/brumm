@@ -9,16 +9,28 @@ const INITIAL_COUNT: usize = 2;
 const INITIAL_FONT_FRACTION: f32 = 0.38;
 
 /// Paints an avatar centered on `center`: the photo if there is one, else initials on a color.
-pub fn paint(ui: &Ui, center: Pos2, diameter: f32, key: &UserKey, name: &str, photo: Option<&AvatarImage>) {
+pub fn paint(
+    ui: &Ui,
+    center: Pos2,
+    diameter: f32,
+    key: &UserKey,
+    name: &str,
+    photo: Option<&AvatarImage>,
+) {
     if let Some(photo) = photo {
         let rect = egui::Rect::from_center_size(center, egui::vec2(diameter, diameter));
-        let image = egui::Image::from_bytes(photo.uri.clone(), egui::load::Bytes::Shared(photo.bytes.clone()))
-            .corner_radius(egui::CornerRadius::same(u8::MAX));
+        let image = egui::Image::from_bytes(
+            photo.uri.clone(),
+            egui::load::Bytes::Shared(photo.bytes.clone()),
+        )
+        .corner_radius(egui::CornerRadius::same(u8::MAX));
         image.paint_at(ui, rect);
         return;
     }
-    let color_index = key.iter().map(|byte| *byte as usize).sum::<usize>() % theme::AVATAR_COLORS.len();
-    ui.painter().circle_filled(center, diameter / 2.0, theme::AVATAR_COLORS[color_index]);
+    let color_index =
+        key.iter().map(|byte| *byte as usize).sum::<usize>() % theme::AVATAR_COLORS.len();
+    ui.painter()
+        .circle_filled(center, diameter / 2.0, theme::AVATAR_COLORS[color_index]);
     ui.painter().text(
         center,
         Align2::CENTER_CENTER,
@@ -41,7 +53,11 @@ fn initials(name: &str) -> String {
         .take(INITIAL_COUNT)
         .flat_map(char::to_uppercase)
         .collect();
-    if letters.is_empty() { "?".to_owned() } else { letters }
+    if letters.is_empty() {
+        "?".to_owned()
+    } else {
+        letters
+    }
 }
 
 #[cfg(test)]

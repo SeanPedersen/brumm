@@ -44,7 +44,8 @@ impl DeviceCrypto {
 
     pub fn load(account_pickle: &str, device_secret: &[u8; 32]) -> Result<Self> {
         let pickle_key = crypto::pickle_key(device_secret);
-        let olm = OlmDevice::from_pickle(account_pickle, &pickle_key).context("olm account unreadable")?;
+        let olm = OlmDevice::from_pickle(account_pickle, &pickle_key)
+            .context("olm account unreadable")?;
         Ok(Self::new(olm, device_secret))
     }
 
@@ -76,20 +77,33 @@ impl DeviceCrypto {
     }
 
     /// Starts a session towards a peer (not yet persisted: call [`Self::adopt`] once accepted).
-    pub fn start_outbound(&self, their_identity: &OlmIdentityKey, their_key: &OneTimeKey) -> Result<Session> {
+    pub fn start_outbound(
+        &self,
+        their_identity: &OlmIdentityKey,
+        their_key: &OneTimeKey,
+    ) -> Result<Session> {
         Ok(self.olm.outbound_session(their_identity, their_key)?)
     }
 
     /// Accepts a pre-key message (consuming a one-time key, if one was used). Returns the new
     /// session, the plaintext and the sender's Olm identity key. Persist the account afterwards
     /// via [`Self::save_account`] when no store existed yet.
-    pub fn accept_inbound_unsaved(&mut self, sealed: &Sealed) -> Result<(Session, Vec<u8>, OlmIdentityKey)> {
-        let sender = sealed.pre_key_sender().context("expected a session-opening message")?;
+    pub fn accept_inbound_unsaved(
+        &mut self,
+        sealed: &Sealed,
+    ) -> Result<(Session, Vec<u8>, OlmIdentityKey)> {
+        let sender = sealed
+            .pre_key_sender()
+            .context("expected a session-opening message")?;
         let (session, plaintext) = self.olm.inbound_session(&sender, sealed)?;
         Ok((session, plaintext, sender))
     }
 
-    pub fn accept_inbound(&mut self, store: &Store, sealed: &Sealed) -> Result<(Session, Vec<u8>, OlmIdentityKey)> {
+    pub fn accept_inbound(
+        &mut self,
+        store: &Store,
+        sealed: &Sealed,
+    ) -> Result<(Session, Vec<u8>, OlmIdentityKey)> {
         let accepted = self.accept_inbound_unsaved(sealed)?;
         self.save_account(store)?;
         Ok(accepted)
@@ -132,13 +146,24 @@ impl DeviceCrypto {
             .and_then(|sessions| sessions.first_mut())
             .expect("session ensured above");
         let sealed = crypto::seal(&mut active.session, plaintext)?;
-        store.save_session(&device, &active.id, &crypto::pickle_session(&active.session, &pickle_key), active.last_used_ms)?;
+        store.save_session(
+            &device,
+            &active.id,
+            &crypto::pickle_session(&active.session, &pickle_key),
+            active.last_used_ms,
+        )?;
         Ok(sealed)
     }
 
     /// Decrypts a message from `device`, trying every known session. A pre-key message from the
     /// device's *certified* identity key that no session can decrypt opens a new session.
-    pub fn open(&mut self, store: &Store, device: &EndpointId, certified_identity: &OlmIdentityKey, sealed: &Sealed) -> Result<Vec<u8>> {
+    pub fn open(
+        &mut self,
+        store: &Store,
+        device: &EndpointId,
+        certified_identity: &OlmIdentityKey,
+        sealed: &Sealed,
+    ) -> Result<Vec<u8>> {
         self.load_sessions(store, device)?;
         if let Some(plaintext) = self.try_existing(store, device, sealed)? {
             return Ok(plaintext);
@@ -151,21 +176,33 @@ impl DeviceCrypto {
         Ok(plaintext)
     }
 
-    fn try_existing(&mut self, store: &Store, device: &EndpointId, sealed: &Sealed) -> Result<Option<Vec<u8>>> {
+    fn try_existing(
+        &mut self,
+        store: &Store,
+        device: &EndpointId,
+        sealed: &Sealed,
+    ) -> Result<Option<Vec<u8>>> {
         let pickle_key = self.pickle_key;
         let Some(sessions) = self.sessions.get_mut(device) else {
             return Ok(None);
         };
-        let Some((index, plaintext)) = sessions
-            .iter_mut()
-            .enumerate()
-            .find_map(|(index, active)| crypto::open(&mut active.session, sealed).ok().map(|plaintext| (index, plaintext)))
+        let Some((index, plaintext)) =
+            sessions.iter_mut().enumerate().find_map(|(index, active)| {
+                crypto::open(&mut active.session, sealed)
+                    .ok()
+                    .map(|plaintext| (index, plaintext))
+            })
         else {
             return Ok(None);
         };
         let mut active = sessions.remove(index);
         active.last_used_ms = now_ms();
-        store.save_session(device, &active.id, &crypto::pickle_session(&active.session, &pickle_key), active.last_used_ms)?;
+        store.save_session(
+            device,
+            &active.id,
+            &crypto::pickle_session(&active.session, &pickle_key),
+            active.last_used_ms,
+        )?;
         sessions.insert(0, active);
         Ok(Some(plaintext))
     }
@@ -176,7 +213,12 @@ impl DeviceCrypto {
     }
 
     fn persist(&self, store: &Store, device: &EndpointId, active: &ActiveSession) -> Result<()> {
-        store.save_session(device, &active.id, &crypto::pickle_session(&active.session, &self.pickle_key), active.last_used_ms)
+        store.save_session(
+            device,
+            &active.id,
+            &crypto::pickle_session(&active.session, &self.pickle_key),
+            active.last_used_ms,
+        )
     }
 
     fn load_sessions(&mut self, store: &Store, device: &EndpointId) -> Result<()> {
@@ -185,8 +227,13 @@ impl DeviceCrypto {
         }
         let mut loaded = Vec::new();
         for (id, pickle, last_used_ms) in store.sessions_of(device)? {
-            let session = crypto::unpickle_session(&pickle, &self.pickle_key).context("olm session unreadable")?;
-            loaded.push(ActiveSession { id, session, last_used_ms });
+            let session = crypto::unpickle_session(&pickle, &self.pickle_key)
+                .context("olm session unreadable")?;
+            loaded.push(ActiveSession {
+                id,
+                session,
+                last_used_ms,
+            });
         }
         loaded.sort_by_key(|active| std::cmp::Reverse(active.last_used_ms));
         self.sessions.insert(*device, loaded);
@@ -217,7 +264,11 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         crypto.save_account(&store).unwrap();
-        Peer { store, crypto, entry }
+        Peer {
+            store,
+            crypto,
+            entry,
+        }
     }
 
     fn deliver(from: &mut Peer, to: &mut Peer, text: &[u8]) -> Result<Vec<u8>> {
@@ -236,12 +287,26 @@ mod tests {
         let (alice_id, bob_id) = (alice.entry.device_id(), bob.entry.device_id());
         let alice_identity = alice.entry.cert.olm_identity_key;
         let bob_identity = bob.entry.cert.olm_identity_key;
-        assert_eq!(bob.crypto.open(&bob.store, &alice_id, &alice_identity, &from_alice).unwrap(), b"a1");
-        assert_eq!(alice.crypto.open(&alice.store, &bob_id, &bob_identity, &from_bob).unwrap(), b"b1");
+        assert_eq!(
+            bob.crypto
+                .open(&bob.store, &alice_id, &alice_identity, &from_alice)
+                .unwrap(),
+            b"a1"
+        );
+        assert_eq!(
+            alice
+                .crypto
+                .open(&alice.store, &bob_id, &bob_identity, &from_bob)
+                .unwrap(),
+            b"b1"
+        );
 
         for round in 0..5u8 {
             assert_eq!(deliver(&mut alice, &mut bob, &[round]).unwrap(), [round]);
-            assert_eq!(deliver(&mut bob, &mut alice, &[round, 1]).unwrap(), [round, 1]);
+            assert_eq!(
+                deliver(&mut bob, &mut alice, &[round, 1]).unwrap(),
+                [round, 1]
+            );
         }
     }
 
@@ -253,16 +318,27 @@ mod tests {
 
         bob.crypto.sessions.clear();
         alice.crypto.sessions.clear();
-        assert_eq!(deliver(&mut alice, &mut bob, b"after reload").unwrap(), b"after reload");
+        assert_eq!(
+            deliver(&mut alice, &mut bob, b"after reload").unwrap(),
+            b"after reload"
+        );
     }
 
     #[test]
     fn foreign_identity_cannot_open_session() {
         let (mut alice, mut bob, mut mallory) = (peer(), peer(), peer());
         // Mallory seals with her own identity but claims to be Alice's device.
-        let sealed = mallory.crypto.seal(&mallory.store, &bob.entry, b"evil").unwrap();
+        let sealed = mallory
+            .crypto
+            .seal(&mallory.store, &bob.entry, b"evil")
+            .unwrap();
         let alice_identity = alice.entry.cert.olm_identity_key;
-        let opened = bob.crypto.open(&bob.store, &alice.entry.device_id(), &alice_identity, &sealed);
+        let opened = bob.crypto.open(
+            &bob.store,
+            &alice.entry.device_id(),
+            &alice_identity,
+            &sealed,
+        );
         assert!(opened.is_err());
         assert_eq!(deliver(&mut alice, &mut bob, b"real").unwrap(), b"real");
     }

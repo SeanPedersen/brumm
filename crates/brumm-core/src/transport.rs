@@ -60,7 +60,10 @@ impl Bound {
 
 impl Transport {
     /// Starts binding in the background; callers wait lazily in [`Self::bound`].
-    pub fn start(secret_key: SecretKey, inbound: mpsc::Sender<InboundRequest>) -> std::sync::Arc<Self> {
+    pub fn start(
+        secret_key: SecretKey,
+        inbound: mpsc::Sender<InboundRequest>,
+    ) -> std::sync::Arc<Self> {
         let transport = std::sync::Arc::new(Self {
             secret_key,
             inbound,
@@ -112,16 +115,23 @@ impl Transport {
                 }
             }
         }
-        let connection = tokio::time::timeout(CONNECT_TIMEOUT, bound.endpoint().connect(addr, ALPN))
-            .await
-            .context("connect timed out")??;
-        bound.connections.lock().expect("lock poisoned").insert(peer, connection.clone());
+        let connection =
+            tokio::time::timeout(CONNECT_TIMEOUT, bound.endpoint().connect(addr, ALPN))
+                .await
+                .context("connect timed out")??;
+        bound
+            .connections
+            .lock()
+            .expect("lock poisoned")
+            .insert(peer, connection.clone());
         exchange(&connection, &payload).await
     }
 
     /// Closes the endpoint; in-flight requests of background tasks fail promptly.
     pub async fn shutdown(&self) {
-        let Some(Ok(bound)) = self.bound.get() else { return };
+        let Some(Ok(bound)) = self.bound.get() else {
+            return;
+        };
         if let Err(err) = bound.router.shutdown().await {
             tracing::warn!(?err, "router shutdown failed");
         }
@@ -130,7 +140,11 @@ impl Transport {
 
 impl Bound {
     fn cached(&self, peer: &EndpointId) -> Option<Connection> {
-        self.connections.lock().expect("lock poisoned").get(peer).cloned()
+        self.connections
+            .lock()
+            .expect("lock poisoned")
+            .get(peer)
+            .cloned()
     }
 
     fn forget(&self, peer: &EndpointId) {
@@ -170,7 +184,11 @@ impl ProtocolHandler for InboundHandler {
                     let frame: Frame = wire::decode(&bytes)?;
                     let (reply_tx, reply_rx) = oneshot::channel();
                     inbound
-                        .send(InboundRequest { from, frame, reply: reply_tx })
+                        .send(InboundRequest {
+                            from,
+                            frame,
+                            reply: reply_tx,
+                        })
                         .await
                         .context("node stopped")?;
                     let reply = reply_rx.await.context("node dropped request")?;

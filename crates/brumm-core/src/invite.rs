@@ -36,8 +36,21 @@ pub enum InviteError {
 }
 
 impl Invite {
-    pub fn new(display_name: String, device_cert: DeviceCert, device_addr: EndpointAddr, secret: InviteSecret, one_time_key: OneTimeKey) -> Self {
-        Self { version: INVITE_VERSION, display_name, device_cert, device_addr, secret, one_time_key }
+    pub fn new(
+        display_name: String,
+        device_cert: DeviceCert,
+        device_addr: EndpointAddr,
+        secret: InviteSecret,
+        one_time_key: OneTimeKey,
+    ) -> Self {
+        Self {
+            version: INVITE_VERSION,
+            display_name,
+            device_cert,
+            device_addr,
+            secret,
+            one_time_key,
+        }
     }
 
     pub fn user_key(&self) -> UserKey {
@@ -73,13 +86,25 @@ mod tests {
         let identity = UserIdentity::generate();
         let device = iroh::SecretKey::generate().public();
         let cert = identity.certify_device(device, [3; 32], 1);
-        let invite = Invite::new("alice".into(), cert, EndpointAddr::from(device), [9; 16], [8; 32]);
+        let invite = Invite::new(
+            "alice".into(),
+            cert,
+            EndpointAddr::from(device),
+            [9; 16],
+            [8; 32],
+        );
         assert_eq!(Invite::from_link(&invite.to_link()).unwrap(), invite);
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(matches!(Invite::from_link("hello"), Err(InviteError::Uri(UriError::WrongPrefix))));
-        assert!(matches!(Invite::from_link("brumm://invite/!!!"), Err(InviteError::Uri(UriError::Malformed))));
+        assert!(matches!(
+            Invite::from_link("hello"),
+            Err(InviteError::Uri(UriError::WrongPrefix))
+        ));
+        assert!(matches!(
+            Invite::from_link("brumm://invite/!!!"),
+            Err(InviteError::Uri(UriError::Malformed))
+        ));
     }
 }

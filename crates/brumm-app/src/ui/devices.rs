@@ -14,7 +14,12 @@ pub struct DevicesView {
     confirm_remove: Option<DeviceId>,
 }
 
-pub fn show(ui: &mut egui::Ui, state: &AppState, view: &mut DevicesView, commands: &mut Vec<Command>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    view: &mut DevicesView,
+    commands: &mut Vec<Command>,
+) {
     if !view.open {
         return;
     }
@@ -32,19 +37,38 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, view: &mut DevicesView, command
     view.open = open;
 }
 
-fn device_list(ui: &mut egui::Ui, state: &AppState, view: &mut DevicesView, commands: &mut Vec<Command>) {
+fn device_list(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    view: &mut DevicesView,
+    commands: &mut Vec<Command>,
+) {
     for device in &state.devices {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&device.label).strong());
-            ui.label(egui::RichText::new(short_id(&device.device_id)).monospace().small().color(theme::MUTED_TEXT));
+            ui.label(
+                egui::RichText::new(short_id(&device.device_id))
+                    .monospace()
+                    .small()
+                    .color(theme::MUTED_TEXT),
+            );
             if device.this_device {
-                ui.label(egui::RichText::new("this device").small().color(theme::ACCENT));
+                ui.label(
+                    egui::RichText::new("this device")
+                        .small()
+                        .color(theme::ACCENT),
+                );
                 return;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if view.confirm_remove == Some(device.device_id) {
-                    if ui.button(egui::RichText::new("Yes, remove").color(theme::DANGER)).clicked() {
-                        commands.push(Command::RemoveDevice { device_id: device.device_id });
+                    if ui
+                        .button(egui::RichText::new("Yes, remove").color(theme::DANGER))
+                        .clicked()
+                    {
+                        commands.push(Command::RemoveDevice {
+                            device_id: device.device_id,
+                        });
                         view.confirm_remove = None;
                     }
                     if ui.button("Cancel").clicked() {
@@ -61,13 +85,25 @@ fn device_list(ui: &mut egui::Ui, state: &AppState, view: &mut DevicesView, comm
 fn link_section(ui: &mut egui::Ui, view: &mut DevicesView, commands: &mut Vec<Command>) {
     ui.strong("Link a new device");
     ui.label(egui::RichText::new("On the new device choose “I use brumm on another device” and paste its link here. It gets your contacts and the last 60 days of chats.").small().color(theme::MUTED_TEXT));
-    ui.add(egui::TextEdit::singleline(&mut view.pasted_link).hint_text("brumm://link/…").desired_width(f32::INFINITY));
+    ui.add(
+        egui::TextEdit::singleline(&mut view.pasted_link)
+            .hint_text("brumm://link/…")
+            .desired_width(f32::INFINITY),
+    );
     let can_link = view.pasted_link.trim().starts_with("brumm://link/");
-    if ui.add_enabled(can_link, theme::primary_button("Link device")).clicked() {
-        commands.push(Command::LinkDevice { link: std::mem::take(&mut view.pasted_link) });
+    if ui
+        .add_enabled(can_link, theme::primary_button("Link device"))
+        .clicked()
+    {
+        commands.push(Command::LinkDevice {
+            link: std::mem::take(&mut view.pasted_link),
+        });
     }
 }
 
 fn short_id(device_id: &DeviceId) -> String {
-    device_id[..3].iter().map(|byte| format!("{byte:02x}")).collect()
+    device_id[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

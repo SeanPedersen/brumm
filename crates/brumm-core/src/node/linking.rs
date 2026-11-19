@@ -2,7 +2,8 @@
 //! updates to our own signed device list. After a link, the linking device syncs contacts and
 //! recent history to the new device and announces the new list to every contact.
 
-use anyhow::{Context, Result, bail, ensure};use iroh::{EndpointId, SecretKey};
+use anyhow::{Context, Result, bail, ensure};
+use iroh::{EndpointId, SecretKey};
 
 use super::{LinkTarget, Me, Node, Outcome, PendingLink, RETENTION_MS, next_seq, profile_view};
 use crate::{
@@ -10,12 +11,18 @@ use crate::{
     clock::now_ms,
     crypto::{self, Sealed},
     e2ee::DeviceCrypto,
-    identity::{DeviceEntry, DeviceList, MAX_DEVICES, Profile, UserIdentity, default_device_label, normalize_display_name},
+    identity::{
+        DeviceEntry, DeviceList, MAX_DEVICES, Profile, UserIdentity, default_device_label,
+        normalize_display_name,
+    },
     link::{LinkBundle, LinkTicket},
     mailbox,
     store::StoredIdentity,
     transport::Transport,
-    wire::{self, Avatar, ContactRecord, Envelope, Frame, LinkSecret, Payload, RejectReason, Reply, chunk_history},
+    wire::{
+        self, Avatar, ContactRecord, Envelope, Frame, LinkSecret, Payload, RejectReason, Reply,
+        chunk_history,
+    },
 };
 
 impl Node {
@@ -26,7 +33,9 @@ impl Node {
             bail!("this device already has an identity");
         }
         if let Some(target) = &self.link_target {
-            self.events.emit(Event::LinkTicket { link: target.ticket.to_link() });
+            self.events.emit(Event::LinkTicket {
+                link: target.ticket.to_link(),
+            });
             return Ok(());
         }
         let device_secret = SecretKey::generate();
@@ -42,19 +51,36 @@ impl Node {
             mailbox::address(&device_secret.to_bytes(), self.mailbox_relays.clone()),
             default_device_label(),
         );
-        self.events.emit(Event::LinkTicket { link: ticket.to_link() });
-        self.link_target = Some(LinkTarget { device_secret, crypto, transport, ticket });
+        self.events.emit(Event::LinkTicket {
+            link: ticket.to_link(),
+        });
+        self.link_target = Some(LinkTarget {
+            device_secret,
+            crypto,
+            transport,
+            ticket,
+        });
         Ok(())
     }
 
     /// Handles `Frame::Link` on a device waiting to be linked.
-    pub(super) fn accept_link(&mut self, from: EndpointId, link_secret: LinkSecret, sealed: &Sealed) -> Result<Reply> {
-        let Some(target) = self.link_target.as_mut().filter(|target| target.ticket.link_secret == link_secret) else {
+    pub(super) fn accept_link(
+        &mut self,
+        from: EndpointId,
+        link_secret: LinkSecret,
+        sealed: &Sealed,
+    ) -> Result<Reply> {
+        let Some(target) = self
+            .link_target
+            .as_mut()
+            .filter(|target| target.ticket.link_secret == link_secret)
+        else {
             return Ok(Reply::Rejected(RejectReason::UnknownInvite));
         };
         let (session, plaintext, sender_identity) = target.crypto.accept_inbound_unsaved(sealed)?;
         let bundle: LinkBundle = wire::decode(&plaintext)?;
-        let user = UserIdentity::from_phrase(&bundle.seed_phrase).context("link bundle has an invalid seed")?;
+        let user = UserIdentity::from_phrase(&bundle.seed_phrase)
+            .context("link bundle has an invalid seed")?;
         let my_device = target.device_secret.public();
         let lists_me = bundle.devices.entry(&my_device).is_some_and(|entry| {
             entry.cert.olm_identity_key == target.crypto.identity_key()
@@ -75,7 +101,10 @@ impl Node {
         }
 
         let target = self.link_target.take().expect("matched above");
-        let profile = Profile { display_name: bundle.display_name, devices: bundle.devices };
+        let profile = Profile {
+            display_name: bundle.display_name,
+            devices: bundle.devices,
+        };
         self.store.save_identity(&StoredIdentity {
             seed_phrase: user.phrase(),
             device_secret: target.device_secret.clone(),
@@ -84,7 +113,10 @@ impl Node {
         })?;
         let others = other_devices(&profile.devices, &my_device);
         self.store.replace_devices(&user.public(), &others)?;
-        self.events.emit(Event::IdentityCreated { profile: profile_view(&profile), seed_phrase: None });
+        self.events.emit(Event::IdentityCreated {
+            profile: profile_view(&profile),
+            seed_phrase: None,
+        });
         let relays = target.ticket.mailbox.relays.clone();
         self.start_mailbox(&target.device_secret, relays);
         self.me = Some(Me {
@@ -97,7 +129,10 @@ impl Node {
             revoked: false,
         });
         let Self { store, me, .. } = self;
-        me.as_mut().expect("just set").crypto.adopt(store, from, session)?;
+        me.as_mut()
+            .expect("just set")
+            .crypto
+            .adopt(store, from, session)?;
         self.emit_devices();
         Ok(Reply::Ack { id: link_secret })
     }
@@ -109,11 +144,19 @@ impl Node {
         let me = self.active_me()?;
         let new_device = ticket.device_addr.id;
         let current = &me.profile.devices;
-        ensure!(current.entry(&new_device).is_none(), "that device is already linked");
-        ensure!(current.entries.len() < MAX_DEVICES, "you can link at most {MAX_DEVICES} devices");
+        ensure!(
+            current.entry(&new_device).is_none(),
+            "that device is already linked"
+        );
+        ensure!(
+            current.entries.len() < MAX_DEVICES,
+            "you can link at most {MAX_DEVICES} devices"
+        );
 
         let entry = DeviceEntry {
-            cert: me.user.certify_device(new_device, ticket.olm_identity_key, now_ms()),
+            cert: me
+                .user
+                .certify_device(new_device, ticket.olm_identity_key, now_ms()),
             fallback_key: ticket.fallback_key,
             mailbox: ticket.mailbox.clone(),
             label: ticket.label.clone(),
@@ -126,31 +169,53 @@ impl Node {
             display_name: me.profile.display_name.clone(),
             devices: devices.clone(),
         };
-        let mut session = me.crypto.start_outbound(&ticket.olm_identity_key, &ticket.one_time_key)?;
+        let mut session = me
+            .crypto
+            .start_outbound(&ticket.olm_identity_key, &ticket.one_time_key)?;
         let frame = Frame::Link {
             link_secret: ticket.link_secret,
             sealed: crypto::seal(&mut session, &wire::encode(&bundle))?,
         };
         let transport = me.transport.clone();
-        self.pending_links.insert(new_device, PendingLink { session, devices, link_secret: ticket.link_secret });
+        self.pending_links.insert(
+            new_device,
+            PendingLink {
+                session,
+                devices,
+                link_secret: ticket.link_secret,
+            },
+        );
         let outcomes = self.outcomes_tx.clone();
         tokio::spawn(async move {
             let reply = transport.request(ticket.device_addr, &frame).await;
-            let _ = outcomes.send(Outcome::Link { device: new_device, reply });
+            let _ = outcomes.send(Outcome::Link {
+                device: new_device,
+                reply,
+            });
         });
         Ok(())
     }
 
     pub(super) fn finish_link(&mut self, device: EndpointId, reply: Result<Reply>) -> Result<()> {
-        let pending = self.pending_links.remove(&device).context("no pending link for this device")?;
+        let pending = self
+            .pending_links
+            .remove(&device)
+            .context("no pending link for this device")?;
         match reply.context("could not reach the new device — is it still showing the link?")? {
             Reply::Ack { id } if id == pending.link_secret => {}
             other => bail!("new device refused the link: {other:?}"),
         }
-        let entry = pending.devices.entry(&device).cloned().context("new device missing from list")?;
+        let entry = pending
+            .devices
+            .entry(&device)
+            .cloned()
+            .context("new device missing from list")?;
         self.apply_own_device_list(pending.devices)?;
         let Self { store, me, .. } = self;
-        me.as_mut().context("no identity")?.crypto.adopt(store, device, pending.session)?;
+        me.as_mut()
+            .context("no identity")?
+            .crypto
+            .adopt(store, device, pending.session)?;
 
         self.sync_to_new_device(&entry)?;
         self.announce_device_list()?;
@@ -161,14 +226,19 @@ impl Node {
     fn sync_to_new_device(&mut self, entry: &DeviceEntry) -> Result<()> {
         for contact in self.store.contacts()? {
             if let Some(profile) = self.store.contact_profile(&contact.user_key)? {
-                let record = ContactRecord { profile, added_at_ms: contact.added_at_ms };
+                let record = ContactRecord {
+                    profile,
+                    added_at_ms: contact.added_at_ms,
+                };
                 self.enqueue_to_device(entry, Payload::ContactSync(record))?;
             }
         }
         for (subject, image) in self.store.avatars()? {
             self.enqueue_to_device(entry, Payload::Avatar(Avatar { subject, image }))?;
         }
-        let history = self.store.history_since(now_ms().saturating_sub(RETENTION_MS))?;
+        let history = self
+            .store
+            .history_since(now_ms().saturating_sub(RETENTION_MS))?;
         for chunk in chunk_history(history) {
             self.enqueue_to_device(entry, Payload::History(chunk))?;
         }
@@ -178,10 +248,18 @@ impl Node {
     pub(super) fn remove_device(&mut self, device_id: DeviceId) -> Result<()> {
         let device = EndpointId::from_bytes(&device_id)?;
         let me = self.active_me()?;
-        ensure!(device != me.device_id, "remove this device from one of your other devices");
+        ensure!(
+            device != me.device_id,
+            "remove this device from one of your other devices"
+        );
         let current = &me.profile.devices;
         let removed_entry = current.entry(&device).cloned().context("unknown device")?;
-        let remaining = current.entries.iter().filter(|entry| entry.device_id() != device).cloned().collect();
+        let remaining = current
+            .entries
+            .iter()
+            .filter(|entry| entry.device_id() != device)
+            .cloned()
+            .collect();
         let devices = me.user.sign_device_list(next_seq(current.seq), remaining);
 
         self.notify_removed_device(&removed_entry, &devices)?;
@@ -194,7 +272,10 @@ impl Node {
     fn notify_removed_device(&mut self, entry: &DeviceEntry, devices: &DeviceList) -> Result<()> {
         let Self { store, me, .. } = self;
         let me = me.as_mut().context("no identity")?;
-        let envelope = Envelope { id: rand::random(), payload: Payload::DeviceList(devices.clone()) };
+        let envelope = Envelope {
+            id: rand::random(),
+            payload: Payload::DeviceList(devices.clone()),
+        };
         let sealed = me.crypto.seal(store, entry, &wire::encode(&envelope))?;
         let transport = me.transport.clone();
         let device = entry.device_id();
@@ -209,7 +290,12 @@ impl Node {
     fn announce_device_list(&mut self) -> Result<()> {
         let devices = self.me()?.profile.devices.clone();
         for contact in self.store.contacts()? {
-            self.enqueue_to_user(&contact.user_key, rand::random(), Payload::DeviceList(devices.clone()), None)?;
+            self.enqueue_to_user(
+                &contact.user_key,
+                rand::random(),
+                Payload::DeviceList(devices.clone()),
+                None,
+            )?;
         }
         self.enqueue_to_own_devices(Payload::DeviceList(devices))
     }
@@ -241,5 +327,9 @@ impl Node {
 }
 
 fn other_devices(list: &DeviceList, me: &EndpointId) -> Vec<DeviceEntry> {
-    list.entries.iter().filter(|entry| &entry.device_id() != me).cloned().collect()
+    list.entries
+        .iter()
+        .filter(|entry| &entry.device_id() != me)
+        .cloned()
+        .collect()
 }

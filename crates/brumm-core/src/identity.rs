@@ -61,7 +61,12 @@ impl UserIdentity {
         self.mnemonic.to_string()
     }
 
-    pub fn certify_device(&self, device_id: EndpointId, olm_identity_key: OlmIdentityKey, issued_at_ms: u64) -> DeviceCert {
+    pub fn certify_device(
+        &self,
+        device_id: EndpointId,
+        olm_identity_key: OlmIdentityKey,
+        issued_at_ms: u64,
+    ) -> DeviceCert {
         let mut cert = DeviceCert {
             user_key: self.public(),
             device_id,
@@ -112,7 +117,8 @@ impl DeviceCert {
         let Ok(key) = VerifyingKey::from_bytes(&self.user_key) else {
             return false;
         };
-        key.verify_strict(&self.signed_bytes(), &self.signature).is_ok()
+        key.verify_strict(&self.signed_bytes(), &self.signature)
+            .is_ok()
     }
 }
 
@@ -167,11 +173,15 @@ impl DeviceList {
         !self.entries.is_empty()
             && self.entries.len() <= MAX_DEVICES
             && entries_valid
-            && key.verify_strict(&self.signed_bytes(), &self.signature).is_ok()
+            && key
+                .verify_strict(&self.signed_bytes(), &self.signature)
+                .is_ok()
     }
 
     pub fn entry(&self, device_id: &EndpointId) -> Option<&DeviceEntry> {
-        self.entries.iter().find(|entry| &entry.device_id() == device_id)
+        self.entries
+            .iter()
+            .find(|entry| &entry.device_id() == device_id)
     }
 }
 
@@ -290,7 +300,8 @@ pub(crate) mod tests {
         let foreign = mallory.sign_device_list(1, vec![entry(&alice, device)]);
         assert!(!foreign.verify());
 
-        let duplicate = alice.sign_device_list(1, vec![entry(&alice, device), entry(&alice, device)]);
+        let duplicate =
+            alice.sign_device_list(1, vec![entry(&alice, device), entry(&alice, device)]);
         assert!(!duplicate.verify());
     }
 

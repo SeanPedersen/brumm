@@ -34,34 +34,53 @@ impl Node {
         let outcomes = self.outcomes_tx.clone();
         tokio::spawn(async move {
             let reply = transport.request(invite.device_addr.clone(), &frame).await;
-            let _ = outcomes.send(Outcome::Hello { invite: Box::new(invite), reply });
+            let _ = outcomes.send(Outcome::Hello {
+                invite: Box::new(invite),
+                reply,
+            });
         });
         Ok(())
     }
 
     pub(super) fn finish_hello(&mut self, invite: Invite, reply: Result<Reply>) -> Result<()> {
         let device = invite.device_addr.id;
-        let mut session = self.pending_hellos.remove(&device).context("no pending invite for this device")?;
+        let mut session = self
+            .pending_hellos
+            .remove(&device)
+            .context("no pending invite for this device")?;
         let sealed = match reply.context("could not reach the inviter — are they online?")? {
             Reply::HelloAck { sealed } => sealed,
-            Reply::Rejected(RejectReason::UnknownInvite) => bail!("invite was already used or has expired"),
+            Reply::Rejected(RejectReason::UnknownInvite) => {
+                bail!("invite was already used or has expired")
+            }
             other => bail!("inviter refused the connection: {other:?}"),
         };
         let profile: Profile = wire::decode(&crypto::open(&mut session, &sealed)?)?;
         let matches_invite = profile.user_key() == invite.user_key()
             && profile.is_valid_for(device)
-            && profile.devices.entry(&device).is_some_and(|entry| entry.cert == invite.device_cert);
+            && profile
+                .devices
+                .entry(&device)
+                .is_some_and(|entry| entry.cert == invite.device_cert);
         if !matches_invite {
             bail!("inviter answered with a different identity");
         }
         self.add_contact(&profile)?;
         let Self { store, me, .. } = self;
-        me.as_mut().context("no identity")?.crypto.adopt(store, device, session)?;
+        me.as_mut()
+            .context("no identity")?
+            .crypto
+            .adopt(store, device, session)?;
         self.send_own_avatar_to(&profile.user_key())?;
         self.flush_outbox()
     }
 
-    pub(super) fn accept_hello(&mut self, from: EndpointId, invite_secret: InviteSecret, sealed: &Sealed) -> Result<Reply> {
+    pub(super) fn accept_hello(
+        &mut self,
+        from: EndpointId,
+        invite_secret: InviteSecret,
+        sealed: &Sealed,
+    ) -> Result<Reply> {
         self.active_me()?;
         if sealed.pre_key_sender().is_none() {
             return Ok(Reply::Rejected(RejectReason::InvalidProfile));
@@ -91,18 +110,33 @@ impl Node {
     /// A new contact has no photo of ours yet.
     fn send_own_avatar_to(&mut self, contact: &UserKey) -> Result<()> {
         let me = self.me()?.user_key();
-        let Some((_, image)) = self.store.avatars()?.into_iter().find(|(user, _)| *user == me) else {
+        let Some((_, image)) = self
+            .store
+            .avatars()?
+            .into_iter()
+            .find(|(user, _)| *user == me)
+        else {
             return Ok(());
         };
-        self.enqueue_to_user(contact, rand::random(), Payload::Avatar(Avatar { subject: me, image }), None)
+        self.enqueue_to_user(
+            contact,
+            rand::random(),
+            Payload::Avatar(Avatar { subject: me, image }),
+            None,
+        )
     }
 
     /// Stores a verified contact, tells the UI and syncs it to our other devices.
     pub(super) fn add_contact(&mut self, profile: &Profile) -> Result<()> {
         let added_at_ms = now_ms();
-        let (contact, removed) = self.store.upsert_contact(profile, Trust::Verified, added_at_ms)?;
+        let (contact, removed) =
+            self.store
+                .upsert_contact(profile, Trust::Verified, added_at_ms)?;
         self.forget_devices(&removed)?;
         self.events.emit(Event::ContactAdded(contact));
-        self.enqueue_to_own_devices(Payload::ContactSync(ContactRecord { profile: profile.clone(), added_at_ms }))
+        self.enqueue_to_own_devices(Payload::ContactSync(ContactRecord {
+            profile: profile.clone(),
+            added_at_ms,
+        }))
     }
 }

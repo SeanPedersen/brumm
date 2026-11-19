@@ -5,7 +5,9 @@ use crate::{state::AppState, ui::theme};
 const WORDS_PER_ROW: usize = 4;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
-    let Some(phrase) = &state.seed_phrase_to_show else { return };
+    let Some(phrase) = &state.seed_phrase_to_show else {
+        return;
+    };
     let mut acknowledged = false;
     egui::Modal::new(egui::Id::unique("seed_phrase")).show(ui.ctx(), |ui| {
         ui.heading("Write down your seed phrase");

@@ -1,7 +1,10 @@
 //! Emoji picker popup and cursor-aware insertion into the composer.
 //! egui renders emoji monochrome (bundled Noto Emoji), so only widely supported ones are listed.
 
-use egui::{Id, Popup, PopupCloseBehavior, Response, RichText, text::{CCursor, CCursorRange}};
+use egui::{
+    Id, Popup, PopupCloseBehavior, Response, RichText,
+    text::{CCursor, CCursorRange},
+};
 
 const POPUP_WIDTH: f32 = 320.0;
 const POPUP_HEIGHT: f32 = 260.0;
@@ -9,11 +12,23 @@ const EMOJI_SIZE: f32 = 22.0;
 const EMOJI_CELL: f32 = 34.0;
 
 const CATEGORIES: [(&str, &str); 5] = [
-    ("Smileys", "😀 😃 😄 😁 😆 😅 😂 😊 😇 🙂 😉 😍 😘 😋 😛 😜 😎 🤓 😏 😒 😞 😔 😟 😕 😢 😭 😤 😠 😡 😱 😨 😰 😳 😴 😷"),
+    (
+        "Smileys",
+        "😀 😃 😄 😁 😆 😅 😂 😊 😇 🙂 😉 😍 😘 😋 😛 😜 😎 🤓 😏 😒 😞 😔 😟 😕 😢 😭 😤 😠 😡 😱 😨 😰 😳 😴 😷",
+    ),
     ("Gestures", "👍 👎 👌 ✌ 👊 ✊ 👋 👏 🙌 🙏 💪 👀 👂 👃 👄 👅"),
-    ("Hearts", "❤ 💔 💕 💖 💗 💙 💚 💛 💜 💘 💝 ✨ ⭐ 🔥 💯 ✅ ❌ ⚡"),
-    ("Nature & food", "🌞 🌙 ⭐ ☁ ☔ ❄ 🌸 🌹 🌲 🐶 🐱 🐭 🐸 🐵 🐔 🐧 🍎 🍌 🍕 🍔 🍺 ☕ 🎂"),
-    ("Objects", "🎉 🎁 🎈 🎵 🎶 📷 📞 💻 📱 📚 ✉ 🔒 🔑 💡 🚀 ✈ 🚗 🏠 ⚽ 🏆"),
+    (
+        "Hearts",
+        "❤ 💔 💕 💖 💗 💙 💚 💛 💜 💘 💝 ✨ ⭐ 🔥 💯 ✅ ❌ ⚡",
+    ),
+    (
+        "Nature & food",
+        "🌞 🌙 ⭐ ☁ ☔ ❄ 🌸 🌹 🌲 🐶 🐱 🐭 🐸 🐵 🐔 🐧 🍎 🍌 🍕 🍔 🍺 ☕ 🎂",
+    ),
+    (
+        "Objects",
+        "🎉 🎁 🎈 🎵 🎶 📷 📞 💻 📱 📚 ✉ 🔒 🔑 💡 🚀 ✈ 🚗 🏠 ⚽ 🏆",
+    ),
 ];
 
 /// Shows the popup anchored to `button`; returns an emoji if one was clicked.
@@ -31,24 +46,30 @@ pub fn picker(button: &Response) -> Option<&'static str> {
 /// Scrollable emoji grid grouped by category; returns the clicked emoji.
 pub fn grid(ui: &mut egui::Ui) -> Option<&'static str> {
     let mut chosen = None;
-    egui::ScrollArea::vertical().max_height(POPUP_HEIGHT).show(ui, |ui| {
-        ui.set_min_width(POPUP_WIDTH);
-        for (title, emojis) in CATEGORIES {
-            ui.label(RichText::new(title).small().color(crate::ui::theme::MUTED_TEXT));
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                for emoji in emojis.split(' ') {
-                    let cell = egui::Button::new(RichText::new(emoji).size(EMOJI_SIZE))
-                        .frame(false)
-                        .min_size(egui::vec2(EMOJI_CELL, EMOJI_CELL));
-                    if ui.add(cell).clicked() {
-                        chosen = Some(emoji);
+    egui::ScrollArea::vertical()
+        .max_height(POPUP_HEIGHT)
+        .show(ui, |ui| {
+            ui.set_min_width(POPUP_WIDTH);
+            for (title, emojis) in CATEGORIES {
+                ui.label(
+                    RichText::new(title)
+                        .small()
+                        .color(crate::ui::theme::MUTED_TEXT),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                    for emoji in emojis.split(' ') {
+                        let cell = egui::Button::new(RichText::new(emoji).size(EMOJI_SIZE))
+                            .frame(false)
+                            .min_size(egui::vec2(EMOJI_CELL, EMOJI_CELL));
+                        if ui.add(cell).clicked() {
+                            chosen = Some(emoji);
+                        }
                     }
-                }
-            });
-            ui.add_space(6.0);
-        }
-    });
+                });
+                ui.add_space(6.0);
+            }
+        });
     chosen
 }
 
@@ -61,7 +82,12 @@ pub fn insert_at_cursor(ctx: &egui::Context, edit_id: Id, draft: &mut String, te
         let (a, b) = (range.primary.index.0, range.secondary.index.0);
         (a.min(b).min(char_count), a.max(b).min(char_count))
     });
-    let byte_of = |char_index: usize| draft.char_indices().nth(char_index).map_or(draft.len(), |(byte, _)| byte);
+    let byte_of = |char_index: usize| {
+        draft
+            .char_indices()
+            .nth(char_index)
+            .map_or(draft.len(), |(byte, _)| byte)
+    };
     draft.replace_range(byte_of(start)..byte_of(end), text);
     let caret = CCursor::new(start + text.chars().count());
     state.cursor.set_char_range(Some(CCursorRange::one(caret)));

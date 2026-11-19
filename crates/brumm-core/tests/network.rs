@@ -16,11 +16,18 @@ async fn invite_via_relay_only() {
     bob.create_identity("Bob").await;
 
     let mut invite = Invite::from_link(&alice.create_invite().await).unwrap();
-    let relay = invite.device_addr.relay_urls().next().cloned().expect("alice has a home relay");
+    let relay = invite
+        .device_addr
+        .relay_urls()
+        .next()
+        .cloned()
+        .expect("alice has a home relay");
     println!("alice home relay: {relay}");
     invite.device_addr.addrs.retain(|addr| addr.is_relay());
 
-    bob.send(Command::AcceptInvite { link: invite.to_link() });
+    bob.send(Command::AcceptInvite {
+        link: invite.to_link(),
+    });
     bob.contact_added().await;
     alice.contact_added().await;
 
@@ -96,7 +103,9 @@ async fn offline_delivery_via_public_nostr_relays() {
 
     let bob_offline = bob.stop().await;
     let sent = alice.send_text(bob_key, "stored on public relays").await;
-    alice.status(sent, brumm_core::api::DeliveryStatus::Sent).await;
+    alice
+        .status(sent, brumm_core::api::DeliveryStatus::Sent)
+        .await;
     let _alice_offline = alice.stop().await;
 
     let mut bob = bob_offline.start();

@@ -20,7 +20,11 @@ pub struct BrummApp {
 }
 
 impl BrummApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, window_size: WindowSize) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        data_dir: PathBuf,
+        window_size: WindowSize,
+    ) -> Self {
         ui::theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         Self {

@@ -21,11 +21,20 @@ use crate::{
 impl Node {
     /// Queues `payload` for every device of `user` (a contact).
     /// Our own user (the Notes chat) is skipped: own devices are served by `enqueue_to_own_devices`.
-    pub(super) fn enqueue_to_user(&mut self, user: &UserKey, envelope_id: EnvelopeId, payload: Payload, chat_contact: Option<&UserKey>) -> Result<()> {
+    pub(super) fn enqueue_to_user(
+        &mut self,
+        user: &UserKey,
+        envelope_id: EnvelopeId,
+        payload: Payload,
+        chat_contact: Option<&UserKey>,
+    ) -> Result<()> {
         if *user == self.me()?.user_key() {
             return Ok(());
         }
-        let envelope = Envelope { id: envelope_id, payload };
+        let envelope = Envelope {
+            id: envelope_id,
+            payload,
+        };
         for entry in self.store.devices_of(user)? {
             self.enqueue_sealed(&entry, &envelope, chat_contact, false)?;
         }
@@ -43,32 +52,67 @@ impl Node {
             .filter(|entry| entry.device_id() != me.device_id)
             .cloned()
             .collect();
-        let envelope = Envelope { id: rand::random(), payload };
+        let envelope = Envelope {
+            id: rand::random(),
+            payload,
+        };
         for entry in &others {
             self.enqueue_sealed(entry, &envelope, None, false)?;
         }
         Ok(())
     }
 
-    pub(super) fn enqueue_to_device(&mut self, entry: &DeviceEntry, payload: Payload) -> Result<()> {
-        self.enqueue_sealed(entry, &Envelope { id: rand::random(), payload }, None, false)
+    pub(super) fn enqueue_to_device(
+        &mut self,
+        entry: &DeviceEntry,
+        payload: Payload,
+    ) -> Result<()> {
+        self.enqueue_sealed(
+            entry,
+            &Envelope {
+                id: rand::random(),
+                payload,
+            },
+            None,
+            false,
+        )
     }
 
     /// Acknowledges envelopes that reached us through the mailbox.
-    pub(super) fn enqueue_receipt(&mut self, device: &EndpointId, envelope_ids: Vec<EnvelopeId>) -> Result<()> {
+    pub(super) fn enqueue_receipt(
+        &mut self,
+        device: &EndpointId,
+        envelope_ids: Vec<EnvelopeId>,
+    ) -> Result<()> {
         let Some(entry) = self.store.device_entry(device)? else {
             return Ok(());
         };
-        let envelope = Envelope { id: rand::random(), payload: Payload::Receipt(envelope_ids) };
+        let envelope = Envelope {
+            id: rand::random(),
+            payload: Payload::Receipt(envelope_ids),
+        };
         self.enqueue_sealed(&entry, &envelope, None, true)?;
         self.flush_outbox()
     }
 
-    fn enqueue_sealed(&mut self, entry: &DeviceEntry, envelope: &Envelope, chat_contact: Option<&UserKey>, is_receipt: bool) -> Result<()> {
+    fn enqueue_sealed(
+        &mut self,
+        entry: &DeviceEntry,
+        envelope: &Envelope,
+        chat_contact: Option<&UserKey>,
+        is_receipt: bool,
+    ) -> Result<()> {
         let Self { store, me, .. } = self;
         let me = me.as_mut().context("no identity")?;
         let sealed = me.crypto.seal(store, entry, &wire::encode(envelope))?;
-        store.enqueue(&entry.device_id(), &envelope.id, &sealed, chat_contact, is_receipt, now_ms())
+        store.enqueue(
+            &entry.device_id(),
+            &envelope.id,
+            &sealed,
+            chat_contact,
+            is_receipt,
+            now_ms(),
+        )
     }
 
     /// Sends every queued envelope that is not already in flight.
@@ -85,17 +129,30 @@ impl Node {
             let transport = transport.clone();
             let outcomes = self.outcomes_tx.clone();
             tokio::spawn(async move {
-                let reply = transport.request(item.device, &Frame::Sealed(item.sealed)).await;
-                let _ = outcomes.send(Outcome::Delivery { device: item.device, envelope_id: item.envelope_id, reply });
+                let reply = transport
+                    .request(item.device, &Frame::Sealed(item.sealed))
+                    .await;
+                let _ = outcomes.send(Outcome::Delivery {
+                    device: item.device,
+                    envelope_id: item.envelope_id,
+                    reply,
+                });
             });
         }
         Ok(())
     }
 
-    pub(super) fn finish_delivery(&mut self, device: EndpointId, envelope_id: EnvelopeId, reply: Result<Reply>) -> Result<()> {
+    pub(super) fn finish_delivery(
+        &mut self,
+        device: EndpointId,
+        envelope_id: EnvelopeId,
+        reply: Result<Reply>,
+    ) -> Result<()> {
         self.in_flight.remove(&(device, envelope_id));
         match reply {
-            Ok(Reply::Ack { id }) if id == envelope_id => self.acknowledge(&device, &envelope_id, DeliveryStatus::Delivered),
+            Ok(Reply::Ack { id }) if id == envelope_id => {
+                self.acknowledge(&device, &envelope_id, DeliveryStatus::Delivered)
+            }
             Ok(Reply::Rejected(RejectReason::InvalidMessage)) => {
                 tracing::warn!(%device, "envelope rejected as invalid");
                 self.acknowledge(&device, &envelope_id, DeliveryStatus::Failed)
@@ -113,12 +170,22 @@ impl Node {
 
     /// Posts a queued envelope once to the device's mailbox (no-op without mailbox / if done).
     fn post_to_mailbox(&mut self, device: EndpointId, envelope_id: EnvelopeId) -> Result<()> {
-        let Some(me) = self.me.as_ref() else { return Ok(()) };
-        let Some(mailbox) = me.mailbox.clone() else { return Ok(()) };
-        let Some(item) = self.store.outbox_item(&device, &envelope_id)?.filter(|item| !item.mailboxed) else {
+        let Some(me) = self.me.as_ref() else {
             return Ok(());
         };
-        let Some(entry) = self.store.device_entry(&device)? else { return Ok(()) };
+        let Some(mailbox) = me.mailbox.clone() else {
+            return Ok(());
+        };
+        let Some(item) = self
+            .store
+            .outbox_item(&device, &envelope_id)?
+            .filter(|item| !item.mailboxed)
+        else {
+            return Ok(());
+        };
+        let Some(entry) = self.store.device_entry(&device)? else {
+            return Ok(());
+        };
         if !self.mailboxing.insert((device, envelope_id)) {
             return Ok(());
         }
@@ -126,12 +193,21 @@ impl Node {
         let outcomes = self.outcomes_tx.clone();
         tokio::spawn(async move {
             let result = mailbox.post(&entry.mailbox, from, item.sealed).await;
-            let _ = outcomes.send(Outcome::Mailboxed { device, envelope_id, result });
+            let _ = outcomes.send(Outcome::Mailboxed {
+                device,
+                envelope_id,
+                result,
+            });
         });
         Ok(())
     }
 
-    pub(super) fn finish_mailboxing(&mut self, device: EndpointId, envelope_id: EnvelopeId, result: Result<()>) -> Result<()> {
+    pub(super) fn finish_mailboxing(
+        &mut self,
+        device: EndpointId,
+        envelope_id: EnvelopeId,
+        result: Result<()>,
+    ) -> Result<()> {
         self.mailboxing.remove(&(device, envelope_id));
         if let Err(err) = result {
             tracing::info!(%device, ?err, "mailbox post failed, will retry when next unreachable");
@@ -149,14 +225,24 @@ impl Node {
             return Ok(());
         };
         if self.store.message_status(&contact, &envelope_id)? == Some(DeliveryStatus::Pending) {
-            self.store.set_status(&contact, &envelope_id, DeliveryStatus::Sent)?;
-            self.events.emit(Event::MessageStatusChanged { contact, id: envelope_id, status: DeliveryStatus::Sent });
+            self.store
+                .set_status(&contact, &envelope_id, DeliveryStatus::Sent)?;
+            self.events.emit(Event::MessageStatusChanged {
+                contact,
+                id: envelope_id,
+                status: DeliveryStatus::Sent,
+            });
         }
         Ok(())
     }
 
     /// The device processed the envelope (direct ack or mailbox receipt).
-    pub(super) fn acknowledge(&mut self, device: &EndpointId, envelope_id: &EnvelopeId, status: DeliveryStatus) -> Result<()> {
+    pub(super) fn acknowledge(
+        &mut self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+        status: DeliveryStatus,
+    ) -> Result<()> {
         let (device, envelope_id) = (*device, *envelope_id);
         let Some(Some(contact)) = self.store.dequeue(&device, &envelope_id)? else {
             return Ok(());
@@ -166,7 +252,11 @@ impl Node {
             return Ok(());
         }
         self.store.set_status(&contact, &envelope_id, status)?;
-        self.events.emit(Event::MessageStatusChanged { contact, id: envelope_id, status });
+        self.events.emit(Event::MessageStatusChanged {
+            contact,
+            id: envelope_id,
+            status,
+        });
         Ok(())
     }
 

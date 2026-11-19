@@ -8,7 +8,12 @@ pub fn show(ui: &mut egui::Ui) {
             ui.add_space(ui.available_height() * 0.3);
             ui.heading(egui::RichText::new("This device was removed").color(theme::DANGER));
             ui.label("It no longer sends or receives messages for your account.");
-            ui.label(egui::RichText::new("To use brumm here again, delete this profile's data folder and link it anew.").color(theme::MUTED_TEXT));
+            ui.label(
+                egui::RichText::new(
+                    "To use brumm here again, delete this profile's data folder and link it anew.",
+                )
+                .color(theme::MUTED_TEXT),
+            );
         });
     });
 }

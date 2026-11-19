@@ -50,7 +50,8 @@ impl LinkTicket {
         if ticket.version != LINK_VERSION {
             return Err(LinkError::UnsupportedVersion);
         }
-        let label_ok = !ticket.label.trim().is_empty() && ticket.label.chars().count() <= MAX_DEVICE_LABEL_CHARS;
+        let label_ok = !ticket.label.trim().is_empty()
+            && ticket.label.chars().count() <= MAX_DEVICE_LABEL_CHARS;
         if !label_ok {
             return Err(LinkError::InvalidLabel);
         }
@@ -60,8 +61,25 @@ impl LinkTicket {
         Ok(ticket)
     }
 
-    pub fn new(device_addr: EndpointAddr, link_secret: LinkSecret, olm_identity_key: OlmIdentityKey, one_time_key: OneTimeKey, fallback_key: OneTimeKey, mailbox: MailboxAddress, label: String) -> Self {
-        Self { version: LINK_VERSION, device_addr, link_secret, olm_identity_key, one_time_key, fallback_key, mailbox, label }
+    pub fn new(
+        device_addr: EndpointAddr,
+        link_secret: LinkSecret,
+        olm_identity_key: OlmIdentityKey,
+        one_time_key: OneTimeKey,
+        fallback_key: OneTimeKey,
+        mailbox: MailboxAddress,
+        label: String,
+    ) -> Self {
+        Self {
+            version: LINK_VERSION,
+            device_addr,
+            link_secret,
+            olm_identity_key,
+            one_time_key,
+            fallback_key,
+            mailbox,
+            label,
+        }
     }
 }
 
@@ -81,7 +99,15 @@ mod tests {
     fn ticket_roundtrip() {
         let device = iroh::SecretKey::generate().public();
         let mailbox = crate::mailbox::address(&[5; 32], crate::mailbox::default_relays());
-        let ticket = LinkTicket::new(EndpointAddr::from(device), [1; 16], [2; 32], [3; 32], [4; 32], mailbox, "Linux".into());
+        let ticket = LinkTicket::new(
+            EndpointAddr::from(device),
+            [1; 16],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            mailbox,
+            "Linux".into(),
+        );
         assert_eq!(LinkTicket::from_link(&ticket.to_link()).unwrap(), ticket);
         assert!(LinkTicket::from_link("brumm://invite/abc").is_err());
     }

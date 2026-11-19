@@ -51,7 +51,10 @@ impl Sealed {
     }
 
     fn to_olm(&self) -> Result<OlmMessage, CryptoError> {
-        Ok(OlmMessage::from_parts(self.message_type.into(), &self.ciphertext)?)
+        Ok(OlmMessage::from_parts(
+            self.message_type.into(),
+            &self.ciphertext,
+        )?)
     }
 
     /// Identity key of the sender, if this message can start a new session.
@@ -75,12 +78,16 @@ pub struct OlmDevice {
 
 impl OlmDevice {
     pub fn generate() -> Self {
-        Self { account: Account::new() }
+        Self {
+            account: Account::new(),
+        }
     }
 
     pub fn from_pickle(pickle: &str, key: &PickleKey) -> Result<Self, CryptoError> {
         let pickle = AccountPickle::from_encrypted(pickle, key)?;
-        Ok(Self { account: Account::from_pickle(pickle) })
+        Ok(Self {
+            account: Account::from_pickle(pickle),
+        })
     }
 
     pub fn pickle(&self, key: &PickleKey) -> String {
@@ -107,7 +114,9 @@ impl OlmDevice {
 
     /// Generates a one-time key to hand out (e.g. in an invite). Persist the account afterwards.
     pub fn new_one_time_key(&mut self) -> OneTimeKey {
-        let generated = self.account.generate_one_time_keys(ONE_TIME_KEYS_PER_INVITE);
+        let generated = self
+            .account
+            .generate_one_time_keys(ONE_TIME_KEYS_PER_INVITE);
         self.account.mark_keys_as_published();
         generated
             .created
@@ -116,7 +125,11 @@ impl OlmDevice {
             .to_bytes()
     }
 
-    pub fn outbound_session(&self, their_identity: &OlmIdentityKey, their_one_time_key: &OneTimeKey) -> Result<Session, CryptoError> {
+    pub fn outbound_session(
+        &self,
+        their_identity: &OlmIdentityKey,
+        their_one_time_key: &OneTimeKey,
+    ) -> Result<Session, CryptoError> {
         Ok(self.account.create_outbound_session(
             SessionConfig::version_1(),
             Curve25519PublicKey::from_bytes(*their_identity),
@@ -126,7 +139,11 @@ impl OlmDevice {
 
     /// Creates the receiving side of a session from a pre-key message and returns its plaintext.
     /// Consumes the referenced one-time key: persist the account afterwards.
-    pub fn inbound_session(&mut self, their_identity: &OlmIdentityKey, sealed: &Sealed) -> Result<(Session, Vec<u8>), CryptoError> {
+    pub fn inbound_session(
+        &mut self,
+        their_identity: &OlmIdentityKey,
+        sealed: &Sealed,
+    ) -> Result<(Session, Vec<u8>), CryptoError> {
         let OlmMessage::PreKey(message) = sealed.to_olm()? else {
             return Err(CryptoError::NotPreKey);
         };
@@ -156,7 +173,9 @@ pub fn pickle_session(session: &Session, key: &PickleKey) -> String {
 }
 
 pub fn unpickle_session(pickle: &str, key: &PickleKey) -> Result<Session, CryptoError> {
-    Ok(Session::from_pickle(SessionPickle::from_encrypted(pickle, key)?))
+    Ok(Session::from_pickle(SessionPickle::from_encrypted(
+        pickle, key,
+    )?))
 }
 
 #[cfg(test)]
@@ -169,12 +188,15 @@ mod tests {
         let bob = OlmDevice::generate();
         let one_time_key = alice.new_one_time_key();
 
-        let mut bob_session = bob.outbound_session(&alice.identity_key(), &one_time_key).unwrap();
+        let mut bob_session = bob
+            .outbound_session(&alice.identity_key(), &one_time_key)
+            .unwrap();
         let hello = seal(&mut bob_session, b"hello").unwrap();
         assert_eq!(hello.pre_key_sender(), Some(bob.identity_key()));
         assert!(!hello.ciphertext.windows(5).any(|window| window == b"hello"));
 
-        let (mut alice_session, plaintext) = alice.inbound_session(&bob.identity_key(), &hello).unwrap();
+        let (mut alice_session, plaintext) =
+            alice.inbound_session(&bob.identity_key(), &hello).unwrap();
         assert_eq!(plaintext, b"hello");
 
         let reply = seal(&mut alice_session, b"hi bob").unwrap();
@@ -191,8 +213,20 @@ mod tests {
         let mut alice = OlmDevice::generate();
         let bob = OlmDevice::generate();
         let one_time_key = alice.new_one_time_key();
-        let hello = seal(&mut bob.outbound_session(&alice.identity_key(), &one_time_key).unwrap(), b"1").unwrap();
-        let replay = seal(&mut bob.outbound_session(&alice.identity_key(), &one_time_key).unwrap(), b"2").unwrap();
+        let hello = seal(
+            &mut bob
+                .outbound_session(&alice.identity_key(), &one_time_key)
+                .unwrap(),
+            b"1",
+        )
+        .unwrap();
+        let replay = seal(
+            &mut bob
+                .outbound_session(&alice.identity_key(), &one_time_key)
+                .unwrap(),
+            b"2",
+        )
+        .unwrap();
         alice.inbound_session(&bob.identity_key(), &hello).unwrap();
         assert!(alice.inbound_session(&bob.identity_key(), &replay).is_err());
     }
@@ -203,7 +237,13 @@ mod tests {
         let fallback = alice.rotate_fallback_key();
         for _ in 0..2 {
             let bob = OlmDevice::generate();
-            let hello = seal(&mut bob.outbound_session(&alice.identity_key(), &fallback).unwrap(), b"hey").unwrap();
+            let hello = seal(
+                &mut bob
+                    .outbound_session(&alice.identity_key(), &fallback)
+                    .unwrap(),
+                b"hey",
+            )
+            .unwrap();
             let (_, plaintext) = alice.inbound_session(&bob.identity_key(), &hello).unwrap();
             assert_eq!(plaintext, b"hey");
         }
@@ -215,7 +255,9 @@ mod tests {
         let mut alice = OlmDevice::generate();
         let bob = OlmDevice::generate();
         let one_time_key = alice.new_one_time_key();
-        let session = bob.outbound_session(&alice.identity_key(), &one_time_key).unwrap();
+        let session = bob
+            .outbound_session(&alice.identity_key(), &one_time_key)
+            .unwrap();
 
         let restored = OlmDevice::from_pickle(&alice.pickle(&key), &key).unwrap();
         assert_eq!(restored.identity_key(), alice.identity_key());

@@ -17,7 +17,12 @@ pub struct AddContactView {
     qr: QrCache,
 }
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut AddContactView, commands: &mut Vec<Command>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    view: &mut AddContactView,
+    commands: &mut Vec<Command>,
+) {
     if !view.open {
         return;
     }
@@ -35,9 +40,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut AddContactView, 
     view.open = open;
 }
 
-fn share_section(ui: &mut egui::Ui, state: &AppState, view: &mut AddContactView, commands: &mut Vec<Command>) {
+fn share_section(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    view: &mut AddContactView,
+    commands: &mut Vec<Command>,
+) {
     ui.strong("Share your invite");
-    ui.label(egui::RichText::new("Each invite works once and expires after 7 days.").small().color(theme::MUTED_TEXT));
+    ui.label(
+        egui::RichText::new("Each invite works once and expires after 7 days.")
+            .small()
+            .color(theme::MUTED_TEXT),
+    );
     let Some(link) = &state.invite_link else {
         if ui.add(theme::primary_button("Create invite")).clicked() {
             commands.push(Command::CreateInvite);
@@ -46,7 +60,9 @@ fn share_section(ui: &mut egui::Ui, state: &AppState, view: &mut AddContactView,
     };
     ui.vertical_centered(|ui| {
         if let Some(texture) = view.qr.texture(ui.ctx(), link) {
-            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(egui::vec2(QR_SIZE, QR_SIZE)));
+            ui.add(
+                egui::Image::from_texture(texture).fit_to_exact_size(egui::vec2(QR_SIZE, QR_SIZE)),
+            );
         }
     });
     // Selectable fallback for compositors where programmatic clipboard access fails.
@@ -61,7 +77,12 @@ fn share_section(ui: &mut egui::Ui, state: &AppState, view: &mut AddContactView,
     });
 }
 
-fn paste_section(ui: &mut egui::Ui, state: &mut AppState, view: &mut AddContactView, commands: &mut Vec<Command>) {
+fn paste_section(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    view: &mut AddContactView,
+    commands: &mut Vec<Command>,
+) {
     ui.strong("Got an invite from a friend?");
     ui.add(
         egui::TextEdit::singleline(&mut view.pasted_link)
@@ -70,9 +91,14 @@ fn paste_section(ui: &mut egui::Ui, state: &mut AppState, view: &mut AddContactV
     );
     ui.horizontal(|ui| {
         let can_connect = !view.pasted_link.trim().is_empty() && !state.connecting;
-        if ui.add_enabled(can_connect, theme::primary_button("Connect")).clicked() {
+        if ui
+            .add_enabled(can_connect, theme::primary_button("Connect"))
+            .clicked()
+        {
             state.connecting = true;
-            commands.push(Command::AcceptInvite { link: std::mem::take(&mut view.pasted_link) });
+            commands.push(Command::AcceptInvite {
+                link: std::mem::take(&mut view.pasted_link),
+            });
         }
         if state.connecting {
             ui.spinner();

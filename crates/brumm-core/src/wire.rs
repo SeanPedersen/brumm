@@ -33,9 +33,15 @@ pub type LinkSecret = [u8; 16];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Frame {
     /// Pre-key message opening a contact session; plaintext is the sender's [`Profile`].
-    Hello { invite_secret: InviteSecret, sealed: Sealed },
+    Hello {
+        invite_secret: InviteSecret,
+        sealed: Sealed,
+    },
     /// Pre-key message to a device being linked; plaintext is a [`crate::link::LinkBundle`].
-    Link { link_secret: LinkSecret, sealed: Sealed },
+    Link {
+        link_secret: LinkSecret,
+        sealed: Sealed,
+    },
     /// Plaintext is an [`Envelope`].
     Sealed(Sealed),
 }
@@ -43,9 +49,13 @@ pub enum Frame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Reply {
     /// Plaintext is the responder's [`Profile`].
-    HelloAck { sealed: Sealed },
+    HelloAck {
+        sealed: Sealed,
+    },
     /// Acknowledges an envelope (or a link, with the link secret as id).
-    Ack { id: EnvelopeId },
+    Ack {
+        id: EnvelopeId,
+    },
     Rejected(RejectReason),
 }
 
@@ -69,7 +79,10 @@ pub enum Payload {
     /// A message from the sender's user to the recipient's user.
     Chat(ChatMessage),
     /// Own-device sync: "I sent `message` to `contact`".
-    SentTranscript { contact: UserKey, message: ChatMessage },
+    SentTranscript {
+        contact: UserKey,
+        message: ChatMessage,
+    },
     /// The sender's user published a new device list.
     DeviceList(DeviceList),
     /// Own-device sync: a contact was added or updated.
@@ -81,14 +94,20 @@ pub enum Payload {
     /// The sender's user deleted these messages they had sent ("delete for everyone").
     Delete(Vec<MessageId>),
     /// Own-device sync: remove these messages from the conversation with `contact`.
-    DeleteSync { contact: UserKey, ids: Vec<MessageId> },
+    DeleteSync {
+        contact: UserKey,
+        ids: Vec<MessageId>,
+    },
     /// A profile photo. From a contact it must describe the contact itself; own devices also
     /// use it to sync contacts' photos to a freshly linked device.
     Avatar(Avatar),
     /// The sender's user reacts to one of the messages in this conversation.
     Reaction(Reaction),
     /// Own-device sync: "I reacted in the conversation with `contact`".
-    ReactionSync { contact: UserKey, reaction: Reaction },
+    ReactionSync {
+        contact: UserKey,
+        reaction: Reaction,
+    },
 }
 
 /// One user's reaction to a message; at most one per user and message (last write wins).
@@ -102,7 +121,11 @@ pub struct Reaction {
 
 impl Reaction {
     pub fn is_valid(&self) -> bool {
-        self.emoji.len() <= MAX_REACTION_BYTES && !self.emoji.chars().any(|c| c.is_control() || c.is_whitespace())
+        self.emoji.len() <= MAX_REACTION_BYTES
+            && !self
+                .emoji
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
     }
 }
 
@@ -169,7 +192,10 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
 
 /// `<prefix><lowercase base32(postcard(value))>`, used for invite and link URIs / QR codes.
 pub fn to_uri<T: Serialize>(prefix: &str, value: &T) -> String {
-    format!("{prefix}{}", BASE32_NOPAD.encode(&encode(value)).to_ascii_lowercase())
+    format!(
+        "{prefix}{}",
+        BASE32_NOPAD.encode(&encode(value)).to_ascii_lowercase()
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -181,7 +207,10 @@ pub enum UriError {
 }
 
 pub fn from_uri<T: DeserializeOwned>(prefix: &str, uri: &str) -> Result<T, UriError> {
-    let payload = uri.trim().strip_prefix(prefix).ok_or(UriError::WrongPrefix)?;
+    let payload = uri
+        .trim()
+        .strip_prefix(prefix)
+        .ok_or(UriError::WrongPrefix)?;
     let bytes = BASE32_NOPAD
         .decode(payload.to_ascii_uppercase().as_bytes())
         .map_err(|_| UriError::Malformed)?;
@@ -217,11 +246,19 @@ mod tests {
         let item = |index: u8| HistoryItem {
             contact: [index; 32],
             outgoing: true,
-            message: ChatMessage { id: [index; 16], sent_at_ms: 1, body: Body::Text("x".repeat(10_000)) },
+            message: ChatMessage {
+                id: [index; 16],
+                sent_at_ms: 1,
+                body: Body::Text("x".repeat(10_000)),
+            },
         };
         let chunks = chunk_history((0..10).map(item).collect());
         assert!(chunks.len() > 1);
         assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 10);
-        assert!(chunks.iter().all(|chunk| encode(chunk).len() <= HISTORY_CHUNK_BYTES + 16));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| encode(chunk).len() <= HISTORY_CHUNK_BYTES + 16)
+        );
     }
 }

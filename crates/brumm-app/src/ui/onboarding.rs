@@ -33,13 +33,26 @@ impl OnboardingView {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, view: &mut OnboardingView, link_ticket: Option<&str>, commands: &mut Vec<Command>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    view: &mut OnboardingView,
+    link_ticket: Option<&str>,
+    commands: &mut Vec<Command>,
+) {
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading(egui::RichText::new("brumm").size(48.0).strong().color(theme::ACCENT_LIGHT));
-                ui.label(egui::RichText::new("no phone number · no servers · just you").color(theme::MUTED_TEXT));
+                ui.heading(
+                    egui::RichText::new("brumm")
+                        .size(48.0)
+                        .strong()
+                        .color(theme::ACCENT_LIGHT),
+                );
+                ui.label(
+                    egui::RichText::new("no phone number · no servers · just you")
+                        .color(theme::MUTED_TEXT),
+                );
                 ui.add_space(24.0);
                 ui.allocate_ui(egui::vec2(FORM_WIDTH, 0.0), |ui| {
                     mode_tabs(ui, view);
@@ -65,7 +78,11 @@ fn mode_tabs(ui: &mut egui::Ui, view: &mut OnboardingView) {
 fn identity_form(ui: &mut egui::Ui, view: &mut OnboardingView, commands: &mut Vec<Command>) {
     let restore = view.mode == Mode::Restore;
     ui.label("What should your contacts call you?");
-    ui.add(egui::TextEdit::singleline(&mut view.display_name).hint_text("display name").desired_width(f32::INFINITY));
+    ui.add(
+        egui::TextEdit::singleline(&mut view.display_name)
+            .hint_text("display name")
+            .desired_width(f32::INFINITY),
+    );
     if restore {
         ui.label("Your 24-word seed phrase");
         ui.add(
@@ -77,14 +94,25 @@ fn identity_form(ui: &mut egui::Ui, view: &mut OnboardingView, commands: &mut Ve
         ui.label(egui::RichText::new("Restoring starts fresh: contacts and chats are not recovered. To keep them, link from a device you still have.").small().color(theme::MUTED_TEXT));
     }
     ui.add_space(8.0);
-    let ready = !view.display_name.trim().is_empty() && (!restore || !view.seed_phrase.trim().is_empty());
-    let label = if restore { "Restore identity" } else { "Let's go" };
-    let button = ui.add_enabled(ready && !view.submitted, theme::primary_button(label).min_size(egui::vec2(FORM_WIDTH, 40.0)));
+    let ready =
+        !view.display_name.trim().is_empty() && (!restore || !view.seed_phrase.trim().is_empty());
+    let label = if restore {
+        "Restore identity"
+    } else {
+        "Let's go"
+    };
+    let button = ui.add_enabled(
+        ready && !view.submitted,
+        theme::primary_button(label).min_size(egui::vec2(FORM_WIDTH, 40.0)),
+    );
     if button.clicked() {
         view.submitted = true;
         let display_name = view.display_name.trim().to_owned();
         commands.push(if restore {
-            Command::RestoreIdentity { phrase: view.seed_phrase.clone(), display_name }
+            Command::RestoreIdentity {
+                phrase: view.seed_phrase.clone(),
+                display_name,
+            }
         } else {
             Command::CreateIdentity { display_name }
         });
@@ -94,7 +122,12 @@ fn identity_form(ui: &mut egui::Ui, view: &mut OnboardingView, commands: &mut Ve
     }
 }
 
-fn link_panel(ui: &mut egui::Ui, view: &mut OnboardingView, link_ticket: Option<&str>, commands: &mut Vec<Command>) {
+fn link_panel(
+    ui: &mut egui::Ui,
+    view: &mut OnboardingView,
+    link_ticket: Option<&str>,
+    commands: &mut Vec<Command>,
+) {
     if !view.linking_requested {
         view.linking_requested = true;
         commands.push(Command::StartLinking);
@@ -107,7 +140,9 @@ fn link_panel(ui: &mut egui::Ui, view: &mut OnboardingView, link_ticket: Option<
     };
     ui.vertical_centered(|ui| {
         if let Some(texture) = view.qr.texture(ui.ctx(), link) {
-            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(egui::vec2(QR_SIZE, QR_SIZE)));
+            ui.add(
+                egui::Image::from_texture(texture).fit_to_exact_size(egui::vec2(QR_SIZE, QR_SIZE)),
+            );
         }
     });
     ui.add(egui::TextEdit::singleline(&mut link.to_owned()).desired_width(f32::INFINITY));

@@ -46,7 +46,9 @@ impl WindowSize {
 
     /// Notes the current inner size. Does not touch disk.
     pub fn observe(&mut self, points: egui::Vec2) {
-        let Some(edges) = edges_from_points(points) else { return };
+        let Some(edges) = edges_from_points(points) else {
+            return;
+        };
         if edges == self.pending.unwrap_or(self.saved) {
             return;
         }
@@ -66,7 +68,9 @@ impl WindowSize {
 
     /// Writes a pending size now.
     pub fn flush(&mut self) {
-        let Some(edges) = self.pending.take() else { return };
+        let Some(edges) = self.pending.take() else {
+            return;
+        };
         if edges == self.saved {
             return;
         }
@@ -94,7 +98,10 @@ fn edges_from_points(points: egui::Vec2) -> Option<[u32; 2]> {
     if !points.x.is_finite() || !points.y.is_finite() {
         return None;
     }
-    if points.x < MIN_SIZE[0] || points.y < MIN_SIZE[1] || points.x > MAX_EDGE as f32 || points.y > MAX_EDGE as f32
+    if points.x < MIN_SIZE[0]
+        || points.y < MIN_SIZE[1]
+        || points.x > MAX_EDGE as f32
+        || points.y > MAX_EDGE as f32
     {
         return None;
     }
@@ -162,7 +169,10 @@ mod tests {
 
         store.observe(egui::vec2(100.0, 100.0));
         store.flush();
-        assert!(!dir.join(FILE_NAME).exists(), "below the minimum size is not saved");
+        assert!(
+            !dir.join(FILE_NAME).exists(),
+            "below the minimum size is not saved"
+        );
 
         store.observe(egui::vec2(1100.4, 700.6));
         store.flush();

@@ -22,11 +22,18 @@ pub struct Composer<'a> {
 
 /// Returns whether the input already held keyboard focus when the frame began.
 pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) -> bool {
-    let Composer { contact, draft, dialogs, grab_focus } = composer;
+    let Composer {
+        contact,
+        draft,
+        dialogs,
+        grab_focus,
+    } = composer;
     let input_id = ui.make_persistent_id(("composer", contact));
     let had_focus = ui.memory(|memory| memory.has_focus(input_id));
     let enter_pressed = had_focus
-        && ui.input_mut(|input| !input.modifiers.shift && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        && ui.input_mut(|input| {
+            !input.modifiers.shift && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+        });
     if grab_focus {
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
@@ -45,7 +52,10 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
     });
 
     if (enter_pressed || send_clicked) && !draft.trim().is_empty() {
-        commands.push(Command::SendText { contact, text: draft.trim().to_owned() });
+        commands.push(Command::SendText {
+            contact,
+            text: draft.trim().to_owned(),
+        });
         draft.clear();
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
@@ -57,15 +67,24 @@ fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
     egui::Frame::new()
         .fill(theme::INPUT_BG)
         .corner_radius(theme::INPUT_RADIUS)
-        .inner_margin(egui::Margin { left: 18, right: 6, top: 0, bottom: 0 })
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 6,
+            top: 0,
+            bottom: 0,
+        })
         .show(ui, |ui| {
             ui.set_width(width - 24.0);
             ui.set_min_height(PILL_MIN_HEIGHT);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let emoji_button = ui.add(
-                    egui::Button::new(egui::RichText::new("☺").size(ICON_FONT_SIZE).color(theme::MUTED_TEXT))
-                        .fill(Color32::TRANSPARENT)
-                        .corner_radius(egui::CornerRadius::same(16)),
+                    egui::Button::new(
+                        egui::RichText::new("☺")
+                            .size(ICON_FONT_SIZE)
+                            .color(theme::MUTED_TEXT),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(egui::CornerRadius::same(16)),
                 );
                 if let Some(chosen) = emoji::picker(&emoji_button.on_hover_text("Emoji")) {
                     emoji::insert_at_cursor(ui.ctx(), input_id, draft, chosen);
@@ -78,18 +97,28 @@ fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
                 // line, which would make the input scroll instead of grow.
                 let mut budget = ui.available_rect_before_wrap();
                 budget.max.y = budget.min.y + PILL_MAX_TEXT_HEIGHT;
-                ui.scope_builder(egui::UiBuilder::new().max_rect(budget).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-                        let output = egui::TextEdit::multiline(draft)
-                                .id(input_id)
-                                .hint_text("Write a message…")
-                                .desired_rows(1)
-                                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, text_margin)))
-                                .desired_width(f32::INFINITY)
-                                .show(ui);
-                        paste_menu(&output.response, input_id);
-                    });
-                });
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(budget)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let output = egui::TextEdit::multiline(draft)
+                                    .id(input_id)
+                                    .hint_text("Write a message…")
+                                    .desired_rows(1)
+                                    .frame(
+                                        egui::Frame::new()
+                                            .inner_margin(egui::Margin::symmetric(0, text_margin)),
+                                    )
+                                    .desired_width(f32::INFINITY)
+                                    .show(ui);
+                                paste_menu(&output.response, input_id);
+                            });
+                    },
+                );
             });
         });
 }
@@ -120,9 +149,20 @@ fn round_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, active: bool) -> b
         (false, true) => theme::INPUT_BG,
         (false, false) => Color32::TRANSPARENT,
     };
-    let icon_color = if active { Color32::WHITE } else { theme::MUTED_TEXT };
-    ui.painter().circle_filled(rect.center(), ROUND_BUTTON_SIZE / 2.0, fill);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(ICON_FONT_SIZE), icon_color);
+    let icon_color = if active {
+        Color32::WHITE
+    } else {
+        theme::MUTED_TEXT
+    };
+    ui.painter()
+        .circle_filled(rect.center(), ROUND_BUTTON_SIZE / 2.0, fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(ICON_FONT_SIZE),
+        icon_color,
+    );
     response.on_hover_text(tooltip).clicked() && (active || icon != "➤")
 }
 
@@ -138,15 +178,29 @@ mod tests {
         let mut draft = draft.to_owned();
         let mut height = 0.0;
         for _ in 0..3 {
-            let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0)));
-            let mut output = ctx.run_ui(egui::RawInput { screen_rect, ..Default::default() }, |ui| {
-                let mut commands = Vec::new();
-                egui::Panel::bottom("composer").show(ui, |ui| {
-                    let composer = Composer { contact: [1; 32], draft: &mut draft, dialogs: &dialogs, grab_focus: false };
-                    show(ui, composer, &mut commands);
-                    height = ui.min_rect().height();
-                });
-            });
+            let screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            ));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect,
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut commands = Vec::new();
+                    egui::Panel::bottom("composer").show(ui, |ui| {
+                        let composer = Composer {
+                            contact: [1; 32],
+                            draft: &mut draft,
+                            dialogs: &dialogs,
+                            grab_focus: false,
+                        };
+                        show(ui, composer, &mut commands);
+                        height = ui.min_rect().height();
+                    });
+                },
+            );
             output.textures_delta.clear();
         }
         height
@@ -156,8 +210,17 @@ mod tests {
     fn single_line_by_default_and_grows_with_lines() {
         let single = composer_height("");
         let multi = composer_height("one\ntwo\nthree");
-        println!("single={single} multi={multi} six={}", composer_height("1\n2\n3\n4\n5\n6"));
-        assert!(single < 70.0, "empty composer should be one line, was {single}");
-        assert!(multi > single + 5.0, "composer should grow: {single} -> {multi}");
+        println!(
+            "single={single} multi={multi} six={}",
+            composer_height("1\n2\n3\n4\n5\n6")
+        );
+        assert!(
+            single < 70.0,
+            "empty composer should be one line, was {single}"
+        );
+        assert!(
+            multi > single + 5.0,
+            "composer should grow: {single} -> {multi}"
+        );
     }
 }

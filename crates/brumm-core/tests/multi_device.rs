@@ -52,13 +52,20 @@ async fn link_sync_fanout_and_revoke() {
     // The phone replies; Bob gets it, the laptop gets a transcript of the sent message.
     let reply = phone.send_text(bob_key, "from my phone").await;
     assert_eq!(bob.received_text().await, "from my phone");
-    assert_eq!(laptop.message_added(Direction::Outgoing).await, "from my phone");
+    assert_eq!(
+        laptop.message_added(Direction::Outgoing).await,
+        "from my phone"
+    );
     phone.delivered(reply).await;
 
     // The laptop removes the phone: the phone is revoked, Bob stops delivering to it.
-    laptop.send(Command::RemoveDevice { device_id: phone_id });
+    laptop.send(Command::RemoveDevice {
+        device_id: phone_id,
+    });
     laptop.wait_devices(1).await;
-    phone.expect(|event| matches!(event, Event::DeviceRevoked).then_some(())).await;
+    phone
+        .expect(|event| matches!(event, Event::DeviceRevoked).then_some(()))
+        .await;
 
     bob.contact_added().await;
     let last = bob.send_text(alice_key, "laptop only").await;
@@ -76,6 +83,12 @@ async fn notes_chat_syncs_between_own_devices_only() {
     let id = laptop.send_text(alice_key, "buy milk").await;
     assert_eq!(phone.message_added(Direction::Outgoing).await, "buy milk");
 
-    phone.send(Command::DeleteMessages { contact: alice_key, ids: vec![id], for_everyone: false });
-    laptop.expect(|event| matches!(event, Event::MessagesDeleted { .. }).then_some(())).await;
+    phone.send(Command::DeleteMessages {
+        contact: alice_key,
+        ids: vec![id],
+        for_everyone: false,
+    });
+    laptop
+        .expect(|event| matches!(event, Event::MessagesDeleted { .. }).then_some(()))
+        .await;
 }

@@ -13,7 +13,10 @@ pub struct QrCache {
 
 impl QrCache {
     pub fn texture(&mut self, ctx: &egui::Context, text: &str) -> Option<&egui::TextureHandle> {
-        let stale = self.cached.as_ref().is_none_or(|(cached_text, _)| cached_text != text);
+        let stale = self
+            .cached
+            .as_ref()
+            .is_none_or(|(cached_text, _)| cached_text != text);
         if stale {
             let image = encode(text)?;
             let texture = ctx.load_texture("invite_qr", image, egui::TextureOptions::NEAREST);
