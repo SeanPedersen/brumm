@@ -26,6 +26,9 @@ impl BrummApp {
         window_size: WindowSize,
     ) -> Self {
         ui::theme::apply(&cc.egui_ctx);
+        // After the text fonts, before any sans-serif fallback that also has emoji outlines.
+        cc.egui_ctx
+            .add_font_provider(std::sync::Arc::new(ui::emoji_font::ColorEmojiFont::new()));
         egui_extras::install_image_loaders(&cc.egui_ctx);
         Self {
             core: CoreBridge::start(data_dir, cc.egui_ctx.clone()),

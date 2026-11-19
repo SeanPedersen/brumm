@@ -23,6 +23,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
   devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning; included in history sync like any conversation.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
+- **Emoji:** the system color emoji font (Noto Color Emoji, via `fc-match emoji` if it is not
+  in a well-known path) is installed after the text fonts and before discovered fallbacks.
+  Sans fonts that also contain emoji outlines (DejaVu Sans, Noto Sans Symbols 2) would otherwise
+  paint those codepoints grey. Letters and digits stay with the text font.
 - **Links:** `http`, `https`, `www.` and `mailto` in a message open with the system handler on click.
   A long note only scans the lines on screen. A single precise click does not select the message.
 - **Paste:** Ctrl+V sends clipboard images (`Event::PasteImage`) and copied files (`text/uri-list` via arboard). The latter needs the
@@ -80,7 +84,8 @@ crates/brumm-app/         eframe binary `brumm`
                           (jiff 1.0 local time)
                           bubble.rs (text/image/file-card bubble + clickable links + selection chrome + context menu),
                           composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
-                          cursor), files.rs (rfd dialogs on threads, avatar shrink to JPEG, chat image
+                          cursor), emoji_font.rs (system color emoji ahead of monochrome symbol fonts),
+                          files.rs (rfd dialogs on threads, avatar shrink to JPEG, chat image
                           previews, size limits)
 ```
 

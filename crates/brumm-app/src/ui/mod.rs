@@ -8,6 +8,7 @@ pub mod chat;
 pub mod composer;
 pub mod devices;
 pub mod emoji;
+pub mod emoji_font;
 pub mod errors;
 pub mod files;
 mod links;

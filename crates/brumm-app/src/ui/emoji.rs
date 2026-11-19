@@ -1,5 +1,4 @@
 //! Emoji picker popup and cursor-aware insertion into the composer.
-//! egui renders emoji monochrome (bundled Noto Emoji), so only widely supported ones are listed.
 
 use egui::{
     Id, Popup, PopupCloseBehavior, Response, RichText,
