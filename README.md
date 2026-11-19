@@ -31,6 +31,15 @@ cargo run --release -- --profile bob                   # e.g. to chat with yours
 ```
 Profile data lives in `~/.local/share/brumm/profiles/<profile>/` (Linux).
 
+Desktop integration (taskbar icon and app grid entry on Wayland/GNOME):
+```sh
+cargo build --release
+scripts/install-desktop.sh      # -> ~/.local/share/{applications,icons/hicolor/256x256}, ~/.local/bin/brumm
+```
+Wayland compositors ignore window icons set by the client: they match the window's `app_id` against an
+installed `brumm.desktop` and take its `Icon=`. Running straight from `target/` therefore shows the
+generic icon until the entry and icon are installed.
+
 ## Test
 ```sh
 cargo test                                                    # unit + local end-to-end (incl. in-memory Nostr relay)

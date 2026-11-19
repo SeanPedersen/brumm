@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=brumm
+Comment=Decentralized end-to-end encrypted messenger
+Exec=brumm
+Icon=brumm
+Categories=Network;InstantMessaging;
+StartupWMClass=brumm

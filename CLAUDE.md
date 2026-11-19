@@ -28,6 +28,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.
 - The DB is plain SQLite (the seed phrase is readable on disk). Rely on OS disk encryption for now.
+- **Window icon / app identity:** the viewport sets `app_id = "brumm"` plus an embedded PNG. Wayland shells ignore a
+  client-set icon and match `app_id` → `brumm.desktop` → `Icon=` in the icon theme, so the icon only appears after
+  `scripts/install-desktop.sh` installed the entry and the hicolor PNG. That script also rewrites `Exec=` to the
+  absolute binary path: the shell runs with the session `PATH` (no `~/.local/bin`), so `Exec=brumm` would not launch.
 
 ## Layout
 ```
@@ -89,6 +93,7 @@ cargo test -p brumm-core --test network -- --ignored   # needs internet: relay +
 cargo clippy --all-targets
 cargo run -- --profile alice                 # separate data dir per profile
 cargo run -- --profile bob                   # 2nd instance to chat locally
+scripts/install-desktop.sh [binary]          # user-level desktop entry + hicolor icon + ~/.local/bin/brumm
 ```
 Data dir: `~/.local/share/brumm/profiles/<profile>/brumm.db` (Linux).
 
