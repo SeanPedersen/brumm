@@ -36,3 +36,16 @@ jiff = "1.0.1"
 # Lets the app see Ctrl+V when the clipboard holds a copied file (see vendor/egui-winit/src/lib.rs, "brumm patch").
 [patch.crates-io]
 egui-winit = { path = "vendor/egui-winit" }
+
+# Everyday optimized build: `cargo build --release`.
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# Slow, smallest/fastest binary for shipping: `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
