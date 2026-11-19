@@ -2,10 +2,7 @@
 //! updates to our own signed device list. After a link, the linking device syncs contacts and
 //! recent history to the new device and announces the new list to every contact.
 
-use std::sync::Arc;
-
-use anyhow::{Context, Result, bail, ensure};
-use iroh::{EndpointId, SecretKey};
+use anyhow::{Context, Result, bail, ensure};use iroh::{EndpointId, SecretKey};
 
 use super::{LinkTarget, Me, Node, Outcome, PendingLink, RETENTION_MS, next_seq, profile_view};
 use crate::{
@@ -35,9 +32,9 @@ impl Node {
         let device_secret = SecretKey::generate();
         let (mut crypto, fallback_key) = DeviceCrypto::generate(&device_secret.to_bytes());
         let one_time_key = crypto.new_one_time_key_unsaved();
-        let transport = Arc::new(Transport::bind(device_secret.clone(), self.inbound_tx.clone()).await?);
+        let transport = Transport::start(device_secret.clone(), self.inbound_tx.clone());
         let ticket = LinkTicket::new(
-            transport.addr().await,
+            transport.addr().await?,
             rand::random(),
             crypto.identity_key(),
             one_time_key,

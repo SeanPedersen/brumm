@@ -61,8 +61,9 @@ crates/brumm-core/        no UI; everything async/network/storage
   tests/mailbox.rs        e2e via in-memory Nostr relay: never online together, receipts
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
 crates/brumm-app/         eframe binary `brumm`
-  src/bridge.rs           tokio runtime thread + channels; repaint on event
-  src/state.rs            AppState, mutated only via apply(Event)
+  src/bridge.rs           tokio runtime thread (2 workers) + channels; repaint on event;
+                          detached thread, closing the command channel stops the core
+  src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
                           Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
@@ -85,6 +86,23 @@ crates/brumm-app/         eframe binary `brumm`
 - Never re-encrypt an outbox entry on retry: always resend the stored ciphertext (ratchet gap limit).
 - Own-device-only payloads (`SentTranscript`, `ContactSync`, `History`) must be rejected from contacts.
 - Names for constants, no magic numbers. Module doc comment at the top of every file.
+
+## Startup & memory
+Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
+- **Renderer is glow/OpenGL** (`eframe::Renderer::Glow`, `default-features = false`). Do not
+  re-enable wgpu/Vulkan: it pulls the Vulkan ICD + shader compiler into the process for no benefit.
+- **`Event::Ready` must never wait for the network.** `Transport::start` binds iroh lazily in the
+  background (`OnceCell`); mailbox startup and the outbox flush happen after Ready.
+- **Never load every conversation at startup.** `Store::conversation_previews` returns one
+  `MessageView` per chat for the sidebar; `Command::LoadConversation` loads a full history only
+  when a chat is opened. Bulk changes emit `Event::PreviewChanged` instead of a full reload.
+- **Bound the caches.** `AppState` keeps only the selected conversation and at most
+  `ATTACHMENT_CACHE_ENTRIES` / `ATTACHMENT_CACHE_BYTES` of file bytes (LRU, `ctx.forget_image` on
+  eviction). Inline files are stored in full, so an unbounded cache is a real leak.
+- SQLite runs `WAL` + `synchronous = NORMAL`; the schema batch only runs when `user_version`
+  differs. Keep single-row lookups keyed (e.g. `outbox_item`) instead of scanning a list.
+- Ship builds with `cargo build --profile dist` (fat LTO, `codegen-units = 1`, `panic = abort`):
+  ~30 MB binary and ~19 MB code pages vs ~26 MB for the release profile.
 
 ## Commands
 ```

@@ -16,7 +16,17 @@ tokio.workspace = true
 directories.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-eframe.workspace = true
+# OpenGL instead of Vulkan/wgpu: much lower RSS and faster start (no GPU-driver
+# compiler libraries loaded). Everything we use is in these features.
+eframe = { workspace = true, default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
 egui.workspace = true
 qrcode.workspace = true
 jiff.workspace = true

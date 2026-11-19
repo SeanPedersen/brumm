@@ -70,7 +70,7 @@ impl Node {
             profile: profile.clone(),
             olm_account: crypto.account_pickle(),
         })?;
-        let transport = Arc::new(Transport::bind(device_secret.clone(), self.inbound_tx.clone()).await?);
+        let transport = Transport::start(device_secret.clone(), self.inbound_tx.clone());
         self.start_mailbox(&device_secret, self.mailbox_relays.clone());
         let seed_phrase = is_new.then(|| user.phrase());
         self.events.emit(Event::IdentityCreated { profile: profile_view(&profile), seed_phrase });
@@ -99,8 +99,13 @@ impl Node {
         let cert = me.own_cert().clone();
         let events = events.clone();
         tokio::spawn(async move {
-            let invite = Invite::new(display_name, cert, transport.addr().await, secret, one_time_key);
-            events.emit(Event::InviteCreated { link: invite.to_link() });
+            match transport.addr().await {
+                Ok(addr) => {
+                    let invite = Invite::new(display_name, cert, addr, secret, one_time_key);
+                    events.emit(Event::InviteCreated { link: invite.to_link() });
+                }
+                Err(err) => events.emit(Event::Error(format!("could not create invite: {err:#}"))),
+            }
         });
         Ok(())
     }
@@ -140,6 +145,7 @@ impl Node {
             return Ok(());
         }
         self.events.emit(Event::MessagesDeleted { contact, ids: removed.clone() });
+        self.emit_preview(&contact)?;
         if for_everyone {
             self.store.drop_outbox_envelopes(&removed)?;
             self.enqueue_to_user(&contact, rand::random(), Payload::Delete(removed.clone()), None)?;
@@ -188,6 +194,13 @@ impl Node {
     pub(super) fn emit_avatar(&self, user: &UserKey, image: &[u8]) {
         let image = (!image.is_empty()).then(|| image.to_vec());
         self.events.emit(Event::AvatarChanged { user: *user, image });
+    }
+
+    /// Tells the UI the new last message after a bulk change (delete, history sync).
+    pub(super) fn emit_preview(&self, contact: &UserKey) -> Result<()> {
+        let last = self.store.last_message(contact)?;
+        self.events.emit(Event::PreviewChanged { contact: *contact, last });
+        Ok(())
     }
 }
 

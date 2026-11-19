@@ -10,7 +10,7 @@ use iroh::{EndpointId, SecretKey};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
-    api::{AttachmentView, ContactView, DeliveryStatus, Direction, MessageView, ReactionsView, Trust},
+    api::{AttachmentView, ContactView, ConversationPreview, DeliveryStatus, Direction, MessageView, ReactionsView, Trust},
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
     crypto::Sealed,
@@ -134,6 +134,9 @@ impl Store {
 
     fn init(db: Connection) -> Result<Self> {
         db.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // WAL + NORMAL: no fsync per commit; a crash can lose the last commits but never
+        // corrupt the database. Startup and every message insert get much cheaper.
+        db.pragma_update(None, "synchronous", "NORMAL")?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             bail!("database schema v{version} is newer than this brumm build");
@@ -141,8 +144,10 @@ impl Store {
         if version != 0 && version < MIN_UPGRADABLE_SCHEMA_VERSION {
             bail!("this profile was created by an incompatible pre-release build (schema v{version}); delete its data folder to start fresh");
         }
-        db.execute_batch(SCHEMA)?;
-        db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if version != SCHEMA_VERSION {
+            db.execute_batch(SCHEMA)?;
+            db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(Self { db })
     }
 
@@ -403,7 +408,24 @@ impl Store {
     }
 
     pub fn outbox_item(&self, device: &EndpointId, envelope_id: &EnvelopeId) -> Result<Option<OutboxItem>> {
-        Ok(self.outbox()?.into_iter().find(|item| &item.device == device && &item.envelope_id == envelope_id))
+        let row = self
+            .db
+            .query_row(
+                "SELECT sealed, is_receipt, mailboxed FROM outbox WHERE device_id = ?1 AND envelope_id = ?2",
+                params![device.as_bytes().as_slice(), envelope_id.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
+            )
+            .optional()?;
+        row.map(|(sealed, is_receipt, mailboxed)| {
+            Ok(OutboxItem {
+                device: *device,
+                envelope_id: *envelope_id,
+                sealed: wire::decode(&sealed)?,
+                is_receipt,
+                mailboxed,
+            })
+        })
+        .transpose()
     }
 
     pub fn mark_mailboxed(&self, device: &EndpointId, envelope_id: &EnvelopeId) -> Result<()> {
@@ -544,6 +566,43 @@ impl Store {
             message.reactions = reactions.remove(&message.id).unwrap_or_default();
         }
         Ok(messages)
+    }
+
+    /// Latest message per conversation, for the chat list. Avoids loading full histories at
+    /// startup; the sidebar only needs previews and the last activity time.
+    pub fn conversation_previews(&self) -> Result<Vec<ConversationPreview>> {
+        let mut stmt = self.db.prepare(
+            "SELECT contact, id, direction, body, sent_at_ms, status FROM messages
+             WHERE rowid IN (
+                 SELECT rowid FROM (
+                     SELECT rowid, ROW_NUMBER() OVER (
+                         PARTITION BY contact ORDER BY sent_at_ms DESC, rowid DESC
+                     ) AS newest FROM messages
+                 ) WHERE newest = 1
+             )",
+        )?;
+        let rows = stmt.query_map([], message_from_row)?;
+        Ok(rows
+            .map(|row| {
+                row.map(|last| ConversationPreview {
+                    contact: last.contact,
+                    last: Some(last),
+                })
+            })
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// The newest message of one conversation, if it has any.
+    pub fn last_message(&self, contact: &UserKey) -> Result<Option<MessageView>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT contact, id, direction, body, sent_at_ms, status FROM messages
+                 WHERE contact = ?1 ORDER BY sent_at_ms DESC, rowid DESC LIMIT 1",
+                params![contact.as_slice()],
+                message_from_row,
+            )
+            .optional()?)
     }
 
     fn conversation_reactions(&self, contact: &UserKey) -> Result<std::collections::HashMap<MessageId, ReactionsView>> {

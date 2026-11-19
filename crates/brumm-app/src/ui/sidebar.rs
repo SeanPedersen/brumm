@@ -30,7 +30,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, view: &mut ViewState, comma
             top_bar(ui, state, view);
             let clicked = chat_list(ui, state, &view.search);
             if let Some(contact) = clicked {
-                state.select(contact);
+                state.select(contact, ui.ctx());
                 commands.push(Command::LoadConversation { contact });
             }
         });
@@ -154,7 +154,7 @@ fn visible_contacts<'a>(state: &'a AppState, search: &str) -> Vec<&'a ContactVie
 }
 
 fn last_message<'a>(state: &'a AppState, contact: &ContactView) -> Option<&'a MessageView> {
-    state.conversations.get(&contact.user_key).and_then(|messages| messages.last())
+    state.previews.get(&contact.user_key)
 }
 
 fn last_activity_ms(state: &AppState, contact: &ContactView) -> u64 {

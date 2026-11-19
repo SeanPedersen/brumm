@@ -134,6 +134,7 @@ impl Node {
         let removed = self.store.delete_messages(&contact, &ids, Some(Direction::Incoming))?;
         if !removed.is_empty() {
             self.events.emit(Event::MessagesDeleted { contact, ids: removed });
+            self.emit_preview(&contact)?;
         }
         Ok(true)
     }
@@ -145,6 +146,7 @@ impl Node {
         let removed = self.store.delete_messages(&contact, &ids, None)?;
         if !removed.is_empty() {
             self.events.emit(Event::MessagesDeleted { contact, ids: removed });
+            self.emit_preview(&contact)?;
         }
         Ok(true)
     }
@@ -226,6 +228,9 @@ impl Node {
             }
         }
         if !changed.is_empty() {
+            for contact in &changed {
+                self.emit_preview(contact)?;
+            }
             self.events.emit(Event::ConversationsChanged(changed));
         }
         Ok(true)

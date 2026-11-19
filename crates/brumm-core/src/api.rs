@@ -37,6 +37,9 @@ pub enum Event {
     Ready {
         profile: Option<ProfileView>,
         contacts: Vec<ContactView>,
+        /// Latest message per conversation, for chat-list ordering and previews; full
+        /// conversations are loaded on demand with [`Command::LoadConversation`].
+        previews: Vec<ConversationPreview>,
     },
     /// `seed_phrase` is set only for brand-new identities (to show once for backup).
     IdentityCreated {
@@ -53,6 +56,11 @@ pub enum Event {
     Conversation {
         contact: UserKey,
         messages: Vec<MessageView>,
+    },
+    /// The last message of a conversation changed (e.g. after a bulk delete or history sync).
+    PreviewChanged {
+        contact: UserKey,
+        last: Option<MessageView>,
     },
     MessageAdded(MessageView),
     /// Bulk change (history sync): reload these conversations if shown.
@@ -107,6 +115,13 @@ pub struct MessageView {
     pub reactions: ReactionsView,
     pub sent_at_ms: u64,
     pub status: DeliveryStatus,
+}
+
+/// Latest message of one conversation, used for the chat list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPreview {
+    pub contact: UserKey,
+    pub last: Option<MessageView>,
 }
 
 /// Who reacted with what; each user has at most one reaction per message.

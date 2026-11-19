@@ -1,6 +1,14 @@
 //! UI-side mirror of core state, updated only by applying core [`Event`]s.
+//!
+//! Startup stays cheap: the core sends one [`ConversationPreview`] per chat instead of the full
+//! history. A conversation's messages are loaded only when it is opened, and caches for
+//! conversations and file bytes are bounded so long chats cannot grow RAM without limit.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Cursor,
+    sync::Arc,
+};
 
 use brumm_core::{
     api::{ContactView, DeviceView, Event, MessageView, ProfileView, Trust},
@@ -10,6 +18,9 @@ use brumm_core::{
 
 const MAX_VISIBLE_ERRORS: usize = 3;
 const NOTES_NAME: &str = "Notes";
+/// File bytes kept in memory across all chats; older entries are dropped first.
+const ATTACHMENT_CACHE_BYTES: usize = 48 * 1024 * 1024;
+const ATTACHMENT_CACHE_ENTRIES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -33,15 +44,25 @@ pub struct LoadedAttachment {
     pub image_size: Option<(u32, u32)>,
 }
 
+/// Stable image-cache key for an attachment; matches what the bubble renders.
+pub fn attachment_uri(id: &MessageId) -> String {
+    format!("bytes://attachment/{}", hex(id))
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub avatars: HashMap<UserKey, AvatarImage>,
     pub attachments: HashMap<(UserKey, MessageId), LoadedAttachment>,
+    pub(crate) attachment_order: VecDeque<(UserKey, MessageId)>,
+    pub(crate) attachment_bytes: usize,
     pub ready: bool,
     pub profile: Option<ProfileView>,
     pub contacts: Vec<ContactView>,
     pub selected: Option<UserKey>,
+    /// Messages of opened chats only.
     pub conversations: HashMap<UserKey, Vec<MessageView>>,
+    /// Newest message per chat, for the sidebar's preview and ordering.
+    pub previews: HashMap<UserKey, MessageView>,
     pub unread: HashMap<UserKey, usize>,
     /// Shown once right after identity creation so the user can write it down.
     pub seed_phrase_to_show: Option<String>,
@@ -50,7 +71,7 @@ pub struct AppState {
     pub link_ticket: Option<String>,
     pub devices: Vec<DeviceView>,
     pub revoked: bool,
-    /// Conversations changed in bulk; the app reloads them from the core.
+    /// Opened conversations changed in bulk; the app reloads them from the core.
     pub stale_conversations: Vec<UserKey>,
     pub connecting: bool,
     pub errors: Vec<String>,
@@ -84,7 +105,6 @@ impl AppState {
             trust: Trust::Verified,
             added_at_ms: 0,
         };
-        self.stale_conversations.push(notes.user_key);
         self.contacts.push(notes);
     }
 
@@ -92,13 +112,24 @@ impl AppState {
         self.contacts.iter().find(|contact| &contact.user_key == key)
     }
 
-    pub fn select(&mut self, key: UserKey) {
+    /// Selects a chat and drops cached data of the previous one; only one chat is shown at a time.
+    pub fn select(&mut self, key: UserKey, ctx: &egui::Context) {
         self.selected = Some(key);
         self.unread.remove(&key);
+        self.conversations.retain(|cached, _| *cached == key);
+        let stale: Vec<(UserKey, MessageId)> = self
+            .attachments
+            .keys()
+            .filter(|(contact, _)| *contact != key)
+            .copied()
+            .collect();
+        for id in stale {
+            self.forget_attachment(id, ctx);
+        }
     }
 
     /// Adds or updates a contact; jumps to it only when the user just connected to it.
-    fn upsert_contact(&mut self, contact: ContactView) {
+    fn upsert_contact(&mut self, contact: ContactView, ctx: &egui::Context) {
         let key = contact.user_key;
         match self.contacts.iter_mut().find(|known| known.user_key == key) {
             Some(known) => *known = contact,
@@ -106,17 +137,19 @@ impl AppState {
         }
         self.contacts.sort_by_key(|contact| contact.display_name.to_lowercase());
         if std::mem::take(&mut self.connecting) {
-            self.select(key);
+            self.select(key, ctx);
         }
     }
 
-    pub fn apply(&mut self, event: Event) {
+    pub fn apply(&mut self, event: Event, ctx: &egui::Context) {
         match event {
-            Event::Ready { profile, contacts } => {
+            Event::Ready { profile, contacts, previews } => {
                 self.ready = true;
                 self.profile = profile;
-                // Chat-list previews and ordering need every conversation's latest message.
-                self.stale_conversations.extend(contacts.iter().map(|contact| contact.user_key));
+                self.previews = previews
+                    .into_iter()
+                    .filter_map(|preview| preview.last.map(|last| (preview.contact, last)))
+                    .collect();
                 self.contacts = contacts;
                 self.ensure_notes_contact();
             }
@@ -130,17 +163,38 @@ impl AppState {
             Event::Devices(devices) => self.devices = devices,
             Event::DeviceRevoked => self.revoked = true,
             Event::InviteCreated { link } => self.invite_link = Some(link),
-            Event::ContactAdded(contact) => self.upsert_contact(contact),
-            Event::ConversationsChanged(contacts) => self.stale_conversations.extend(contacts),
+            Event::ContactAdded(contact) => self.upsert_contact(contact, ctx),
+            Event::ConversationsChanged(contacts) => {
+                for contact in contacts {
+                    self.conversations.remove(&contact);
+                    if self.selected == Some(contact) {
+                        self.stale_conversations.push(contact);
+                    }
+                }
+            }
             Event::Conversation { contact, messages } => {
+                if let Some(last) = messages.last() {
+                    self.remember_preview(last.clone());
+                }
                 self.conversations.insert(contact, messages);
             }
+            Event::PreviewChanged { contact, last } => match last {
+                Some(last) => {
+                    self.previews.insert(contact, last);
+                }
+                None => {
+                    self.previews.remove(&contact);
+                }
+            },
             Event::MessageAdded(message) => {
                 let contact = message.contact;
                 if self.selected != Some(contact) {
                     *self.unread.entry(contact).or_default() += 1;
                 }
-                self.conversations.entry(contact).or_default().push(message);
+                if self.selected == Some(contact) {
+                    self.conversations.entry(contact).or_default().push(message.clone());
+                }
+                self.remember_preview(message);
             }
             Event::MessageStatusChanged { contact, id, status } => {
                 let message = self
@@ -156,7 +210,7 @@ impl AppState {
                     messages.retain(|message| !ids.contains(&message.id));
                 }
                 for id in &ids {
-                    self.attachments.remove(&(contact, *id));
+                    self.forget_attachment((contact, *id), ctx);
                 }
             }
             Event::ReactionsChanged { contact, id, reactions } => {
@@ -174,7 +228,9 @@ impl AppState {
                     self.avatars.insert(user, AvatarImage { uri, bytes: bytes.into() });
                 }
                 None => {
-                    self.avatars.remove(&user);
+                    if let Some(old) = self.avatars.remove(&user) {
+                        ctx.forget_image(&old.uri);
+                    }
                 }
             },
             Event::Attachment { contact, id, data } => {
@@ -183,7 +239,7 @@ impl AppState {
                     .ok()
                     .and_then(|reader| reader.into_dimensions().ok());
                 let bytes: Arc<[u8]> = data.as_slice().into();
-                self.attachments.insert((contact, id), LoadedAttachment { bytes, image_size });
+                self.remember_attachment((contact, id), LoadedAttachment { bytes, image_size }, ctx);
             }
             Event::Error(error) => {
                 self.connecting = false;
@@ -193,12 +249,49 @@ impl AppState {
             }
         }
     }
+
+    /// Keeps the newest message per chat; older arrivals (history sync) do not move the preview back.
+    fn remember_preview(&mut self, message: MessageView) {
+        let newer = self
+            .previews
+            .get(&message.contact)
+            .is_none_or(|known| (known.sent_at_ms, known.id) <= (message.sent_at_ms, message.id));
+        if newer {
+            self.previews.insert(message.contact, message);
+        }
+    }
+
+    fn remember_attachment(&mut self, key: (UserKey, MessageId), loaded: LoadedAttachment, ctx: &egui::Context) {
+        self.forget_attachment(key, ctx);
+        self.attachment_bytes += loaded.bytes.len();
+        self.attachments.insert(key, loaded);
+        self.attachment_order.push_back(key);
+        while self.attachments.len() > ATTACHMENT_CACHE_ENTRIES || self.attachment_bytes > ATTACHMENT_CACHE_BYTES {
+            let Some(oldest) = self.attachment_order.pop_front() else { break };
+            if let Some(dropped) = self.attachments.remove(&oldest) {
+                self.attachment_bytes = self.attachment_bytes.saturating_sub(dropped.bytes.len());
+                ctx.forget_image(&attachment_uri(&oldest.1));
+            }
+        }
+    }
+
+    fn forget_attachment(&mut self, key: (UserKey, MessageId), ctx: &egui::Context) {
+        if let Some(dropped) = self.attachments.remove(&key) {
+            self.attachment_bytes = self.attachment_bytes.saturating_sub(dropped.bytes.len());
+            self.attachment_order.retain(|entry| *entry != key);
+            ctx.forget_image(&attachment_uri(&key.1));
+        }
+    }
 }
 
 const HEX_PREFIX_BYTES: usize = 4;
 
 fn hex_prefix(key: &UserKey) -> String {
     key[..HEX_PREFIX_BYTES].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Cheap content fingerprint (FNV-1a) so a changed photo gets a fresh image-cache uri.

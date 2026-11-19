@@ -179,15 +179,11 @@ fn measure_content<'a>(ui: &egui::Ui, message: &MessageView, loaded: Option<&'a 
         let size = loaded
             .and_then(|loaded| loaded.image_size)
             .map_or(IMAGE_PLACEHOLDER_SIZE, |(width, height)| fit_image(width, height));
-        return Content::Image { size, loaded, uri: format!("bytes://attachment/{}", hex(&message.id)) };
+        return Content::Image { size, loaded, uri: crate::state::attachment_uri(&message.id) };
     }
     let name = ui.painter().layout_no_wrap(truncate_name(&attachment.name), FontId::proportional(CARD_NAME_FONT_SIZE), theme::TEXT);
     let size = ui.painter().layout_no_wrap(files::format_size(attachment.size), FontId::proportional(META_FONT_SIZE), theme::MUTED_TEXT);
     Content::Card { name, size }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Content size without meta or reactions, and the width of its last line (where the meta may go).

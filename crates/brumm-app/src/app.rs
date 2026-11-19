@@ -30,12 +30,12 @@ impl BrummApp {
 }
 
 impl eframe::App for BrummApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         for event in self.core.drain() {
             if matches!(event, brumm_core::api::Event::Error(_)) {
                 self.view.onboarding.allow_retry();
             }
-            self.state.apply(event);
+            self.state.apply(event, ctx);
         }
     }
 

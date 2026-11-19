@@ -1,7 +1,7 @@
 //! Runs the async core on its own tokio thread and exposes a non-blocking command/event
 //! interface to the immediate-mode UI.
 
-use std::{path::PathBuf, thread::JoinHandle};
+use std::path::PathBuf;
 
 use brumm_core::{
     api::{Command, Event, EventSink},
@@ -9,10 +9,13 @@ use brumm_core::{
 };
 use tokio::sync::mpsc;
 
+/// The core is network-light: a small multi-thread runtime is enough and keeps
+/// idle thread/stack overhead low.
+const CORE_WORKER_THREADS: usize = 2;
+
 pub struct CoreBridge {
     commands: Option<mpsc::UnboundedSender<Command>>,
     events: mpsc::UnboundedReceiver<Event>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl CoreBridge {
@@ -20,10 +23,13 @@ impl CoreBridge {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let sink = EventSink::new(event_tx, move || ctx.request_repaint());
-        let thread = std::thread::Builder::new()
+        // Detached: the core stops when the command channel closes, but shutdown never
+        // blocks the window from closing (see `Drop`).
+        std::thread::Builder::new()
             .name("brumm-core".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(CORE_WORKER_THREADS)
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
@@ -33,7 +39,6 @@ impl CoreBridge {
         Self {
             commands: Some(command_tx),
             events: event_rx,
-            thread: Some(thread),
         }
     }
 
@@ -49,11 +54,9 @@ impl CoreBridge {
 }
 
 impl Drop for CoreBridge {
-    /// Closing the command channel stops the node, which then shuts iroh down gracefully.
+    /// Closing the command channel asks the node to stop. Do not wait for iroh/Nostr
+    /// teardown: the process is exiting, and waiting here makes the window linger.
     fn drop(&mut self) {
         self.commands.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }

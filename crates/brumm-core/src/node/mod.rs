@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -212,11 +212,13 @@ impl Node {
     }
 
     async fn start(&mut self) {
+        let started = Instant::now();
         let loaded = self.load_me().await;
         self.report(loaded);
         let contacts = self.store.contacts().unwrap_or_default();
+        let previews = self.store.conversation_previews().unwrap_or_default();
         let profile = self.me.as_ref().map(|me| profile_view(&me.profile));
-        self.events.emit(Event::Ready { profile, contacts });
+        self.events.emit(Event::Ready { profile, contacts, previews });
         for (user, image) in self.store.avatars().unwrap_or_default() {
             self.emit_avatar(&user, &image);
         }
@@ -224,6 +226,7 @@ impl Node {
         if self.me.as_ref().is_some_and(|me| me.revoked) {
             self.events.emit(Event::DeviceRevoked);
         }
+        tracing::info!(elapsed_ms = started.elapsed().as_millis(), "storage ready");
         let flushed = self.flush_outbox();
         self.report(flushed);
     }
@@ -235,7 +238,7 @@ impl Node {
         let revoked = self.store.is_revoked()?;
         let user = UserIdentity::from_phrase(&stored.seed_phrase)?;
         let crypto = DeviceCrypto::load(&stored.olm_account, &stored.device_secret.to_bytes())?;
-        let transport = Arc::new(Transport::bind(stored.device_secret.clone(), self.inbound_tx.clone()).await?);
+        let transport = Transport::start(stored.device_secret.clone(), self.inbound_tx.clone());
         let device_id = stored.device_secret.public();
         let relays = stored
             .profile
