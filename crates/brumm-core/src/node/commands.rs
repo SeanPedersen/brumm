@@ -106,15 +106,20 @@ impl Node {
     }
 
     /// Sends a text or file message to a contact (and a transcript to our other devices).
+    /// The conversation keyed by our own user key is the "Notes" chat: it only syncs to our devices.
     fn send_text(&mut self, contact: UserKey, body: Body) -> Result<()> {
-        self.active_me()?;
-        self.store.contact(&contact)?.context("unknown contact")?;
+        let is_notes = contact == self.active_me()?.user_key();
+        if !is_notes {
+            self.store.contact(&contact)?.context("unknown contact")?;
+        }
         let message = ChatMessage { id: rand::random(), sent_at_ms: now_ms(), body };
         if !message.body.is_valid() {
             bail!("message is empty, too long or the file is too large");
         }
-        self.store.insert_message(&contact, &message, Direction::Outgoing, DeliveryStatus::Pending, None)?;
-        self.events.emit(Event::MessageAdded(message_view(contact, &message, Direction::Outgoing, DeliveryStatus::Pending)));
+        // Notes never leave our own devices, so there is no delivery to wait for.
+        let status = if is_notes { DeliveryStatus::Delivered } else { DeliveryStatus::Pending };
+        self.store.insert_message(&contact, &message, Direction::Outgoing, status, None)?;
+        self.events.emit(Event::MessageAdded(message_view(contact, &message, Direction::Outgoing, status)));
         self.enqueue_to_user(&contact, message.id, Payload::Chat(message.clone()), Some(&contact))?;
         self.enqueue_to_own_devices(Payload::SentTranscript { contact, message })?;
         self.flush_outbox()

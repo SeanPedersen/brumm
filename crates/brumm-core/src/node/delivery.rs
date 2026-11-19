@@ -20,7 +20,11 @@ use crate::{
 
 impl Node {
     /// Queues `payload` for every device of `user` (a contact).
+    /// Our own user (the Notes chat) is skipped: own devices are served by `enqueue_to_own_devices`.
     pub(super) fn enqueue_to_user(&mut self, user: &UserKey, envelope_id: EnvelopeId, payload: Payload, chat_contact: Option<&UserKey>) -> Result<()> {
+        if *user == self.me()?.user_key() {
+            return Ok(());
+        }
         let envelope = Envelope { id: envelope_id, payload };
         for entry in self.store.devices_of(user)? {
             self.enqueue_sealed(&entry, &envelope, chat_contact, false)?;

@@ -146,12 +146,18 @@ fn header(ui: &mut egui::Ui, state: &AppState, view: &ContactView) {
         .show(ui, |ui| {
             ui.set_min_height(theme::TOP_BAR_HEIGHT - 16.0);
             ui.horizontal_centered(|ui| {
-                avatar::show(ui, theme::HEADER_AVATAR_SIZE, &view.user_key, &view.display_name, state.avatars.get(&view.user_key));
+                let is_notes = state.is_notes(&view.user_key);
+                let photo = if is_notes { None } else { state.avatars.get(&view.user_key) };
+                avatar::show(ui, theme::HEADER_AVATAR_SIZE, &view.user_key, &view.display_name, photo);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(egui::RichText::new(&view.display_name).size(16.0).strong());
-                    ui.label(egui::RichText::new("end-to-end encrypted").small().color(theme::MUTED_TEXT));
+                    let subtitle = if is_notes { "visible on all your devices" } else { "end-to-end encrypted" };
+                    ui.label(egui::RichText::new(subtitle).small().color(theme::MUTED_TEXT));
                 });
+                if is_notes {
+                    return;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(&view.fingerprint).monospace().small().color(theme::MUTED_TEXT));
                     ui.label(egui::RichText::new("✔ verified").small().color(theme::ACCENT_LIGHT))

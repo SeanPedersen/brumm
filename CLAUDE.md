@@ -19,6 +19,9 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place),
   emoji reactions (`Payload::Reaction` / own-device `ReactionSync`, one per user and message, last write wins by
   `at_ms`, `reactions` table; schema v6 upgrades v4/v5 in place). Reactions are not part of history sync.
+- **Notes chat done:** the conversation keyed by our own `UserKey` (no contacts row; the UI lists a pseudo-contact "Notes").
+  Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
+  devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning; included in history sync like any conversation.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.

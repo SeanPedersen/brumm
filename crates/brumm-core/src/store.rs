@@ -687,13 +687,14 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Deletes messages (and dedupe records) older than `cutoff_ms`. Returns messages removed.
-    pub fn prune_messages_before(&self, cutoff_ms: u64) -> Result<usize> {
+    /// Deletes messages (and dedupe records) older than `cutoff_ms`, except the `keep` conversation
+    /// (the Notes chat). Returns messages removed.
+    pub fn prune_messages_before(&self, cutoff_ms: u64, keep: &UserKey) -> Result<usize> {
         self.db
             .execute("DELETE FROM seen_ciphertexts WHERE seen_at_ms < ?1", params![cutoff_ms as i64])?;
         let removed = self
             .db
-            .execute("DELETE FROM messages WHERE sent_at_ms < ?1", params![cutoff_ms as i64])?;
+            .execute("DELETE FROM messages WHERE sent_at_ms < ?1 AND contact != ?2", params![cutoff_ms as i64, keep])?;
         self.purge_orphan_reactions()?;
         Ok(removed)
     }
@@ -894,7 +895,7 @@ mod tests {
 
         store.remember_ciphertext(&[1; 32], &id, 5).unwrap();
         assert_eq!(store.seen_ciphertext(&[1; 32]).unwrap(), Some(id));
-        store.prune_messages_before(6).unwrap();
+        store.prune_messages_before(6, &[0; 32]).unwrap();
         assert_eq!(store.seen_ciphertext(&[1; 32]).unwrap(), None);
     }
 
@@ -913,6 +914,7 @@ mod tests {
 
         assert_eq!(store.history_since(150).unwrap().len(), 1);
         assert_eq!(store.conversation(&contact).unwrap().len(), 2);
-        assert_eq!(store.prune_messages_before(150).unwrap(), 1);
+        assert_eq!(store.prune_messages_before(150, &[0; 32]).unwrap(), 1);
+        assert_eq!(store.prune_messages_before(1000, &contact).unwrap(), 0);
     }
 }

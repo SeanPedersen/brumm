@@ -306,7 +306,8 @@ impl Node {
     }
 
     fn prune(&self) -> Result<()> {
-        let removed = self.store.prune_messages_before(crate::clock::now_ms().saturating_sub(RETENTION_MS))?;
+        let Some(me) = &self.me else { return Ok(()) };
+        let removed = self.store.prune_messages_before(crate::clock::now_ms().saturating_sub(RETENTION_MS), &me.user_key())?;
         if removed > 0 {
             tracing::info!(removed, "pruned messages past retention");
         }

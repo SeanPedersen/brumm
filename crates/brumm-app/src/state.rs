@@ -3,12 +3,13 @@
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use brumm_core::{
-    api::{ContactView, DeviceView, Event, MessageView, ProfileView},
+    api::{ContactView, DeviceView, Event, MessageView, ProfileView, Trust},
     identity::UserKey,
     wire::MessageId,
 };
 
 const MAX_VISIBLE_ERRORS: usize = 3;
+const NOTES_NAME: &str = "Notes";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -65,6 +66,28 @@ impl AppState {
         }
     }
 
+    /// The "Notes" chat is the conversation with our own user key.
+    pub fn is_notes(&self, key: &UserKey) -> bool {
+        self.profile.as_ref().is_some_and(|profile| &profile.user_key == key)
+    }
+
+    /// Lists the Notes chat as a pseudo-contact so it appears in the chat list from the start.
+    fn ensure_notes_contact(&mut self) {
+        let Some(profile) = &self.profile else { return };
+        if self.contact(&profile.user_key).is_some() {
+            return;
+        }
+        let notes = ContactView {
+            user_key: profile.user_key,
+            display_name: NOTES_NAME.to_owned(),
+            fingerprint: profile.fingerprint.clone(),
+            trust: Trust::Verified,
+            added_at_ms: 0,
+        };
+        self.stale_conversations.push(notes.user_key);
+        self.contacts.push(notes);
+    }
+
     pub fn contact(&self, key: &UserKey) -> Option<&ContactView> {
         self.contacts.iter().find(|contact| &contact.user_key == key)
     }
@@ -95,10 +118,12 @@ impl AppState {
                 // Chat-list previews and ordering need every conversation's latest message.
                 self.stale_conversations.extend(contacts.iter().map(|contact| contact.user_key));
                 self.contacts = contacts;
+                self.ensure_notes_contact();
             }
             Event::IdentityCreated { profile, seed_phrase } => {
                 self.profile = Some(profile);
                 self.seed_phrase_to_show = seed_phrase;
+                self.ensure_notes_contact();
                 self.link_ticket = None;
             }
             Event::LinkTicket { link } => self.link_ticket = Some(link),

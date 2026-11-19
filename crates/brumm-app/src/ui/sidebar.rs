@@ -179,7 +179,7 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
     }
 
     let avatar_center = egui::pos2(rect.left() + ROW_PADDING + theme::CONTACT_AVATAR_SIZE / 2.0, rect.center().y);
-    avatar::paint(ui, avatar_center, theme::CONTACT_AVATAR_SIZE, &contact.user_key, &contact.display_name, state.avatars.get(&contact.user_key));
+    avatar::paint(ui, avatar_center, theme::CONTACT_AVATAR_SIZE, &contact.user_key, &contact.display_name, notes_aware_avatar(state, &contact.user_key));
 
     let secondary = if selected { theme::MUTED_TEXT_ON_SELECTED } else { theme::MUTED_TEXT };
     let text_left = avatar_center.x + theme::CONTACT_AVATAR_SIZE / 2.0 + ROW_TEXT_GAP;
@@ -202,6 +202,11 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
     paint_clipped(ui, text_left, preview_right, bottom_line_y, &preview, FontId::proportional(PREVIEW_FONT_SIZE), secondary);
 
     response.clicked()
+}
+
+/// Notes show an initial, not our own profile photo.
+fn notes_aware_avatar<'a>(state: &'a AppState, key: &brumm_core::identity::UserKey) -> Option<&'a crate::state::AvatarImage> {
+    if state.is_notes(key) { None } else { state.avatars.get(key) }
 }
 
 fn preview_text(last: Option<&MessageView>) -> String {
