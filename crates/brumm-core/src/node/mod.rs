@@ -217,6 +217,9 @@ impl Node {
         let contacts = self.store.contacts().unwrap_or_default();
         let profile = self.me.as_ref().map(|me| profile_view(&me.profile));
         self.events.emit(Event::Ready { profile, contacts });
+        for (user, image) in self.store.avatars().unwrap_or_default() {
+            self.emit_avatar(&user, &image);
+        }
         self.emit_devices();
         if self.me.as_ref().is_some_and(|me| me.revoked) {
             self.events.emit(Event::DeviceRevoked);

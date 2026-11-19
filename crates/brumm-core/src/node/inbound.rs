@@ -14,7 +14,7 @@ use crate::{
     mailbox::MailboxDelivery,
     identity::{DeviceList, UserKey},
     transport::InboundRequest,
-    wire::{self, ChatMessage, ContactRecord, Envelope, Frame, HistoryItem, Payload, RejectReason, Reply},
+    wire::{self, Avatar, ChatMessage, ContactRecord, Envelope, Frame, HistoryItem, Payload, RejectReason, Reply},
 };
 
 impl Node {
@@ -87,6 +87,9 @@ impl Node {
             (Payload::DeviceList(list), _) => self.receive_device_list(owner, list)?,
             (Payload::SentTranscript { contact, message }, true) => self.receive_transcript(contact, message)?,
             (Payload::ContactSync(record), true) => self.receive_contact_sync(record)?,
+            (Payload::Delete(ids), false) => self.receive_delete(owner, ids)?,
+            (Payload::DeleteSync { contact, ids }, true) => self.receive_delete_sync(contact, ids)?,
+            (Payload::Avatar(avatar), from_own) => self.receive_avatar(owner, avatar, from_own)?,
             (Payload::History(items), true) => self.receive_history(items)?,
             (payload, _) => {
                 tracing::warn!(?payload, from_own_device, "payload not allowed from this sender");
@@ -118,6 +121,42 @@ impl Node {
         if self.store.insert_message(&contact, &message, Direction::Outgoing, DeliveryStatus::Delivered, None)? {
             self.events.emit(Event::MessageAdded(message_view(contact, &message, Direction::Outgoing, DeliveryStatus::Delivered)));
         }
+        Ok(true)
+    }
+
+    /// A contact deletes messages they sent; they cannot touch ours.
+    fn receive_delete(&mut self, contact: UserKey, ids: Vec<wire::MessageId>) -> Result<bool> {
+        if ids.len() > wire::MAX_DELETE_IDS {
+            return Ok(false);
+        }
+        let removed = self.store.delete_messages(&contact, &ids, Some(Direction::Incoming))?;
+        if !removed.is_empty() {
+            self.events.emit(Event::MessagesDeleted { contact, ids: removed });
+        }
+        Ok(true)
+    }
+
+    fn receive_delete_sync(&mut self, contact: UserKey, ids: Vec<wire::MessageId>) -> Result<bool> {
+        if ids.len() > wire::MAX_DELETE_IDS {
+            return Ok(false);
+        }
+        let removed = self.store.delete_messages(&contact, &ids, None)?;
+        if !removed.is_empty() {
+            self.events.emit(Event::MessagesDeleted { contact, ids: removed });
+        }
+        Ok(true)
+    }
+
+    /// Contacts may only set their own photo; our other devices may sync anyone's.
+    fn receive_avatar(&mut self, owner: UserKey, avatar: Avatar, from_own_device: bool) -> Result<bool> {
+        let allowed = avatar.is_valid()
+            && (from_own_device || avatar.subject == owner)
+            && (avatar.subject == self.me()?.user_key() || self.store.contact(&avatar.subject)?.is_some());
+        if !allowed {
+            return Ok(false);
+        }
+        self.store.set_avatar(&avatar.subject, &avatar.image)?;
+        self.emit_avatar(&avatar.subject, &avatar.image);
         Ok(true)
     }
 

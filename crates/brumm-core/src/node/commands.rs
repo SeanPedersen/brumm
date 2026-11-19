@@ -7,7 +7,7 @@ use iroh::SecretKey;
 
 use super::{Me, Node, next_seq, profile_view};
 use crate::{
-    api::{Command, DeliveryStatus, Direction, Event, MessageView},
+    api::{AttachmentView, Command, DeliveryStatus, Direction, Event, MessageView},
     clock::now_ms,
     e2ee::DeviceCrypto,
     identity::{DeviceEntry, Profile, UserIdentity, UserKey, default_device_label, normalize_display_name},
@@ -15,7 +15,7 @@ use crate::{
     mailbox,
     store::StoredIdentity,
     transport::Transport,
-    wire::{Body, ChatMessage, Payload},
+    wire::{Avatar, Body, ChatMessage, MAX_DELETE_IDS, MessageId, Payload},
 };
 
 impl Node {
@@ -38,7 +38,11 @@ impl Node {
                 self.events.emit(Event::Conversation { contact, messages });
                 Ok(())
             }
-            Command::SendText { contact, text } => self.send_text(contact, text),
+            Command::SendText { contact, text } => self.send_text(contact, Body::Text(text.trim().to_owned())),
+            Command::SendFile { contact, name, data } => self.send_text(contact, Body::File { name, data }),
+            Command::DeleteMessages { contact, ids, for_everyone } => self.delete_messages(contact, ids, for_everyone),
+            Command::SetAvatar { image } => self.set_avatar(image),
+            Command::LoadAttachment { contact, id } => self.load_attachment(contact, id),
         }
     }
 
@@ -100,16 +104,13 @@ impl Node {
         Ok(())
     }
 
-    fn send_text(&mut self, contact: UserKey, text: String) -> Result<()> {
+    /// Sends a text or file message to a contact (and a transcript to our other devices).
+    fn send_text(&mut self, contact: UserKey, body: Body) -> Result<()> {
         self.active_me()?;
         self.store.contact(&contact)?.context("unknown contact")?;
-        let message = ChatMessage {
-            id: rand::random(),
-            sent_at_ms: now_ms(),
-            body: Body::Text(text.trim().to_owned()),
-        };
+        let message = ChatMessage { id: rand::random(), sent_at_ms: now_ms(), body };
         if !message.body.is_valid() {
-            bail!("message is empty or too long");
+            bail!("message is empty, too long or the file is too large");
         }
         self.store.insert_message(&contact, &message, Direction::Outgoing, DeliveryStatus::Pending, None)?;
         self.events.emit(Event::MessageAdded(message_view(contact, &message, Direction::Outgoing, DeliveryStatus::Pending)));
@@ -119,13 +120,68 @@ impl Node {
     }
 }
 
+impl Node {
+    fn delete_messages(&mut self, contact: UserKey, ids: Vec<MessageId>, for_everyone: bool) -> Result<()> {
+        self.active_me()?;
+        if ids.is_empty() || ids.len() > MAX_DELETE_IDS {
+            bail!("nothing to delete or too many messages at once");
+        }
+        if for_everyone && !self.store.all_outgoing(&contact, &ids)? {
+            bail!("you can only delete your own messages for everyone");
+        }
+        let removed = self.store.delete_messages(&contact, &ids, None)?;
+        if removed.is_empty() {
+            return Ok(());
+        }
+        self.events.emit(Event::MessagesDeleted { contact, ids: removed.clone() });
+        if for_everyone {
+            self.store.drop_outbox_envelopes(&removed)?;
+            self.enqueue_to_user(&contact, rand::random(), Payload::Delete(removed.clone()), None)?;
+        }
+        self.enqueue_to_own_devices(Payload::DeleteSync { contact, ids: removed })?;
+        self.flush_outbox()
+    }
+
+    fn load_attachment(&mut self, contact: UserKey, id: MessageId) -> Result<()> {
+        if let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? {
+            self.events.emit(Event::Attachment { contact, id, data: Arc::new(data) });
+        }
+        Ok(())
+    }
+
+    /// Stores our new photo and shares it with every contact and our other devices.
+    fn set_avatar(&mut self, image: Vec<u8>) -> Result<()> {
+        let me = self.active_me()?.user_key();
+        let avatar = Avatar { subject: me, image };
+        if !avatar.is_valid() {
+            bail!("profile photo is too large");
+        }
+        self.store.set_avatar(&me, &avatar.image)?;
+        self.emit_avatar(&me, &avatar.image);
+        for contact in self.store.contacts()? {
+            self.enqueue_to_user(&contact.user_key, rand::random(), Payload::Avatar(avatar.clone()), None)?;
+        }
+        self.enqueue_to_own_devices(Payload::Avatar(avatar))?;
+        self.flush_outbox()
+    }
+
+    pub(super) fn emit_avatar(&self, user: &UserKey, image: &[u8]) {
+        let image = (!image.is_empty()).then(|| image.to_vec());
+        self.events.emit(Event::AvatarChanged { user: *user, image });
+    }
+}
+
 pub(super) fn message_view(contact: UserKey, message: &ChatMessage, direction: Direction, status: DeliveryStatus) -> MessageView {
-    let Body::Text(text) = &message.body;
+    let (text, attachment) = match &message.body {
+        Body::Text(text) => (text.clone(), None),
+        Body::File { name, data } => (String::new(), Some(AttachmentView { name: name.clone(), size: data.len() })),
+    };
     MessageView {
         id: message.id,
         contact,
         direction,
-        text: text.clone(),
+        text,
+        attachment,
         sent_at_ms: message.sent_at_ms,
         status,
     }

@@ -10,14 +10,16 @@ use iroh::{EndpointId, SecretKey};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
-    api::{ContactView, DeliveryStatus, Direction, MessageView, Trust},
+    api::{AttachmentView, ContactView, DeliveryStatus, Direction, MessageView, Trust},
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
     crypto::Sealed,
     wire::{self, Body, ChatMessage, EnvelopeId, HistoryItem, InviteSecret, MessageId},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+/// Oldest schema that [`SCHEMA`] upgrades in place (v5 only added the `avatars` table).
+const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -67,6 +69,10 @@ CREATE TABLE IF NOT EXISTS outbox (
     mailboxed     INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (device_id, envelope_id)
+);
+CREATE TABLE IF NOT EXISTS avatars (
+    user_key BLOB PRIMARY KEY,
+    image    BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     hash        BLOB PRIMARY KEY,
@@ -124,7 +130,7 @@ impl Store {
         if version > SCHEMA_VERSION {
             bail!("database schema v{version} is newer than this brumm build");
         }
-        if version != 0 && version < SCHEMA_VERSION {
+        if version != 0 && version < MIN_UPGRADABLE_SCHEMA_VERSION {
             bail!("this profile was created by an incompatible pre-release build (schema v{version}); delete its data folder to start fresh");
         }
         db.execute_batch(SCHEMA)?;
@@ -546,6 +552,87 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Removes messages of one conversation; `only` restricts it to one direction (a contact may
+    /// only delete what they sent). Returns the ids that were actually removed.
+    pub fn delete_messages(&self, contact: &UserKey, ids: &[MessageId], only: Option<Direction>) -> Result<Vec<MessageId>> {
+        let mut removed = Vec::new();
+        for id in ids {
+            let deleted = match only {
+                Some(direction) => self.db.execute(
+                    "DELETE FROM messages WHERE contact = ?1 AND id = ?2 AND direction = ?3",
+                    params![contact.as_slice(), id.as_slice(), direction_code(direction)],
+                )?,
+                None => self.db.execute(
+                    "DELETE FROM messages WHERE contact = ?1 AND id = ?2",
+                    params![contact.as_slice(), id.as_slice()],
+                )?,
+            };
+            if deleted == 1 {
+                removed.push(*id);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// True iff every id is a stored outgoing message of this conversation.
+    pub fn all_outgoing(&self, contact: &UserKey, ids: &[MessageId]) -> Result<bool> {
+        for id in ids {
+            let direction: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT direction FROM messages WHERE contact = ?1 AND id = ?2",
+                    params![contact.as_slice(), id.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if direction.map(direction_from_code) != Some(Direction::Outgoing) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Drops queued envelopes whose id equals a deleted message id (unsent copies).
+    pub fn drop_outbox_envelopes(&self, ids: &[MessageId]) -> Result<()> {
+        for id in ids {
+            self.db.execute("DELETE FROM outbox WHERE envelope_id = ?1", params![id.as_slice()])?;
+        }
+        Ok(())
+    }
+
+    pub fn message_body(&self, contact: &UserKey, id: &MessageId) -> Result<Option<Body>> {
+        let blob: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT body FROM messages WHERE contact = ?1 AND id = ?2",
+                params![contact.as_slice(), id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(blob.map(|blob| wire::decode(&blob)).transpose()?)
+    }
+
+    // ── avatars ─────────────────────────────────────────────────────────────
+
+    /// Empty `image` removes the avatar.
+    pub fn set_avatar(&self, user: &UserKey, image: &[u8]) -> Result<()> {
+        if image.is_empty() {
+            self.db.execute("DELETE FROM avatars WHERE user_key = ?1", params![user.as_slice()])?;
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT OR REPLACE INTO avatars (user_key, image) VALUES (?1, ?2)",
+            params![user.as_slice(), image],
+        )?;
+        Ok(())
+    }
+
+    pub fn avatars(&self) -> Result<Vec<(UserKey, Vec<u8>)>> {
+        let mut stmt = self.db.prepare("SELECT user_key, image FROM avatars")?;
+        let rows = stmt.query_map([], |row| Ok((blob_array(row, 0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Deletes messages (and dedupe records) older than `cutoff_ms`. Returns messages removed.
     pub fn prune_messages_before(&self, cutoff_ms: u64) -> Result<usize> {
         self.db
@@ -606,12 +693,16 @@ fn contact_from_row(row: &rusqlite::Row) -> rusqlite::Result<ContactView> {
 }
 
 fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
-    let Body::Text(text) = body_from_blob(row, 3)?;
+    let (text, attachment) = match body_from_blob(row, 3)? {
+        Body::Text(text) => (text, None),
+        Body::File { name, data } => (String::new(), Some(AttachmentView { name, size: data.len() })),
+    };
     Ok(MessageView {
         contact: blob_array(row, 0)?,
         id: blob_array(row, 1)?,
         direction: direction_from_code(row.get(2)?),
         text,
+        attachment,
         sent_at_ms: row.get::<_, i64>(4)? as u64,
         status: status_from_code(row.get(5)?),
     })

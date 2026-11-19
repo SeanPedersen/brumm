@@ -10,9 +10,9 @@ use crate::{
     api::{Event, Trust},
     clock::now_ms,
     crypto::{self, Sealed},
-    identity::Profile,
+    identity::{Profile, UserKey},
     invite::Invite,
-    wire::{self, ContactRecord, Frame, InviteSecret, Payload, RejectReason, Reply},
+    wire::{self, Avatar, ContactRecord, Frame, InviteSecret, Payload, RejectReason, Reply},
 };
 
 impl Node {
@@ -57,6 +57,7 @@ impl Node {
         self.add_contact(&profile)?;
         let Self { store, me, .. } = self;
         me.as_mut().context("no identity")?.crypto.adopt(store, device, session)?;
+        self.send_own_avatar_to(&profile.user_key())?;
         self.flush_outbox()
     }
 
@@ -82,8 +83,18 @@ impl Node {
         let ack = crypto::seal(&mut session, &wire::encode(&me.profile))?;
         me.crypto.adopt(store, from, session)?;
         self.add_contact(&profile)?;
+        self.send_own_avatar_to(&profile.user_key())?;
         self.flush_outbox()?;
         Ok(Reply::HelloAck { sealed: ack })
+    }
+
+    /// A new contact has no photo of ours yet.
+    fn send_own_avatar_to(&mut self, contact: &UserKey) -> Result<()> {
+        let me = self.me()?.user_key();
+        let Some((_, image)) = self.store.avatars()?.into_iter().find(|(user, _)| *user == me) else {
+            return Ok(());
+        };
+        self.enqueue_to_user(contact, rand::random(), Payload::Avatar(Avatar { subject: me, image }), None)
     }
 
     /// Stores a verified contact, tells the UI and syncs it to our other devices.

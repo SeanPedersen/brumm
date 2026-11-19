@@ -20,6 +20,7 @@ pub struct BrummApp {
 impl BrummApp {
     pub fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf) -> Self {
         ui::theme::apply(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         Self {
             core: CoreBridge::start(data_dir, cc.egui_ctx.clone()),
             state: AppState::default(),

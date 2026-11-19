@@ -20,6 +20,13 @@ pub enum Command {
     RemoveDevice { device_id: DeviceId },
     LoadConversation { contact: UserKey },
     SendText { contact: UserKey, text: String },
+    SendFile { contact: UserKey, name: String, data: Vec<u8> },
+    /// `for_everyone` additionally asks the contact's devices to remove our own messages.
+    DeleteMessages { contact: UserKey, ids: Vec<MessageId>, for_everyone: bool },
+    /// Replaces our profile photo (empty `image` removes it) and shares it with contacts.
+    SetAvatar { image: Vec<u8> },
+    /// Fetches the bytes of a file message; answered with [`Event::Attachment`].
+    LoadAttachment { contact: UserKey, id: MessageId },
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +60,10 @@ pub enum Event {
         id: MessageId,
         status: DeliveryStatus,
     },
+    MessagesDeleted { contact: UserKey, ids: Vec<MessageId> },
+    /// A profile photo changed (own or a contact's); `None` means it was removed.
+    AvatarChanged { user: UserKey, image: Option<Vec<u8>> },
+    Attachment { contact: UserKey, id: MessageId, data: Arc<Vec<u8>> },
     Error(String),
 }
 
@@ -87,9 +98,18 @@ pub struct MessageView {
     pub id: MessageId,
     pub contact: UserKey,
     pub direction: Direction,
+    /// Empty for file messages.
     pub text: String,
+    pub attachment: Option<AttachmentView>,
     pub sent_at_ms: u64,
     pub status: DeliveryStatus,
+}
+
+/// Metadata of a file message; the bytes are fetched on demand with `Command::LoadAttachment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentView {
+    pub name: String,
+    pub size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

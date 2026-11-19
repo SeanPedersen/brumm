@@ -18,7 +18,7 @@ use crate::{
     mailbox,
     store::StoredIdentity,
     transport::Transport,
-    wire::{self, ContactRecord, Envelope, Frame, LinkSecret, Payload, RejectReason, Reply, chunk_history},
+    wire::{self, Avatar, ContactRecord, Envelope, Frame, LinkSecret, Payload, RejectReason, Reply, chunk_history},
 };
 
 impl Node {
@@ -167,6 +167,9 @@ impl Node {
                 let record = ContactRecord { profile, added_at_ms: contact.added_at_ms };
                 self.enqueue_to_device(entry, Payload::ContactSync(record))?;
             }
+        }
+        for (subject, image) in self.store.avatars()? {
+            self.enqueue_to_device(entry, Payload::Avatar(Avatar { subject, image }))?;
         }
         let history = self.store.history_since(now_ms().saturating_sub(RETENTION_MS))?;
         for chunk in chunk_history(history) {

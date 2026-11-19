@@ -1,6 +1,6 @@
 //! One-time modal that shows the freshly generated seed phrase for backup.
 
-use crate::state::AppState;
+use crate::{state::AppState, ui::theme};
 
 const WORDS_PER_ROW: usize = 4;
 
@@ -20,7 +20,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
         ui.add_space(8.0);
-        acknowledged = ui.button("I have written it down").clicked();
+        acknowledged = ui.add(theme::primary_button("I have written it down")).clicked();
     });
     if acknowledged {
         state.seed_phrase_to_show = None;

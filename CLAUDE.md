@@ -14,6 +14,9 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **M3 mailbox done:** offline delivery via **public Nostr relays** (no own server). Unreachable
   device → the outbox ciphertext is posted once as a NIP-44 letter to its inbox key → status Sent ✔ →
   the recipient answers with `Payload::Receipt` → Delivered ✔✔.
+- **Rich messages done:** inline files (`Body::File`, ≤ 1 MiB, one sealed envelope; > mailbox letter limit
+  is only delivered while both are online), "delete for everyone" (`Payload::Delete` / own-device `DeleteSync`),
+  profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place).
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **UX rule: no passphrase or unlock screens** (Telegram-like). DB-at-rest encryption will come via an
   OS-keychain-held SQLCipher key (M5), never a prompt.
@@ -51,6 +54,13 @@ crates/brumm-app/         eframe binary `brumm`
   src/state.rs            AppState, mutated only via apply(Event)
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
+                          Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
+                          avatar.rs (initials circles), sidebar.rs (search, chat list sorted by last
+                          activity, unread badges), chat.rs (hand-painted bubbles with inline time/ticks,
+                          grouping, day pills, pill composer), time_fmt.rs (jiff 1.0 local time)
+                          bubble.rs (text/image/file-card bubble + selection chrome + context menu),
+                          composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
+                          cursor), files.rs (rfd dialogs on threads, avatar shrink to JPEG, size limits)
 ```
 
 ## Conventions

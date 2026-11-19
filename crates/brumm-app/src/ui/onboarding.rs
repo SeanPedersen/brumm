@@ -38,7 +38,7 @@ pub fn show(ui: &mut egui::Ui, view: &mut OnboardingView, link_ticket: Option<&s
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading(egui::RichText::new("brumm").size(48.0).color(theme::ACCENT));
+                ui.heading(egui::RichText::new("brumm").size(48.0).strong().color(theme::ACCENT_LIGHT));
                 ui.label(egui::RichText::new("no phone number · no servers · just you").color(theme::MUTED_TEXT));
                 ui.add_space(24.0);
                 ui.allocate_ui(egui::vec2(FORM_WIDTH, 0.0), |ui| {
@@ -79,7 +79,7 @@ fn identity_form(ui: &mut egui::Ui, view: &mut OnboardingView, commands: &mut Ve
     ui.add_space(8.0);
     let ready = !view.display_name.trim().is_empty() && (!restore || !view.seed_phrase.trim().is_empty());
     let label = if restore { "Restore identity" } else { "Let's go" };
-    let button = ui.add_enabled(ready && !view.submitted, egui::Button::new(label).min_size(egui::vec2(FORM_WIDTH, 32.0)));
+    let button = ui.add_enabled(ready && !view.submitted, theme::primary_button(label).min_size(egui::vec2(FORM_WIDTH, 40.0)));
     if button.clicked() {
         view.submitted = true;
         let display_name = view.display_name.trim().to_owned();

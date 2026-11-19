@@ -43,7 +43,7 @@ fn device_list(ui: &mut egui::Ui, state: &AppState, view: &mut DevicesView, comm
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if view.confirm_remove == Some(device.device_id) {
-                    if ui.button("Yes, remove").clicked() {
+                    if ui.button(egui::RichText::new("Yes, remove").color(theme::DANGER)).clicked() {
                         commands.push(Command::RemoveDevice { device_id: device.device_id });
                         view.confirm_remove = None;
                     }
@@ -63,7 +63,7 @@ fn link_section(ui: &mut egui::Ui, view: &mut DevicesView, commands: &mut Vec<Co
     ui.label(egui::RichText::new("On the new device choose “I use brumm on another device” and paste its link here. It gets your contacts and the last 60 days of chats.").small().color(theme::MUTED_TEXT));
     ui.add(egui::TextEdit::singleline(&mut view.pasted_link).hint_text("brumm://link/…").desired_width(f32::INFINITY));
     let can_link = view.pasted_link.trim().starts_with("brumm://link/");
-    if ui.add_enabled(can_link, egui::Button::new("Link device")).clicked() {
+    if ui.add_enabled(can_link, theme::primary_button("Link device")).clicked() {
         commands.push(Command::LinkDevice { link: std::mem::take(&mut view.pasted_link) });
     }
 }

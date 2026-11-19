@@ -1,10 +1,11 @@
 //! UI-side mirror of core state, updated only by applying core [`Event`]s.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use brumm_core::{
     api::{ContactView, DeviceView, Event, MessageView, ProfileView},
     identity::UserKey,
+    wire::MessageId,
 };
 
 const MAX_VISIBLE_ERRORS: usize = 3;
@@ -17,8 +18,24 @@ pub enum Phase {
     Revoked,
 }
 
+/// A profile photo ready for `egui::Image`; the uri changes whenever the bytes do.
+#[derive(Clone)]
+pub struct AvatarImage {
+    pub uri: String,
+    pub bytes: Arc<[u8]>,
+}
+
+/// Bytes of a file message, fetched on demand, plus the pixel size if it is an image.
+#[derive(Clone)]
+pub struct LoadedAttachment {
+    pub bytes: Arc<[u8]>,
+    pub image_size: Option<(u32, u32)>,
+}
+
 #[derive(Default)]
 pub struct AppState {
+    pub avatars: HashMap<UserKey, AvatarImage>,
+    pub attachments: HashMap<(UserKey, MessageId), LoadedAttachment>,
     pub ready: bool,
     pub profile: Option<ProfileView>,
     pub contacts: Vec<ContactView>,
@@ -75,6 +92,8 @@ impl AppState {
             Event::Ready { profile, contacts } => {
                 self.ready = true;
                 self.profile = profile;
+                // Chat-list previews and ordering need every conversation's latest message.
+                self.stale_conversations.extend(contacts.iter().map(|contact| contact.user_key));
                 self.contacts = contacts;
             }
             Event::IdentityCreated { profile, seed_phrase } => {
@@ -107,6 +126,31 @@ impl AppState {
                     message.status = status;
                 }
             }
+            Event::MessagesDeleted { contact, ids } => {
+                if let Some(messages) = self.conversations.get_mut(&contact) {
+                    messages.retain(|message| !ids.contains(&message.id));
+                }
+                for id in &ids {
+                    self.attachments.remove(&(contact, *id));
+                }
+            }
+            Event::AvatarChanged { user, image } => match image {
+                Some(bytes) => {
+                    let uri = format!("bytes://avatar/{}-{}", hex_prefix(&user), checksum(&bytes));
+                    self.avatars.insert(user, AvatarImage { uri, bytes: bytes.into() });
+                }
+                None => {
+                    self.avatars.remove(&user);
+                }
+            },
+            Event::Attachment { contact, id, data } => {
+                let image_size = image::ImageReader::new(Cursor::new(data.as_slice()))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|reader| reader.into_dimensions().ok());
+                let bytes: Arc<[u8]> = data.as_slice().into();
+                self.attachments.insert((contact, id), LoadedAttachment { bytes, image_size });
+            }
             Event::Error(error) => {
                 self.connecting = false;
                 self.errors.push(error);
@@ -115,4 +159,17 @@ impl AppState {
             }
         }
     }
+}
+
+const HEX_PREFIX_BYTES: usize = 4;
+
+fn hex_prefix(key: &UserKey) -> String {
+    key[..HEX_PREFIX_BYTES].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Cheap content fingerprint (FNV-1a) so a changed photo gets a fresh image-cache uri.
+fn checksum(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    bytes.iter().fold(FNV_OFFSET, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME))
 }

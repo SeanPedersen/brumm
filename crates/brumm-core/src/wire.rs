@@ -11,8 +11,16 @@ use crate::{
 };
 
 pub const ALPN: &[u8] = b"brumm/3";
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Largest sealed frame. Sized for a maximal file plus Olm and framing overhead.
+pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Files travel inline in one sealed envelope (larger transfers wait for iroh-blobs, M4).
+/// Anything above the mailbox letter limit is only delivered while both devices are online.
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_FILE_NAME_CHARS: usize = 255;
+/// Small enough to also fit into a Nostr mailbox letter.
+pub const MAX_AVATAR_BYTES: usize = 24 * 1024;
+pub const MAX_DELETE_IDS: usize = 256;
 /// Plaintext budget per history chunk, leaving room for Olm + framing overhead.
 pub const HISTORY_CHUNK_BYTES: usize = 32 * 1024;
 
@@ -69,6 +77,26 @@ pub enum Payload {
     History(Vec<HistoryItem>),
     /// "I processed these envelopes" — the ack for envelopes that arrived via the mailbox.
     Receipt(Vec<EnvelopeId>),
+    /// The sender's user deleted these messages they had sent ("delete for everyone").
+    Delete(Vec<MessageId>),
+    /// Own-device sync: remove these messages from the conversation with `contact`.
+    DeleteSync { contact: UserKey, ids: Vec<MessageId> },
+    /// A profile photo. From a contact it must describe the contact itself; own devices also
+    /// use it to sync contacts' photos to a freshly linked device.
+    Avatar(Avatar),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Avatar {
+    pub subject: UserKey,
+    /// Encoded image (PNG/JPEG/WebP); empty removes the photo.
+    pub image: Vec<u8>,
+}
+
+impl Avatar {
+    pub fn is_valid(&self) -> bool {
+        self.image.len() <= MAX_AVATAR_BYTES
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,12 +109,19 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Body {
     Text(String),
+    File { name: String, data: Vec<u8> },
 }
 
 impl Body {
     pub fn is_valid(&self) -> bool {
         match self {
             Body::Text(text) => !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES,
+            Body::File { name, data } => {
+                !name.trim().is_empty()
+                    && name.chars().count() <= MAX_FILE_NAME_CHARS
+                    && !data.is_empty()
+                    && data.len() <= MAX_FILE_BYTES
+            }
         }
     }
 }
