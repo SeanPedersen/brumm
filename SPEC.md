@@ -209,7 +209,29 @@ unreachable → also post the same ciphertext once to the device's Nostr mailbox
   can't decrypt a pre-key message from the peer's *certified* Olm key, a new inbound session replaces it.
 - Account and session pickles are encrypted with `pickle_key = blake3::derive_key(ctx, device_secret)`.
 - iroh QUIC/TLS (authenticated by `DK`) is a second, transport-level layer.
-- [later] Groups: MLS (openmls) with commit ordering by the group's mailbox, or Megolm-style sender keys.
+- [later] Groups: MLS (openmls) with commit ordering by the group's mailbox. **Not Megolm** (see §7.1).
+
+### 7.1 Crypto trust assumptions (relation to Matrix)
+vodozemac is Matrix's Olm implementation, so Matrix's E2EE criticism needs a precise answer.
+- **Used:** only pairwise Olm (Double Ratchet: forward secrecy + post-compromise security per chain).
+  vodozemac is a small, pure crypto library (no network or room logic) and had an external audit (Least Authority, 2022).
+- **Not used:** Megolm (weak group forward secrecy and recovery after compromise), Matrix cross-signing,
+  server-mediated device lists, key backup and key requests, homeservers. The published attacks on Matrix
+  (e.g. "Practically-exploitable Cryptographic Vulnerabilities in Matrix", 2023) target that protocol and client-SDK
+  layer, not the Olm primitive. No server can lie about key ownership here: identity is the seed-derived `UK`
+  signing the `DeviceList`.
+- **Residual risks (ours):**
+  1. The glue code around the ratchet is brumm's own and **unaudited**: device certs, `DeviceList` signing and
+     `seq` rollback, invite/link one-time keys, fallback-key sessions, own-device-only payload rejection,
+     revocation. Matrix's failures were in exactly this layer.
+  2. **No post-quantum protection** (no PQXDH-style handshake in Olm): recorded traffic is decryptable by a
+     future quantum attacker. Not a v0.1 goal; revisit if the threat model grows.
+  3. **Upstream dependency:** vodozemac is maintained by the Matrix team. Keep the `crypto.rs` wrapper thin so the
+     library can be swapped.
+  4. **Groups:** use MLS (openmls), never Megolm. MLS tooling is still maturing (see arewemlsyet.com).
+- **Planned:** review the identity-binding and revocation paths against the attack classes in the Matrix paper
+  (impersonation via unauthenticated key sharing, device-list manipulation), then an external audit before any
+  claim beyond "private chat for individuals".
 
 ---
 
@@ -266,7 +288,8 @@ and `relay.primal.net` (each device publishes its own list, max 3).
 | Holder of your `UK_pub` | your home relay, device count, online-ish (record refresh) | IPs, contacts, content |
 | Stolen unlocked device | everything on it, the `UK` (revoke via other device) | — |
 
-Out of scope for v0.1: global passive adversaries, traffic analysis, compromised OS.
+Out of scope for v0.1: global passive adversaries, traffic analysis, compromised OS, quantum adversaries
+(harvest-now-decrypt-later), national-security-grade assurance. See §7.1.
 
 ---
 
