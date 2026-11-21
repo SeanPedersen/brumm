@@ -192,7 +192,16 @@ cargo clippy -p brumm-app -p brumm-worker --target wasm32-unknown-unknown
 cargo run -- --profile alice                 # separate data dir per profile
 cargo run -- --profile bob                   # 2nd instance to chat locally
 scripts/install-desktop.sh [binary]          # user-level desktop entry + hicolor icon + ~/.local/bin/brumm
+deploy/deploy.sh                             # web client: trunk --release, rsync, docker compose on the host
 ```
+**Web deploy** (`deploy/`): a static Caddy container (`docker-compose.yml`, `Caddyfile`) joins an
+existing Docker network behind a TLS-terminating proxy/tunnel; no host port. Host, directory,
+network and URL live only in the gitignored `deploy/.env` (template: `.env.example`). The repo
+is public: never commit host names, paths or keys. Caching: trunk-hashed assets are immutable,
+`index.html` and the fixed-name worker files are revalidated (`no-store` for the worker `.js`,
+since Cloudflare rewrites `no-cache` on `.js`), so a new UI never meets an old worker.
+`index.html` passes Rust's default wasm features to `wasm-opt` (`data-wasm-opt-params`);
+without them it rejects the bulk-memory ops that current rustc emits.
 Data dir: `~/.local/share/brumm/profiles/<profile>/` (Linux): `brumm.db`, `window-size`.
 
 ## Stack

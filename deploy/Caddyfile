@@ -1,0 +1,33 @@
+# Static server for the brumm web client, behind a reverse proxy or tunnel
+# that terminates TLS (plain HTTP inside the Docker network).
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	root * /srv/brumm
+	encode zstd gzip
+
+	# Trunk hashes the app's asset names: cache those forever. The worker files keep fixed
+	# names, so they (and index.html) are revalidated on every load; a cached old worker
+	# must never meet a new UI.
+	@hashed path_regexp hashed -[0-9a-f]{12,20}(_bg)?\.(js|wasm|css|png)$
+	@unhashed not path_regexp unhashed -[0-9a-f]{12,20}(_bg)?\.(js|wasm|css|png)$
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	header @unhashed Cache-Control "no-cache"
+	# Cloudflare replaces no-cache on .js with its own browser TTL, but keeps no-store.
+	@unhashed_js {
+		not path_regexp unhashed_js -[0-9a-f]{12,20}\.js$
+		path *.js
+	}
+	header @unhashed_js Cache-Control "no-store"
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+
+	respond /health 200
+	file_server
+}

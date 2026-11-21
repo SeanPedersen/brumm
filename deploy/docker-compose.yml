@@ -1,0 +1,19 @@
+# brumm web client: a static file server (the client itself talks to iroh and Nostr relays).
+# No host port is published. It joins an existing Docker network on which a reverse proxy or
+# tunnel reaches it as http://${EDGE_ALIAS}:80. Settings come from deploy/.env.
+services:
+  web:
+    image: docker.io/library/caddy:2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web-dist:/srv/brumm:ro
+    networks:
+      edge:
+        aliases:
+          - ${EDGE_ALIAS:-brumm-web}
+
+networks:
+  edge:
+    external: true
+    name: ${EDGE_NETWORK:?set EDGE_NETWORK in .env}
