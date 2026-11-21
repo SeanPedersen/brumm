@@ -32,6 +32,16 @@ pub enum Picked {
         id: MessageId,
         path: PathBuf,
     },
+    /// A file dropped in the browser, read asynchronously (there is no path to open).
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    Dropped {
+        contact: UserKey,
+        name: String,
+        data: Vec<u8>,
+    },
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    /// The browser build has no file dialogs yet; files arrive by drag & drop or paste there.
+    Unavailable(&'static str),
 }
 
 pub struct FileDialogs {
@@ -49,19 +59,14 @@ impl Default for FileDialogs {
 impl FileDialogs {
     pub fn pick_attachment(&self, ctx: &egui::Context, contact: UserKey) {
         self.spawn(ctx, move || {
-            rfd::FileDialog::new()
-                .set_title("Send file")
-                .pick_file()
+            native_dialog::pick_file("Send file", None)
                 .map(|path| Picked::Attachment { contact, path })
         });
     }
 
     pub fn pick_avatar(&self, ctx: &egui::Context) {
         self.spawn(ctx, || {
-            rfd::FileDialog::new()
-                .set_title("Choose a profile photo")
-                .add_filter("Images", &IMAGE_EXTENSIONS)
-                .pick_file()
+            native_dialog::pick_file("Choose a profile photo", Some(&IMAGE_EXTENSIONS))
                 .map(Picked::Avatar)
         });
     }
@@ -74,11 +79,51 @@ impl FileDialogs {
         file_name: String,
     ) {
         self.spawn(ctx, move || {
-            rfd::FileDialog::new()
-                .set_title("Save file")
-                .set_file_name(file_name)
-                .save_file()
-                .map(|path| Picked::SaveAs { contact, id, path })
+            native_dialog::save_file("Save file", file_name).map(|path| Picked::SaveAs {
+                contact,
+                id,
+                path,
+            })
+        });
+    }
+
+    /// A file dropped on the window. Natively it is opened by path later; in the browser its
+    /// bytes are read in the background and arrive through [`Self::poll`].
+    #[cfg(not(target_family = "wasm"))]
+    pub fn take_dropped(
+        &self,
+        _ctx: &egui::Context,
+        contact: UserKey,
+        file: std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
+        picked: &mut Vec<Picked>,
+    ) {
+        picked.push(Picked::Attachment {
+            contact,
+            path: file.path().to_path_buf(),
+        });
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn take_dropped(
+        &self,
+        ctx: &egui::Context,
+        contact: UserKey,
+        file: std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
+        _picked: &mut Vec<Picked>,
+    ) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let name = file.path().to_string_lossy().into_owned();
+            let picked = match file.bytes_async().await {
+                Ok(data) => Picked::Dropped {
+                    contact,
+                    name,
+                    data,
+                },
+                Err(_) => Picked::Unavailable("the browser could not read the dropped file"),
+            };
+            let _ = tx.send(picked);
+            ctx.request_repaint();
         });
     }
 
@@ -86,6 +131,7 @@ impl FileDialogs {
         self.rx.try_iter().collect()
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn spawn(&self, ctx: &egui::Context, dialog: impl FnOnce() -> Option<Picked> + Send + 'static) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
@@ -94,6 +140,53 @@ impl FileDialogs {
                 ctx.request_repaint();
             }
         });
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn spawn(
+        &self,
+        ctx: &egui::Context,
+        _dialog: impl FnOnce() -> Option<Picked> + Send + 'static,
+    ) {
+        let _ = self.tx.send(Picked::Unavailable(
+            "file dialogs are not available in the browser yet; drop the file on the chat instead",
+        ));
+        ctx.request_repaint();
+    }
+}
+
+/// rfd's blocking dialogs, called on helper threads.
+#[cfg(not(target_family = "wasm"))]
+mod native_dialog {
+    use std::path::PathBuf;
+
+    pub fn pick_file(title: &str, extensions: Option<&[&str]>) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some(extensions) = extensions {
+            dialog = dialog.add_filter("Images", extensions);
+        }
+        dialog.pick_file()
+    }
+
+    pub fn save_file(title: &str, file_name: String) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_title(title)
+            .set_file_name(file_name)
+            .save_file()
+    }
+}
+
+/// Never called: the wasm `FileDialogs::spawn` drops the dialog closure unrun.
+#[cfg(target_family = "wasm")]
+mod native_dialog {
+    use std::path::PathBuf;
+
+    pub fn pick_file(_title: &str, _extensions: Option<&[&str]>) -> Option<PathBuf> {
+        None
+    }
+
+    pub fn save_file(_title: &str, _file_name: String) -> Option<PathBuf> {
+        None
     }
 }
 
@@ -138,19 +231,53 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>), String> {
     Ok((name, data))
 }
 
+/// A file the browser handed over as bytes (drag & drop). Same limits as [`read_attachment`].
+pub fn attachment_from_dropped(name: String, bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
+    let name = if name.is_empty() {
+        "file".to_owned()
+    } else {
+        name
+    };
+    if bytes.len() <= MAX_FILE_BYTES {
+        return Ok((name, bytes.to_vec()));
+    }
+    if !is_image_name(&name) {
+        return Err(format!(
+            "file is too large (limit {})",
+            format_size(MAX_FILE_BYTES)
+        ));
+    }
+    let source =
+        image::load_from_memory(bytes).map_err(|err| format!("cannot open image: {err}"))?;
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("image");
+    shrink_to_fit(&source, stem)
+}
+
 /// What a Ctrl+V found on the clipboard that egui itself cannot see.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub enum ClipboardItem {
     File(PathBuf),
     /// Encoded image bytes (PNG).
     Image(Vec<u8>),
 }
 
+#[cfg(not(target_family = "wasm"))]
 const URI_LIST_MIME: &str = "text/uri-list";
+#[cfg(not(target_family = "wasm"))]
 const PNG_MIME: &str = "image/png";
 const FILE_URI_PREFIX: &str = "file://";
 
 /// Files copied in a file manager or an image copied as PNG. On Wayland the compositor may offer no
 /// data-control protocol (KDE), which arboard needs, so `wl-paste` is asked first there.
+#[cfg(target_family = "wasm")]
+pub fn clipboard_items() -> Vec<ClipboardItem> {
+    Vec::new()
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub fn clipboard_items() -> Vec<ClipboardItem> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return wl_paste_items();
@@ -161,6 +288,7 @@ pub fn clipboard_items() -> Vec<ClipboardItem> {
     files.into_iter().map(ClipboardItem::File).collect()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn wl_paste_items() -> Vec<ClipboardItem> {
     if let Some(list) = wl_paste(URI_LIST_MIME) {
         let files: Vec<_> = String::from_utf8_lossy(&list)
@@ -178,6 +306,7 @@ fn wl_paste_items() -> Vec<ClipboardItem> {
         .collect()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn wl_paste(mime: &str) -> Option<Vec<u8>> {
     let output = std::process::Command::new("wl-paste")
         .args(["--no-newline", "--type", mime])
@@ -189,6 +318,7 @@ fn wl_paste(mime: &str) -> Option<Vec<u8>> {
 }
 
 /// `file:///a/b%20c.png` -> `/a/b c.png`; comments and other schemes yield `None`.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn path_from_uri(line: &str) -> Option<PathBuf> {
     let encoded = line.trim().strip_prefix(FILE_URI_PREFIX)?;
     let mut bytes = Vec::with_capacity(encoded.len());

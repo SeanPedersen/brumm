@@ -132,7 +132,7 @@ impl Mailbox {
             .await
             .context("subscribe to inbox")?;
 
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             use nostr_sdk::prelude::StreamExt;
             while let Some(notification) = notifications.next().await {
                 let ClientNotification::Event { event, .. } = notification else {

@@ -186,7 +186,7 @@ impl Node {
             },
         );
         let outcomes = self.outcomes_tx.clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             let reply = transport.request(ticket.device_addr, &frame).await;
             let _ = outcomes.send(Outcome::Link {
                 device: new_device,
@@ -279,7 +279,7 @@ impl Node {
         let sealed = me.crypto.seal(store, entry, &wire::encode(&envelope))?;
         let transport = me.transport.clone();
         let device = entry.device_id();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             if let Err(err) = transport.request(device, &Frame::Sealed(sealed)).await {
                 tracing::info!(%device, ?err, "removed device not reachable; it will stay unaware");
             }

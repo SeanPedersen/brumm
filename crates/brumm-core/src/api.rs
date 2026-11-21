@@ -1,13 +1,16 @@
 //! Public boundary between the core and any UI: commands in, events out.
 //! Views are plain data so a UI can mirror state without touching storage or networking.
+//! Commands and events are serde types: the browser build moves them between the UI thread and
+//! the Web Worker that runs the core.
 
 use std::{path::PathBuf, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{identity::UserKey, wire::MessageId};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     CreateIdentity {
         display_name: String,
@@ -86,7 +89,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     /// First event after start. `profile` is `None` until an identity exists.
     Ready {
@@ -162,7 +165,7 @@ pub enum Event {
     Error(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileView {
     pub user_key: UserKey,
     pub display_name: String,
@@ -171,7 +174,7 @@ pub struct ProfileView {
 
 pub type DeviceId = [u8; 32];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceView {
     pub device_id: DeviceId,
     pub label: String,
@@ -179,7 +182,7 @@ pub struct DeviceView {
     pub this_device: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactView {
     pub user_key: UserKey,
     pub display_name: String,
@@ -188,7 +191,7 @@ pub struct ContactView {
     pub added_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageView {
     pub id: MessageId,
     pub contact: UserKey,
@@ -202,14 +205,14 @@ pub struct MessageView {
 }
 
 /// Latest message of one conversation, used for the chat list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationPreview {
     pub contact: UserKey,
     pub last: Option<MessageView>,
 }
 
 /// Who reacted with what; each user has at most one reaction per message.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionsView {
     pub mine: Option<String>,
     pub theirs: Option<String>,
@@ -218,25 +221,25 @@ pub struct ReactionsView {
 /// Metadata of a file message. A preview is fetched with `Command::LoadAttachment`.
 /// Saving the original uses `Command::SaveAttachment`, which reads the database and does not
 /// keep the bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentView {
     pub name: String,
     pub size: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trust {
     /// Keys exchanged in person or via invite link.
     Verified,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Incoming,
     Outgoing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryStatus {
     /// Not yet accepted anywhere.
     Pending,
@@ -267,4 +270,22 @@ impl EventSink {
             (self.wake)();
         }
     }
+}
+
+/// Browser build: what the UI thread posts to the Web Worker that runs the core.
+/// Messages are postcard bytes; the worker answers with [`FromWorker`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToWorker {
+    /// Opens the profile's database and starts the node. Sent once, after [`FromWorker::Listening`].
+    Start {
+        profile: String,
+    },
+    Command(Command),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FromWorker {
+    /// The worker installed its message handler. Anything posted earlier would have been dropped.
+    Listening,
+    Event(Event),
 }

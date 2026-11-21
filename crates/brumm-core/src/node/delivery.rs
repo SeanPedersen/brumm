@@ -191,7 +191,7 @@ impl Node {
         }
         let from = me.device_id;
         let outcomes = self.outcomes_tx.clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             let result = mailbox.post(&entry.mailbox, from, item.sealed).await;
             let _ = outcomes.send(Outcome::Mailboxed {
                 device,

@@ -5,6 +5,8 @@ use brumm_core::api::Command;
 
 use crate::ui::{qr::QrCache, theme};
 
+/// The core gives up after 30 s for the endpoint plus 30 s for the relay; offer a retry after.
+const LINK_RETRY_AFTER_S: f64 = 62.0;
 const FORM_WIDTH: f32 = 380.0;
 const QR_SIZE: f32 = 220.0;
 
@@ -23,6 +25,8 @@ pub struct OnboardingView {
     seed_phrase: String,
     submitted: bool,
     linking_requested: bool,
+    /// `ui.input().time` of the last `StartLinking`, to offer a retry if no ticket arrives.
+    linking_since: f64,
     qr: QrCache,
 }
 
@@ -70,7 +74,7 @@ pub fn show(
 fn mode_tabs(ui: &mut egui::Ui, view: &mut OnboardingView) {
     ui.horizontal(|ui| {
         ui.selectable_value(&mut view.mode, Mode::Create, "I'm new");
-        ui.selectable_value(&mut view.mode, Mode::Link, "I use brumm on another device");
+        ui.selectable_value(&mut view.mode, Mode::Link, "Link device");
         ui.selectable_value(&mut view.mode, Mode::Restore, "Restore");
     });
 }
@@ -128,14 +132,27 @@ fn link_panel(
     link_ticket: Option<&str>,
     commands: &mut Vec<Command>,
 ) {
+    let now = ui.input(|input| input.time);
     if !view.linking_requested {
         view.linking_requested = true;
+        view.linking_since = now;
         commands.push(Command::StartLinking);
     }
     ui.label("On your other device, open “Devices” → “Link a new device” and paste this link (or scan the code with a phone, later).");
     ui.add_space(8.0);
     let Some(link) = link_ticket else {
-        ui.spinner();
+        // The link needs our relay address; without it the other device cannot dial us.
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new("connecting to the brumm network…").color(theme::MUTED_TEXT),
+            );
+        });
+        if now - view.linking_since > LINK_RETRY_AFTER_S && ui.button("Try again").clicked() {
+            view.linking_requested = false;
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
         return;
     };
     ui.vertical_centered(|ui| {

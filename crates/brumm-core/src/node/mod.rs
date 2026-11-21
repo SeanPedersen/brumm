@@ -19,11 +19,15 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
+use n0_future::{
+    task,
+    time::{self, Instant},
+};
 use tokio::sync::mpsc;
 use vodozemac::olm::Session;
 
@@ -78,8 +82,8 @@ pub async fn run(
     };
     node.start().await;
 
-    let mut retry = tokio::time::interval(config.retry_interval);
-    let mut prune = tokio::time::interval(PRUNE_INTERVAL);
+    let mut retry = time::interval(config.retry_interval);
+    let mut prune = time::interval(PRUNE_INTERVAL);
     loop {
         let result = tokio::select! {
             command = commands.recv() => match command {
@@ -188,15 +192,26 @@ struct Node {
 
 impl Node {
     fn open(config: &NodeConfig, events: EventSink) -> Result<Self> {
+        #[cfg(not(target_family = "wasm"))]
         std::fs::create_dir_all(&config.data_dir)?;
         let store = Store::open(&config.data_dir.join(DATABASE_FILE))?;
+        Ok(Self::with_store(
+            store,
+            events,
+            config.mailbox_relays.clone(),
+        ))
+    }
+
+    /// Fresh in-memory state over an opened store. New channels, so results of network tasks
+    /// spawned by an earlier node (before a log-out) are dropped.
+    fn with_store(store: Store, events: EventSink, mailbox_relays: Vec<String>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let (letters_tx, letters_rx) = mpsc::channel(INBOUND_QUEUE);
-        Ok(Self {
+        Self {
             store,
             events,
-            mailbox_relays: config.mailbox_relays.clone(),
+            mailbox_relays,
             me: None,
             link_target: None,
             pending_hellos: HashMap::new(),
@@ -209,7 +224,7 @@ impl Node {
             outcomes_rx,
             letters_tx,
             letters_rx,
-        })
+        }
     }
 
     /// Connects to our mailbox relays in the background; reports back via `Outcome::MailboxReady`.
@@ -219,7 +234,7 @@ impl Node {
         let secret = device_secret.to_bytes();
         let letters = self.letters_tx.clone();
         let outcomes = self.outcomes_tx.clone();
-        tokio::spawn(async move {
+        task::spawn(async move {
             match Mailbox::start(&secret, &relays, since, letters).await {
                 Ok(mailbox) => {
                     let _ = outcomes.send(Outcome::MailboxReady(mailbox));

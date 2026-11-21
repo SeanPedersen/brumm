@@ -1,0 +1,12 @@
+# Browser build of brumm (#2). Run `trunk serve` from crates/brumm-app.
+[build]
+target = "index.html"
+dist = "../../target/web-dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+# The worker and the core live outside this crate; rebuild when they change too.
+[watch]
+watch = ["index.html", "Cargo.toml", "src", "assets", "../brumm-core", "../brumm-worker", "../../Cargo.toml"]

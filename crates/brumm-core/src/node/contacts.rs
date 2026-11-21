@@ -32,7 +32,7 @@ impl Node {
         let transport = me.transport.clone();
         self.pending_hellos.insert(invite.device_addr.id, session);
         let outcomes = self.outcomes_tx.clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             let reply = transport.request(invite.device_addr.clone(), &frame).await;
             let _ = outcomes.send(Outcome::Hello {
                 invite: Box::new(invite),

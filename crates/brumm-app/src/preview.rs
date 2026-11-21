@@ -2,11 +2,12 @@
 //!
 //! The thread scales the photo down to the bubble (`prepare_chat_image`) and hands back only
 //! the preview bytes. The UI thread installs that result and asks the core to store it.
+//! The browser build has no threads here: it decodes on submit, and the stored preview makes
+//! that a one-time cost per photo.
 
-use std::sync::{
-    Arc,
-    mpsc::{self, Receiver, Sender},
-};
+use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use brumm_core::{identity::UserKey, wire::MessageId};
 
@@ -23,6 +24,8 @@ struct Job {
     id: MessageId,
     bytes: Arc<Vec<u8>>,
     max_edge: u32,
+    /// Repainted when the background thread finishes; the browser decodes inside the frame.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     ctx: egui::Context,
 }
 
@@ -37,12 +40,19 @@ pub struct ReadyPreview {
     pub max_edge: u32,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct PreviewLoader {
     jobs: Sender<Job>,
     ready: Receiver<ReadyPreview>,
 }
 
+#[cfg(target_family = "wasm")]
+pub struct PreviewLoader {
+    jobs: std::cell::RefCell<Vec<Job>>,
+}
+
 impl PreviewLoader {
+    #[cfg(not(target_family = "wasm"))]
     pub fn start() -> Self {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -65,6 +75,14 @@ impl PreviewLoader {
         }
     }
 
+    /// Jobs are decoded in [`Self::poll`], on the UI thread.
+    #[cfg(target_family = "wasm")]
+    pub fn start() -> Self {
+        Self {
+            jobs: std::cell::RefCell::default(),
+        }
+    }
+
     pub fn submit(
         &self,
         contact: UserKey,
@@ -73,23 +91,34 @@ impl PreviewLoader {
         max_edge: u32,
         ctx: egui::Context,
     ) {
-        let _ = self.jobs.send(Job {
+        let job = Job {
             contact,
             id,
             bytes,
             max_edge,
             ctx,
-        });
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let _ = self.jobs.send(job);
+        #[cfg(target_family = "wasm")]
+        self.jobs.borrow_mut().push(job);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn poll(&self) -> impl Iterator<Item = ReadyPreview> + '_ {
         std::iter::from_fn(|| self.ready.try_recv().ok())
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn poll(&self) -> impl Iterator<Item = ReadyPreview> + '_ {
+        let jobs = std::mem::take(&mut *self.jobs.borrow_mut());
+        jobs.into_iter().map(decode)
     }
 }
 
 fn decode(job: Job) -> ReadyPreview {
     let source_len = job.bytes.len();
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
     let prepared = files::prepare_chat_image(job.bytes.as_slice(), job.max_edge);
     let (loaded, persist, source_size) = match prepared {
         Some(ChatImage {

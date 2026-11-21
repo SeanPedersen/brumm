@@ -3,7 +3,7 @@
 //! See SPEC.md for the protocol.
 
 pub mod api;
-mod clock;
+pub mod clock;
 pub mod crypto;
 mod e2ee;
 pub mod identity;
@@ -14,3 +14,7 @@ pub mod node;
 mod store;
 mod transport;
 pub mod wire;
+
+#[cfg(target_family = "wasm")]
+#[doc(hidden)]
+pub use universal_time as __universal_time;

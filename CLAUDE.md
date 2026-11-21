@@ -78,9 +78,12 @@ crates/brumm-core/        no UI; everything async/network/storage
   tests/multi_device.rs   e2e: link, contact/history sync, fan-out, transcripts, revocation
   tests/mailbox.rs        e2e via in-memory Nostr relay: never online together, receipts
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
-crates/brumm-app/         eframe binary `brumm`
-  src/bridge.rs           tokio runtime thread (2 workers) + channels; repaint on event;
+crates/brumm-worker/      browser only: runs brumm-core in a Web Worker (OPFS storage, message pump)
+crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html + Trunk.toml for the web
+  src/main.rs             picks native.rs (window, --profile, window size) or web.rs (canvas, ?profile=)
+  src/bridge/native.rs    tokio runtime thread (2 workers) + channels; repaint on event;
                           detached thread, closing the command channel stops the core
+  src/bridge/web.rs       starts brumm-worker, postcard messages, queues commands until Listening
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
   src/preview.rs          background thread: scale a chat photo, then the UI stores the preview
   src/window_size.rs      8-byte window size (`window-size`), read before the window is created
@@ -158,6 +161,8 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
 cargo test                                   # unit + local e2e
 cargo test -p brumm-core --test network -- --ignored   # needs internet: relay + DNS discovery
 cargo clippy --all-targets
+cargo clippy -p brumm-app -p brumm-worker --target wasm32-unknown-unknown
+(cd crates/brumm-app && trunk serve)         # browser build: http://localhost:8080/?profile=alice
 cargo run -- --profile alice                 # separate data dir per profile
 cargo run -- --profile bob                   # 2nd instance to chat locally
 scripts/install-desktop.sh [binary]          # user-level desktop entry + hicolor icon + ~/.local/bin/brumm

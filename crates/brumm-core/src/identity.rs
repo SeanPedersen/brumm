@@ -206,8 +206,14 @@ impl Profile {
 }
 
 /// Default label for this device, e.g. "Linux".
+/// Shown for a device whose platform has no OS name (`std::env::consts::OS` is empty in wasm).
+const BROWSER_DEVICE_LABEL: &str = "Browser";
+
 pub fn default_device_label() -> String {
     let os = std::env::consts::OS;
+    if cfg!(target_family = "wasm") || os.is_empty() {
+        return BROWSER_DEVICE_LABEL.to_owned();
+    }
     let mut label: String = os.chars().take(MAX_DEVICE_LABEL_CHARS).collect();
     if let Some(first) = label.get_mut(..1) {
         first.make_ascii_uppercase();

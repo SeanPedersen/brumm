@@ -146,9 +146,11 @@ impl Store {
     }
 
     fn init(db: Connection) -> Result<Self> {
-        db.execute_batch("PRAGMA journal_mode = WAL;")?;
         // WAL + NORMAL: no fsync per commit; a crash can lose the last commits but never
         // corrupt the database. Startup and every message insert get much cheaper.
+        // The browser's OPFS VFS (sahpool) has no shared memory, so it keeps the rollback journal.
+        #[cfg(not(target_family = "wasm"))]
+        db.execute_batch("PRAGMA journal_mode = WAL;")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {

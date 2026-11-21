@@ -5,17 +5,69 @@ use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+use n0_future::{task, time};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::wire::{self, ALPN, Frame, MAX_FRAME_BYTES, Reply};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Throughput assumed on top of [`REQUEST_TIMEOUT`] for large frames. A browser always goes
+/// through an iroh relay, where a 10 MiB file needs far longer than 10 s.
+const MIN_TRANSFER_BYTES_PER_SEC: u64 = 128 * 1024;
+/// How long a ticket (invite or link) waits for the home relay. A phone browser on a mobile
+/// network can need well over 5 s, and a ticket without the relay is undialable for a browser.
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// iroh's n0 relays, named without the DNS root dot (`euc1-1.relay.n0.iroh.link`, not
+/// `….link.`). WebKit (every iOS browser) fails `fetch` and WebSocket to a host ending in a
+/// dot, so a browser could neither probe nor join them. Natives use the same names, because
+/// browsers dial a peer's home relay by the URL in its address.
+fn relay_map() -> RelayMap {
+    iroh::defaults::prod::default_relay_map()
+        .relays::<Vec<_>>()
+        .into_iter()
+        .map(|relay| {
+            let mut relay = (*relay).clone();
+            relay.url = without_root_dot(&relay.url);
+            relay
+        })
+        .collect()
+}
+
+fn without_root_dot(url: &RelayUrl) -> RelayUrl {
+    let mut url: url::Url = (**url).clone();
+    if let Some(host) = url.host_str().and_then(|host| host.strip_suffix('.'))
+        && !host.is_empty()
+    {
+        let host = host.to_owned();
+        let _ = url.set_host(Some(&host));
+    }
+    RelayUrl::from(url)
+}
+
+/// Peers on older versions still advertise the dotted relay names.
+fn without_root_dots(addr: EndpointAddr) -> EndpointAddr {
+    let addrs: Vec<TransportAddr> = addr
+        .addrs
+        .into_iter()
+        .map(|transport| match transport {
+            TransportAddr::Relay(url) => TransportAddr::Relay(without_root_dot(&url)),
+            other => other,
+        })
+        .collect();
+    EndpointAddr::from_parts(addr.id, addrs)
+}
+
+/// A relay URL, or (natively) at least one direct address. A browser has only its relay.
+fn is_dialable(addr: &EndpointAddr) -> bool {
+    addr.relay_urls().next().is_some()
+        || (!cfg!(target_arch = "wasm32") && addr.ip_addrs().next().is_some())
+}
 
 /// A decoded frame from a peer device awaiting the node's decision.
 pub struct InboundRequest {
@@ -40,6 +92,7 @@ struct Bound {
 impl Bound {
     async fn bind(secret_key: SecretKey, inbound: mpsc::Sender<InboundRequest>) -> Result<Self> {
         let endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Custom(relay_map()))
             .secret_key(secret_key)
             .bind()
             .await
@@ -70,7 +123,7 @@ impl Transport {
             bound: OnceCell::new(),
         });
         let warm = transport.clone();
-        tokio::spawn(async move {
+        task::spawn(async move {
             if let Err(err) = warm.bound().await {
                 tracing::warn!(?err, "iroh endpoint unavailable; direct delivery disabled");
             }
@@ -94,16 +147,33 @@ impl Transport {
     }
 
     /// Our dialable address; waits briefly for a home relay so invites work across NATs.
+    /// Our address for a ticket. Waits for the home relay; fails instead of returning an
+    /// address nobody can dial (only the id), which peers could then only look up via
+    /// pkarr/DNS, where a device that never got online has published nothing.
     pub async fn addr(&self) -> Result<EndpointAddr> {
-        let bound = self.bound().await?;
-        let _ = tokio::time::timeout(ONLINE_TIMEOUT, bound.endpoint().online()).await;
-        Ok(bound.endpoint().addr())
+        let bound = time::timeout(ONLINE_TIMEOUT, self.bound())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the iroh endpoint did not start within {} s — reload the page and try again",
+                    ONLINE_TIMEOUT.as_secs()
+                )
+            })??;
+        let online = time::timeout(ONLINE_TIMEOUT, bound.endpoint().online()).await;
+        let addr = bound.endpoint().addr();
+        if online.is_ok() || is_dialable(&addr) {
+            return Ok(addr);
+        }
+        bail!(
+            "could not reach the brumm network (no iroh relay after {} s) — check the connection and try again",
+            ONLINE_TIMEOUT.as_secs()
+        )
     }
 
     /// Sends one frame and waits for the reply. Retries once on a stale cached connection.
     pub async fn request(&self, addr: impl Into<EndpointAddr>, frame: &Frame) -> Result<Reply> {
         let bound = self.bound().await?;
-        let addr = addr.into();
+        let addr = without_root_dots(addr.into());
         let payload = wire::encode(frame);
         let peer = addr.id;
         if let Some(cached) = bound.cached(&peer) {
@@ -115,10 +185,9 @@ impl Transport {
                 }
             }
         }
-        let connection =
-            tokio::time::timeout(CONNECT_TIMEOUT, bound.endpoint().connect(addr, ALPN))
-                .await
-                .context("connect timed out")??;
+        let connection = time::timeout(CONNECT_TIMEOUT, bound.endpoint().connect(addr, ALPN))
+            .await
+            .context("connect timed out")??;
         bound
             .connections
             .lock()
@@ -160,9 +229,14 @@ async fn exchange(connection: &Connection, payload: &[u8]) -> Result<Reply> {
         let response = recv.read_to_end(MAX_FRAME_BYTES).await?;
         anyhow::Ok(wire::decode(&response)?)
     };
-    tokio::time::timeout(REQUEST_TIMEOUT, round_trip)
+    time::timeout(request_timeout(payload.len()), round_trip)
         .await
         .context("request timed out")?
+}
+
+/// Base timeout plus the time to move `payload_len` bytes at [`MIN_TRANSFER_BYTES_PER_SEC`].
+fn request_timeout(payload_len: usize) -> Duration {
+    REQUEST_TIMEOUT + Duration::from_secs(payload_len as u64 / MIN_TRANSFER_BYTES_PER_SEC)
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +252,7 @@ impl ProtocolHandler for InboundHandler {
                 return Ok(());
             };
             let inbound = self.inbound.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 let result = async {
                     let bytes = recv.read_to_end(MAX_FRAME_BYTES).await?;
                     let frame: Frame = wire::decode(&bytes)?;
@@ -202,5 +276,36 @@ impl ProtocolHandler for InboundHandler {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_names_have_no_root_dot() {
+        let relays: Vec<RelayUrl> = relay_map().urls();
+        assert!(!relays.is_empty());
+        for url in relays {
+            let host = url.host_str().expect("relay host");
+            assert!(!host.ends_with('.'), "{url}");
+            assert!(host.ends_with("relay.n0.iroh.link"), "{url}");
+        }
+    }
+
+    #[test]
+    fn peer_addresses_lose_the_root_dot() {
+        let dotted: RelayUrl = "https://euc1-1.relay.n0.iroh.link./".parse().unwrap();
+        let direct: std::net::SocketAddr = "192.0.2.1:4433".parse().unwrap();
+        let id = SecretKey::generate().public();
+        let addr = without_root_dots(
+            EndpointAddr::new(id)
+                .with_relay_url(dotted)
+                .with_ip_addr(direct),
+        );
+        let relays: Vec<_> = addr.relay_urls().map(|url| url.to_string()).collect();
+        assert_eq!(relays, vec!["https://euc1-1.relay.n0.iroh.link/"]);
+        assert_eq!(addr.ip_addrs().copied().collect::<Vec<_>>(), vec![direct]);
     }
 }

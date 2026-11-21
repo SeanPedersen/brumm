@@ -141,7 +141,7 @@ impl Node {
         let display_name = me.profile.display_name.clone();
         let cert = me.own_cert().clone();
         let events = events.clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             match transport.addr().await {
                 Ok(addr) => {
                     let invite = Invite::new(display_name, cert, addr, secret, one_time_key);
@@ -311,13 +311,21 @@ impl Node {
         let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? else {
             bail!("message has no file");
         };
-        let events = self.events.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = std::fs::write(&path, data) {
-                events.emit(Event::Error(format!("could not save file: {err}")));
-            }
-        });
-        Ok(())
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (data, path);
+            bail!("saving files is not available in the browser yet");
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let events = self.events.clone();
+            std::thread::spawn(move || {
+                if let Err(err) = std::fs::write(&path, data) {
+                    events.emit(Event::Error(format!("could not save file: {err}")));
+                }
+            });
+            Ok(())
+        }
     }
 
     /// Stores our new photo and shares it with every contact and our other devices.

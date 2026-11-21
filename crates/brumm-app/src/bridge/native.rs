@@ -1,5 +1,5 @@
-//! Runs the async core on its own tokio thread and exposes a non-blocking command/event
-//! interface to the immediate-mode UI.
+//! Native bridge: runs the async core on its own tokio thread and exposes a non-blocking
+//! command/event interface to the immediate-mode UI.
 
 use std::path::PathBuf;
 

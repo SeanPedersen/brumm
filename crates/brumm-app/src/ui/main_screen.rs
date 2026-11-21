@@ -42,19 +42,12 @@ fn handle_file_events(
     }
     let mut picked = view.chat.dialogs.poll();
     if let Some(contact) = state.selected {
-        let dropped = ui.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .map(|file| file.path().to_path_buf())
-                .collect::<Vec<_>>()
-        });
-        picked.extend(
-            dropped
-                .into_iter()
-                .map(|path| files::Picked::Attachment { contact, path }),
-        );
+        let dropped = ui.input(|input| input.raw.dropped_files.clone());
+        for file in dropped {
+            view.chat
+                .dialogs
+                .take_dropped(ui.ctx(), contact, file, &mut picked);
+        }
         let menu_paste = ui
             .data_mut(|data| data.remove_temp::<bool>(composer::paste_menu_requested_id()))
             .unwrap_or(false);
@@ -108,6 +101,19 @@ fn handle_file_events(
             files::Picked::SaveAs { contact, id, path } => {
                 commands.push(Command::SaveAttachment { contact, id, path })
             }
+            files::Picked::Dropped {
+                contact,
+                name,
+                data,
+            } => match files::attachment_from_dropped(name, &data) {
+                Ok((name, data)) => commands.push(Command::SendFile {
+                    contact,
+                    name,
+                    data,
+                }),
+                Err(message) => state.errors.push(message),
+            },
+            files::Picked::Unavailable(message) => state.errors.push(message.to_owned()),
         }
     }
 }

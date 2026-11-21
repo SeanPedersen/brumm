@@ -10,6 +10,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 iroh.workspace = true
+url.workspace = true
+n0-future.workspace = true
 serde.workspace = true
 postcard.workspace = true
 rusqlite.workspace = true
@@ -22,6 +24,14 @@ rand.workspace = true
 blake3.workspace = true
 data-encoding.workspace = true
 tracing.workspace = true
+
+# Browser build (#2): entropy comes from `crypto.getRandomValues`. Two getrandom
+# majors are in the wasm tree (0.2 via ring, 0.4 via the rest); each needs its JS backend.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom-02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# nostr reads the clock through universal-time; wasm binaries must register a provider (clock.rs).
+universal-time = "0.3.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
