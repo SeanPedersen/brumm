@@ -17,7 +17,9 @@ use crate::{
     crypto::Sealed,
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
-    wire::{self, Body, ChatMessage, EnvelopeId, HistoryItem, InviteSecret, MessageId},
+    wire::{
+        self, Body, ChatMessage, EnvelopeId, HistoryCount, HistoryItem, InviteSecret, MessageId,
+    },
 };
 
 const SCHEMA_VERSION: i64 = 7;
@@ -108,6 +110,7 @@ const META_OLM_ACCOUNT: &str = "olm_account";
 const META_REVOKED: &str = "revoked";
 const META_MAILBOX_SINCE: &str = "mailbox_since_secs";
 const META_LAST_OPENED: &str = "last_opened";
+const META_HISTORY_SYNC: &str = "history_sync";
 
 /// Own identity as persisted on this device.
 pub struct StoredIdentity {
@@ -132,6 +135,14 @@ pub struct OutboxItem {
 
 pub struct Store {
     db: Connection,
+}
+
+/// Initial history sync on a freshly linked device. `expected` comes from the linking device's
+/// manifest; chunks may arrive before it, so `received` is counted regardless.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistorySyncState {
+    pub expected: Option<Vec<HistoryCount>>,
+    pub received: Vec<HistoryCount>,
 }
 
 impl Store {
@@ -259,6 +270,26 @@ impl Store {
 
     pub fn set_last_opened(&self, contact: &UserKey) -> Result<()> {
         set_meta(&self.db, META_LAST_OPENED, contact.as_slice())
+    }
+
+    /// Progress of the initial history sync (only on a freshly linked device, until complete).
+    pub fn history_sync(&self) -> Result<Option<HistorySyncState>> {
+        get_meta(&self.db, META_HISTORY_SYNC)?
+            .map(|bytes| wire::decode(&bytes).context("history sync state"))
+            .transpose()
+    }
+
+    pub fn set_history_sync(&self, state: Option<&HistorySyncState>) -> Result<()> {
+        match state {
+            Some(state) => set_meta(&self.db, META_HISTORY_SYNC, &wire::encode(state)),
+            None => {
+                self.db.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    params![META_HISTORY_SYNC],
+                )?;
+                Ok(())
+            }
+        }
     }
 
     // ── invites ─────────────────────────────────────────────────────────────
@@ -544,6 +575,23 @@ impl Store {
             .and_then(|contact| contact.try_into().ok()))
     }
 
+    /// Queue order (oldest first) without the ciphertexts; the sender loads one at a time.
+    pub fn outbox_keys(&self) -> Result<Vec<(EndpointId, EnvelopeId)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT device_id, envelope_id FROM outbox ORDER BY created_at_ms, rowid")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((blob_array::<32>(row, 0)?, blob_array::<16>(row, 1)?))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let (device, envelope_id) = row?;
+            keys.push((EndpointId::from_bytes(&device)?, envelope_id));
+        }
+        Ok(keys)
+    }
+
+    #[cfg(test)]
     pub fn outbox(&self) -> Result<Vec<OutboxItem>> {
         let mut stmt = self
             .db
@@ -799,11 +847,13 @@ impl Store {
     }
 
     /// All messages sent at or after `since_ms`, oldest first (for syncing a linked device).
-    pub fn history_since(&self, since_ms: u64) -> Result<Vec<HistoryItem>> {
+    /// Messages from `since_ms` on, plus every message of `keep_all` (the Notes chat, which is
+    /// exempt from retention just like in [`Self::prune_messages_before`]).
+    pub fn history_since(&self, since_ms: u64, keep_all: &UserKey) -> Result<Vec<HistoryItem>> {
         let mut stmt = self.db.prepare(
-            "SELECT contact, id, direction, body, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 ORDER BY sent_at_ms, rowid",
+            "SELECT contact, id, direction, body, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 OR contact = ?2 ORDER BY sent_at_ms, rowid",
         )?;
-        let rows = stmt.query_map(params![since_ms as i64], |row| {
+        let rows = stmt.query_map(params![since_ms as i64, keep_all], |row| {
             Ok(HistoryItem {
                 contact: blob_array(row, 0)?,
                 outgoing: direction_from_code(row.get(2)?) == Direction::Outgoing,
@@ -1321,7 +1371,8 @@ mod tests {
             Some(DeliveryStatus::Delivered)
         );
 
-        assert_eq!(store.history_since(150).unwrap().len(), 1);
+        assert_eq!(store.history_since(150, &[0; 32]).unwrap().len(), 1);
+        assert_eq!(store.history_since(150, &contact).unwrap().len(), 2);
         assert_eq!(store.conversation(&contact).unwrap().len(), 2);
         assert_eq!(store.prune_messages_before(150, &[0; 32]).unwrap(), 1);
         assert_eq!(store.prune_messages_before(1000, &contact).unwrap(), 0);

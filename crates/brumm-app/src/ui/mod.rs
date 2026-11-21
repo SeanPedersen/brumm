@@ -22,6 +22,7 @@ pub mod revoked;
 pub mod seed_phrase;
 pub mod sidebar;
 pub mod starting;
+mod sync_hint;
 pub mod theme;
 pub mod time_fmt;
 

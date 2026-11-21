@@ -123,6 +123,7 @@ impl Node {
             }
             (Payload::Avatar(avatar), from_own) => self.receive_avatar(owner, avatar, from_own)?,
             (Payload::History(items), true) => self.receive_history(items)?,
+            (Payload::HistoryManifest(counts), true) => self.receive_history_manifest(counts)?,
             (payload, _) => {
                 tracing::warn!(
                     ?payload,
@@ -305,6 +306,7 @@ impl Node {
     }
 
     fn receive_history(&mut self, items: Vec<HistoryItem>) -> Result<bool> {
+        self.note_history_chunk(&items)?;
         let mut changed = Vec::new();
         for item in items {
             if !item.message.body.is_valid() {

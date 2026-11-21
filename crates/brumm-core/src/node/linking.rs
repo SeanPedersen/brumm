@@ -5,7 +5,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, SecretKey};
 
-use super::{LinkTarget, Me, Node, Outcome, PendingLink, RETENTION_MS, next_seq, profile_view};
+use super::{
+    LinkTarget, Me, Node, Outcome, PendingLink, RETENTION_MS, history_sync, next_seq, profile_view,
+};
 use crate::{
     api::{DeviceId, Event},
     clock::now_ms,
@@ -21,7 +23,6 @@ use crate::{
     transport::Transport,
     wire::{
         self, Avatar, ContactRecord, Envelope, Frame, LinkSecret, Payload, RejectReason, Reply,
-        chunk_history,
     },
 };
 
@@ -236,10 +237,14 @@ impl Node {
         for (subject, image) in self.store.avatars()? {
             self.enqueue_to_device(entry, Payload::Avatar(Avatar { subject, image }))?;
         }
+        let notes = self.active_me()?.user_key();
         let history = self
             .store
-            .history_since(now_ms().saturating_sub(RETENTION_MS))?;
-        for chunk in chunk_history(history) {
+            .history_since(now_ms().saturating_sub(RETENTION_MS), &notes)?;
+        // Ahead of the chunks, so the new device can show per-chat progress.
+        let counts = history_sync::count_per_contact(&history);
+        self.enqueue_to_device(entry, Payload::HistoryManifest(counts))?;
+        for chunk in history_sync::prioritized_chunks(history) {
             self.enqueue_to_device(entry, Payload::History(chunk))?;
         }
         Ok(())

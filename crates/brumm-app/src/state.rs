@@ -98,6 +98,15 @@ pub(crate) struct PendingPreview {
 }
 
 impl AppState {
+    /// Any message of this chat is known (loaded, or as the sidebar preview).
+    pub fn has_messages(&self, contact: &UserKey) -> bool {
+        self.previews.contains_key(contact)
+            || self
+                .conversations
+                .get(contact)
+                .is_some_and(|messages| !messages.is_empty())
+    }
+
     pub fn phase(&self) -> Phase {
         match (self.ready, &self.profile, self.revoked) {
             (false, _, _) => Phase::Starting,
@@ -217,9 +226,12 @@ impl AppState {
             Event::ContactAdded(contact) => self.upsert_contact(contact, ctx),
             Event::ConversationsChanged(contacts) => {
                 for contact in contacts {
-                    self.conversations.remove(&contact);
+                    // The open chat keeps showing its messages until the reload replaces them;
+                    // dropping them would blank the chat once per synced history chunk.
                     if self.selected == Some(contact) {
                         self.stale_conversations.push(contact);
+                    } else {
+                        self.conversations.remove(&contact);
                     }
                 }
             }

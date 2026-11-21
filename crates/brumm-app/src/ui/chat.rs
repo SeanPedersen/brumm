@@ -23,7 +23,7 @@ use crate::{
         chat_search::{self, Pending},
         composer::{self, Composer},
         files::{self, FileDialogs},
-        theme, time_fmt,
+        sync_hint, theme, time_fmt,
     },
 };
 
@@ -298,6 +298,12 @@ pub fn show(
                         .inner;
                     handle_pointer(ui, chat, messages, &slots);
                 });
+            if let Some(&(received, expected)) = state.history_sync.get(&contact) {
+                let progress = sync_hint::SyncProgress { received, expected };
+                // Once one message exists, only the small pill shows (no switching back).
+                let chat_is_empty = !state.has_messages(&contact);
+                sync_hint::show(ui, output.inner_rect, &progress, chat_is_empty);
+            }
             let jumped = chat.search.take_jumped();
             chat.search
                 .note_offset(output.state.clamped_offset().y, jumped);

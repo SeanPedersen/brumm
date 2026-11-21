@@ -25,7 +25,23 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   `at_ms`, `reactions` table; schema v6 upgrades v4/v5 in place). Reactions are not part of history sync.
 - **Notes chat done:** the conversation keyed by our own `UserKey` (no contacts row; the UI lists a pseudo-contact "Notes").
   Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
-  devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning; included in history sync like any conversation.
+  devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning, and history sync to a new device sends it in full (other chats: last 60 days).
+  Linking sends a `HistoryManifest` first; history chunks go one chat at a time, most recent chat first, newest messages
+  first. The outbox keeps queue order (≤ 2 in flight per device, next on ack). The new device shows a per-chat
+  "Syncing history… n of m" hint (`ui/sync_hint.rs`, progress persisted in `meta`).
+  Request timeouts grow with frame size (`MIN_TRANSFER_BYTES_PER_SEC`): a multi-MB file over an iroh relay (always the case for
+  the browser) needs far more than the 10 s base.
+- **Browser build (#2, in progress):** the same egui UI on a canvas (`eframe::WebRunner`, built with
+  trunk). brumm-core runs in a dedicated Web Worker (`crates/brumm-worker`), because SQLite's OPFS VFS
+  (`sqlite-wasm-vfs` sahpool) needs sync access handles. UI ↔ worker: postcard `api::ToWorker` /
+  `api::FromWorker` over `postMessage`; commands queue until the worker reports `Listening`.
+  `?profile=<name>` picks the identity, and each profile has its own OPFS directory. iroh is relay-only
+  in the browser. Relays are iroh's n0 relays **without the DNS root dot** (`transport::relay_map`):
+  WebKit (every iOS browser) fails `fetch`/WebSocket to `….iroh.link.`, so with iroh's default names no
+  relay is ever chosen. Peer addresses are normalized the same way before dialing. A ticket (link or
+  invite) is only issued with a relay address (`Transport::addr` fails after 30 s instead). Not on the web yet: file dialogs (send by drag & drop), Save As, clipboard file paste,
+  system color emoji. Core code uses `n0_future::{task::spawn, time}` (tokio natively,
+  setTimeout/spawn_local in wasm), never `tokio::spawn` / `tokio::time` / `std::time::Instant`.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **Emoji:** the system color emoji font (Noto Color Emoji, via `fc-match emoji` if it is not
   in a well-known path) is installed after the text fonts and before discovered fallbacks.

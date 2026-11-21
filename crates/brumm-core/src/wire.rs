@@ -108,6 +108,15 @@ pub enum Payload {
         contact: UserKey,
         reaction: Reaction,
     },
+    /// Own-device sync, sent before the [`Payload::History`] chunks for a freshly linked
+    /// device: how many history items follow per conversation, so it can show progress.
+    HistoryManifest(Vec<HistoryCount>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCount {
+    pub contact: UserKey,
+    pub messages: u32,
 }
 
 /// One user's reaction to a message; at most one per user and message (last write wins).

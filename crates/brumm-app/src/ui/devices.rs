@@ -84,7 +84,7 @@ fn device_list(
 
 fn link_section(ui: &mut egui::Ui, view: &mut DevicesView, commands: &mut Vec<Command>) {
     ui.strong("Link a new device");
-    ui.label(egui::RichText::new("On the new device choose “I use brumm on another device” and paste its link here. It gets your contacts and the last 60 days of chats.").small().color(theme::MUTED_TEXT));
+    ui.label(egui::RichText::new("On the new device choose “Link device” and paste its link here. It gets your contacts and your full chat history.").small().color(theme::MUTED_TEXT));
     ui.add(
         egui::TextEdit::singleline(&mut view.pasted_link)
             .hint_text("brumm://link/…")

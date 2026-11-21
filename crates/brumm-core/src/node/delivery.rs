@@ -6,6 +6,9 @@
 //! If a device is unreachable, the same ciphertext is posted once to its Nostr mailbox
 //! (status `Sent`). The recipient later answers with a `Payload::Receipt`, which counts as the
 //! ack. Direct retries continue meanwhile; duplicates are re-acked by the receiver.
+//!
+//! The outbox is sent in queue order with a few envelopes in flight per device, so priorities
+//! set by the enqueue order hold (history sync sends the most recent chat first).
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
@@ -17,6 +20,10 @@ use crate::{
     identity::{DeviceEntry, UserKey},
     wire::{self, Envelope, EnvelopeId, Frame, Payload, RejectReason, Reply},
 };
+
+/// Envelopes sent to one device at once. Small enough that the first chats of a history sync
+/// arrive first, large enough that a big file does not hold up everything behind it.
+const MAX_IN_FLIGHT_PER_DEVICE: usize = 2;
 
 impl Node {
     /// Queues `payload` for every device of `user` (a contact).
@@ -115,20 +122,27 @@ impl Node {
         )
     }
 
-    /// Sends every queued envelope that is not already in flight.
+    /// Sends queued envelopes in queue order, at most [`MAX_IN_FLIGHT_PER_DEVICE`] per device.
+    /// Queue order is the priority (history sync: most recent chat first); later envelopes
+    /// wait for a slot instead of splitting the bandwidth, and start as soon as one is acked.
     pub(super) fn flush_outbox(&mut self) -> Result<()> {
         let Some(me) = self.me.as_ref().filter(|me| !me.revoked) else {
             return Ok(());
         };
         let transport = me.transport.clone();
-        for item in self.store.outbox()? {
-            let key = (item.device, item.envelope_id);
-            if !self.in_flight.insert(key) {
+        for key in self.store.outbox_keys()? {
+            let (device, envelope_id) = key;
+            let busy = self.in_flight.iter().filter(|(d, _)| *d == device).count();
+            if busy >= MAX_IN_FLIGHT_PER_DEVICE || self.in_flight.contains(&key) {
                 continue;
             }
+            let Some(item) = self.store.outbox_item(&device, &envelope_id)? else {
+                continue;
+            };
+            self.in_flight.insert(key);
             let transport = transport.clone();
             let outcomes = self.outcomes_tx.clone();
-            tokio::spawn(async move {
+            n0_future::task::spawn(async move {
                 let reply = transport
                     .request(item.device, &Frame::Sealed(item.sealed))
                     .await;
@@ -151,7 +165,9 @@ impl Node {
         self.in_flight.remove(&(device, envelope_id));
         match reply {
             Ok(Reply::Ack { id }) if id == envelope_id => {
-                self.acknowledge(&device, &envelope_id, DeliveryStatus::Delivered)
+                self.acknowledge(&device, &envelope_id, DeliveryStatus::Delivered)?;
+                // A slot for this device is free: send the next queued envelope.
+                self.flush_outbox()
             }
             Ok(Reply::Rejected(RejectReason::InvalidMessage)) => {
                 tracing::warn!(%device, "envelope rejected as invalid");
@@ -163,7 +179,13 @@ impl Node {
             }
             Err(err) => {
                 tracing::debug!(%device, ?err, "device unreachable, falling back to its mailbox");
-                self.post_to_mailbox(device, envelope_id)
+                // Everything queued for it, not only the envelopes that had a slot.
+                for (queued_device, queued_id) in self.store.outbox_keys()? {
+                    if queued_device == device {
+                        self.post_to_mailbox(device, queued_id)?;
+                    }
+                }
+                Ok(())
             }
         }
     }

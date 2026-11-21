@@ -92,8 +92,11 @@ old device:  LinkDevice(link) → certifies the new device, signs DeviceList seq
              → Frame::Link { link_secret, sealed: Olm pre-key(LinkBundle { seed_phrase, display_name, devices }) }
 new device:  checks the secret, that the seed derives devices.user_key, that the list is valid and lists itself (same Olm + fallback key)
              and the sender (same Olm key as the pre-key) → stores the identity → Reply::Ack { id: link_secret }
-old device:  on ack: adopts the list, then queues to the new device ContactSync per contact and
-             History chunks (≤ 32 KiB each, last 60 days), and announces the list to all contacts + own devices
+old device:  on ack: adopts the list, then queues to the new device ContactSync per contact,
+             a HistoryManifest (messages per conversation), and History chunks (≤ 32 KiB each; last 60 days,
+             the Notes chat in full), and announces the list to all contacts + own devices
+             chunk order = priority: one conversation at a time, most recently active first, newest messages first
+new device:  counts arriving items per conversation against the manifest (persisted) → per-chat "syncing" hint
 ```
 - **Removal**: any device signs a list without the target, sends it directly to the removed device (best effort),
   and announces it. A device that receives its own user's list without itself marks itself
@@ -165,6 +168,7 @@ Payload::DeviceList(DeviceList)                     any device of the list's own
 Payload::SentTranscript { contact, ChatMessage }    own device only
 Payload::ContactSync(ContactRecord { profile, added_at_ms })   own device only
 Payload::History(Vec<HistoryItem>)                  own device only
+Payload::HistoryManifest(Vec<HistoryCount { contact, messages }>)   own device only, ahead of the History chunks
 Payload::Receipt(Vec<EnvelopeId>)                   any known device (ack for mailbox-delivered envelopes)
 Sealed { message_type: u8, ciphertext }             # vodozemac OlmMessage::to_parts
 ```
@@ -177,11 +181,13 @@ send_text(contact, text):
     for d in devices(contact):   outbox += (d, Envelope{ id = message.id, Chat })        # chat_contact = contact
     for d in my other devices:   outbox += (d, Envelope{ random id, SentTranscript })
 each outbox row stores the Olm ciphertext, **sealed once** at enqueue time
-flush (on enqueue + every 30 s): send every row not in flight
+flush (on enqueue, after each ack, every 30 s): send rows in queue order, ≤ 2 in flight per device
+             # queue order is the priority (history sync); the next row starts when one is acked
 Ack{id}                     → drop row; chat rows mark the message Delivered (any device suffices)
 Rejected(InvalidMessage)    → drop row; chat → Failed (unless already Delivered)
 Rejected(other) / unreachable → keep row, retry   # e.g. contact hasn't processed our new device list yet
 unreachable → also post the same ciphertext once to the device's Nostr mailbox (§8) → Sent
+              (every row queued for that device, not only the ones in flight)
 ```
 - **Seal once, resend the same bytes.** Re-encrypting on every retry would advance the ratchet without bound while a
   device is offline, beyond Olm's skipped-message-key window.

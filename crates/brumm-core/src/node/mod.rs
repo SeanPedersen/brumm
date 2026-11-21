@@ -12,6 +12,7 @@
 mod commands;
 mod contacts;
 mod delivery;
+mod history_sync;
 mod inbound;
 mod linking;
 mod logout;
@@ -283,6 +284,8 @@ impl Node {
             self.emit_avatar(&user, &image);
         }
         self.emit_devices();
+        let syncing = self.emit_history_sync();
+        self.report(syncing);
         if self.me.as_ref().is_some_and(|me| me.revoked) {
             self.events.emit(Event::DeviceRevoked);
         }
