@@ -1,15 +1,17 @@
 //! Message composer: attach button, a one-line pill that grows with its content (Shift+Enter adds
-//! a line), emoji picker and a round send button. Enter sends.
+//! a line) and an emoji picker. Enter sends.
 
 use brumm_core::{api::Command, identity::UserKey};
-use egui::{Align2, Color32, FontId, Sense, Vec2};
+use egui::{Rect, Sense, Vec2};
 
-use crate::ui::{emoji, files::FileDialogs, theme};
+use crate::ui::{emoji, files::FileDialogs, icons, theme};
 
 const PILL_MIN_HEIGHT: f32 = 44.0;
 const PILL_MAX_TEXT_HEIGHT: f32 = 140.0;
-const ROUND_BUTTON_SIZE: f32 = 44.0;
-const ICON_FONT_SIZE: f32 = 22.0;
+const ATTACH_BUTTON_WIDTH: f32 = ICON_SIZE;
+const ATTACH_GAP: f32 = 6.0;
+const ICON_SIZE: f32 = 24.0;
+const EMOJI_BUTTON_SIZE: f32 = 32.0;
 
 pub struct Composer<'a> {
     pub contact: UserKey,
@@ -38,20 +40,15 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
 
-    let mut send_clicked = false;
     ui.horizontal(|ui| {
-        if round_button(ui, "📎", "Send a file", false) {
+        ui.spacing_mut().item_spacing.x = ATTACH_GAP;
+        if attach_button(ui) {
             dialogs.pick_attachment(ui.ctx(), contact);
         }
-        // Right-to-left: the send button takes its space first, the pill fills the rest. A
-        // hand-computed width would overflow and fight the sidebar resize.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            send_clicked = round_button(ui, "➤", "Send", !draft.trim().is_empty());
-            pill(ui, input_id, draft);
-        });
+        pill(ui, input_id, draft);
     });
 
-    if (enter_pressed || send_clicked) && !draft.trim().is_empty() {
+    if enter_pressed && !draft.trim().is_empty() {
         commands.push(Command::SendText {
             contact,
             text: draft.trim().to_owned(),
@@ -77,14 +74,17 @@ fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
             ui.set_width(width - 24.0);
             ui.set_min_height(PILL_MIN_HEIGHT);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let emoji_button = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("☺")
-                            .size(ICON_FONT_SIZE)
-                            .color(theme::MUTED_TEXT),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .corner_radius(egui::CornerRadius::same(16)),
+                let (emoji_rect, emoji_button) =
+                    ui.allocate_exact_size(Vec2::splat(EMOJI_BUTTON_SIZE), Sense::click());
+                let emoji_color = if emoji_button.hovered() {
+                    theme::TEXT
+                } else {
+                    theme::MUTED_TEXT
+                };
+                icons::smiley(
+                    ui.painter(),
+                    Rect::from_center_size(emoji_rect.center(), Vec2::splat(ICON_SIZE)),
+                    emoji_color,
                 );
                 if let Some(chosen) = emoji::picker(&emoji_button.on_hover_text("Emoji")) {
                     emoji::insert_at_cursor(ui.ctx(), input_id, draft, chosen);
@@ -140,30 +140,20 @@ fn paste_menu(response: &egui::Response, input_id: egui::Id) {
     });
 }
 
-/// Round icon button; `active` fills it with the accent color (used for "send").
-fn round_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, active: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(ROUND_BUTTON_SIZE), Sense::click());
-    let fill = match (active, response.hovered()) {
-        (true, true) => theme::ACCENT_HOVER,
-        (true, false) => theme::ACCENT,
-        (false, true) => theme::INPUT_BG,
-        (false, false) => Color32::TRANSPARENT,
-    };
-    let icon_color = if active {
-        Color32::WHITE
+/// Paperclip button: narrow, but as tall as the input pill so the icon is centered on it.
+fn attach_button(ui: &mut egui::Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ATTACH_BUTTON_WIDTH, PILL_MIN_HEIGHT), Sense::click());
+    let color = if response.hovered() {
+        theme::TEXT
     } else {
         theme::MUTED_TEXT
     };
-    ui.painter()
-        .circle_filled(rect.center(), ROUND_BUTTON_SIZE / 2.0, fill);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        icon,
-        FontId::proportional(ICON_FONT_SIZE),
-        icon_color,
+    icons::paperclip(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(ICON_SIZE)),
+        color,
     );
-    response.on_hover_text(tooltip).clicked() && (active || icon != "➤")
+    response.on_hover_text("Send a file").clicked()
 }
 
 #[cfg(test)]

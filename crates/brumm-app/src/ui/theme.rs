@@ -9,7 +9,6 @@ pub const INPUT_BG: Color32 = Color32::from_rgb(0x24, 0x2F, 0x3D);
 pub const ROW_HOVER: Color32 = Color32::from_rgb(0x20, 0x2B, 0x36);
 pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x2B, 0x52, 0x78);
 pub const ACCENT: Color32 = Color32::from_rgb(0x52, 0x88, 0xC1);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x64, 0x9A, 0xD3);
 pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x6A, 0xB2, 0xF2);
 pub const OUTGOING_BUBBLE: Color32 = Color32::from_rgb(0x2B, 0x52, 0x78);
 pub const INCOMING_BUBBLE: Color32 = Color32::from_rgb(0x18, 0x25, 0x33);

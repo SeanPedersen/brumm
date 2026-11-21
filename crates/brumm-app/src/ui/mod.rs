@@ -12,6 +12,7 @@ pub mod emoji;
 pub mod emoji_font;
 pub mod errors;
 pub mod files;
+mod icons;
 mod links;
 pub mod main_screen;
 pub mod onboarding;
