@@ -2,6 +2,10 @@
 //! their payloads. Every successfully processed ciphertext is remembered so a retried copy is
 //! acked again instead of failing to decrypt (its message key is already used). Envelopes that
 //! arrive via the mailbox are acknowledged with a `Payload::Receipt` (never for receipts).
+//!
+//! Only a payload we refuse is answered with the final `InvalidMessage`. A ciphertext no session
+//! opens gets `Undecryptable` (the sender encrypts it again), and a local failure gets
+//! `TryLater`, so the sender never drops an envelope because of a problem on this side.
 
 use anyhow::Result;
 use iroh::EndpointId;
@@ -26,7 +30,7 @@ impl Node {
             Ok(reply) => reply,
             Err(err) => {
                 tracing::warn!(?err, "inbound frame failed");
-                Reply::Rejected(RejectReason::InvalidMessage)
+                Reply::Rejected(RejectReason::TryLater)
             }
         };
         let _ = request.reply.send(reply);
@@ -42,7 +46,13 @@ impl Node {
                 link_secret,
                 sealed,
             } => self.accept_link(from, link_secret, &sealed),
-            Frame::Sealed(sealed) => Ok(self.receive_sealed(from, &sealed)?.reply),
+            Frame::Sealed(sealed) => {
+                let processed = self.receive_sealed(from, &sealed)?;
+                if matches!(processed.reply, Reply::Ack { .. }) {
+                    self.own_device_reachable(from)?;
+                }
+                Ok(processed.reply)
+            }
         }
     }
 
@@ -86,12 +96,16 @@ impl Node {
             });
         }
         let Self { store, me, .. } = self;
-        let plaintext = me.as_mut().expect("checked above").crypto.open(
+        let Some(plaintext) = me.as_mut().expect("checked above").crypto.open(
             store,
             &from,
             &entry.cert.olm_identity_key,
             sealed,
-        )?;
+        )?
+        else {
+            tracing::info!(%from, "no session opens this envelope");
+            return Ok(rejected(RejectReason::Undecryptable));
+        };
         let envelope: Envelope = wire::decode(&plaintext)?;
         self.store
             .remember_ciphertext(&hash, &envelope.id, now_ms())?;
@@ -124,6 +138,9 @@ impl Node {
             (Payload::Avatar(avatar), from_own) => self.receive_avatar(owner, avatar, from_own)?,
             (Payload::History(items), true) => self.receive_history(items)?,
             (Payload::HistoryManifest(counts), true) => self.receive_history_manifest(counts)?,
+            (Payload::SyncDigest(digest), true) => self.receive_sync_digest(from, digest)?,
+            (Payload::SyncHave(have), true) => self.receive_sync_have(from, have)?,
+            (Payload::SyncMessages(items), true) => self.receive_sync_messages(from, items)?,
             (payload, _) => {
                 tracing::warn!(
                     ?payload,
@@ -307,6 +324,14 @@ impl Node {
 
     fn receive_history(&mut self, items: Vec<HistoryItem>) -> Result<bool> {
         self.note_history_chunk(&items)?;
+        self.insert_history(items)?;
+        Ok(true)
+    }
+
+    /// Stores history items from an own device; returns the ones refused because they were
+    /// deleted here.
+    pub(super) fn insert_history(&mut self, items: Vec<HistoryItem>) -> Result<Vec<HistoryItem>> {
+        let mut refused = Vec::new();
         let mut changed = Vec::new();
         for item in items {
             if !item.message.body.is_valid() {
@@ -317,15 +342,19 @@ impl Node {
             } else {
                 Direction::Incoming
             };
-            if self.store.insert_message(
+            let inserted = self.store.insert_message(
                 &item.contact,
                 &item.message,
                 direction,
                 DeliveryStatus::Delivered,
                 None,
-            )? && !changed.contains(&item.contact)
-            {
-                changed.push(item.contact);
+            )?;
+            if inserted {
+                if !changed.contains(&item.contact) {
+                    changed.push(item.contact);
+                }
+            } else if !self.store.message_exists(&item.contact, &item.message.id)? {
+                refused.push(item);
             }
         }
         if !changed.is_empty() {
@@ -334,7 +363,7 @@ impl Node {
             }
             self.events.emit(Event::ConversationsChanged(changed));
         }
-        Ok(true)
+        Ok(refused)
     }
 }
 

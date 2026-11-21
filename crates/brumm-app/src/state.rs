@@ -316,10 +316,9 @@ impl AppState {
                     *self.unread.entry(contact).or_default() += 1;
                 }
                 if self.selected == Some(contact) {
-                    self.conversations
-                        .entry(contact)
-                        .or_default()
-                        .push(message.clone());
+                    let has_older = self.has_older.contains(&contact);
+                    let loaded = self.conversations.entry(contact).or_default();
+                    insert_in_order(loaded, message.clone(), has_older);
                 }
                 self.remember_preview(message);
             }
@@ -474,6 +473,20 @@ impl AppState {
             ctx.forget_image(&attachment_uri(&key.1));
         }
     }
+}
+
+/// Places a live arrival where the store's order (`sent_at_ms`, then arrival) puts it, so a
+/// late transcript or mailbox letter does not land below newer messages until the next reload.
+/// One older than the loaded page (while older pages exist) is left to `LoadOlder`.
+fn insert_in_order(loaded: &mut Vec<MessageView>, message: MessageView, has_older: bool) {
+    if loaded.iter().any(|known| known.id == message.id) {
+        return;
+    }
+    let position = loaded.partition_point(|known| known.sent_at_ms <= message.sent_at_ms);
+    if position == 0 && has_older && !loaded.is_empty() {
+        return;
+    }
+    loaded.insert(position, message);
 }
 
 fn arc_bytes(data: Arc<Vec<u8>>) -> Arc<[u8]> {
@@ -638,6 +651,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn late_arrivals_take_their_sent_time_position_in_the_open_chat() {
+        let mut state = AppState::default();
+        let (me, bob) = ([1; 32], [2; 32]);
+        ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
+        let ctx = egui::Context::default();
+        state.apply(
+            Event::Conversation {
+                contact: bob,
+                messages: vec![message(bob, 10), message(bob, 20), message(bob, 30)],
+                has_older: false,
+            },
+            &ctx,
+        );
+        // A letter that was sent between two loaded messages, one that is the newest, a
+        // duplicate event and one sent at the same time as a loaded one (it arrived later).
+        for id in [15, 40, 15] {
+            state.apply(Event::MessageAdded(message(bob, id)), &ctx);
+        }
+        let mut same_time = message(bob, 41);
+        same_time.sent_at_ms = 20;
+        state.apply(Event::MessageAdded(same_time), &ctx);
+        let ids: Vec<u8> = state.conversations[&bob].iter().map(|m| m.id[0]).collect();
+        assert_eq!(ids, vec![10, 15, 20, 41, 30, 40]);
+        assert_eq!(state.previews[&bob].id, [40; 16]);
+    }
+
+    #[test]
+    fn a_late_arrival_older_than_the_loaded_page_waits_for_load_older() {
+        let mut state = AppState::default();
+        let (me, bob) = ([1; 32], [2; 32]);
+        ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
+        let ctx = egui::Context::default();
+        state.apply(
+            Event::Conversation {
+                contact: bob,
+                messages: vec![message(bob, 10), message(bob, 20)],
+                has_older: true,
+            },
+            &ctx,
+        );
+        state.apply(Event::MessageAdded(message(bob, 5)), &ctx);
+        let ids: Vec<u8> = state.conversations[&bob].iter().map(|m| m.id[0]).collect();
+        assert_eq!(ids, vec![10, 20], "the gap to older pages stays closed");
     }
 
     #[test]

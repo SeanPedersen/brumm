@@ -170,6 +170,8 @@ Payload::ContactSync(ContactRecord { profile, added_at_ms })   own device only
 Payload::History(Vec<HistoryItem>)                  own device only
 Payload::HistoryManifest(Vec<HistoryCount { contact, messages }>)   own device only, ahead of the History chunks
 Payload::Receipt(Vec<EnvelopeId>)                   any known device (ack for mailbox-delivered envelopes)
+Payload::SyncDigest / SyncHave / SyncMessages       own device only, consistency check (§6.4)
+RejectReason: UnknownInvite | InvalidProfile | UnknownSender | InvalidMessage | Undecryptable | TryLater
 Sealed { message_type: u8, ciphertext }             # vodozemac OlmMessage::to_parts
 ```
 One request/response per QUIC bi-stream. Connections are cached per peer device.
@@ -180,17 +182,22 @@ Acks are plaintext random ids over QUIC/TLS. They become sealed payloads when th
 send_text(contact, text):
     for d in devices(contact):   outbox += (d, Envelope{ id = message.id, Chat })        # chat_contact = contact
     for d in my other devices:   outbox += (d, Envelope{ random id, SentTranscript })
-each outbox row stores the Olm ciphertext, **sealed once** at enqueue time
+each outbox row stores the Olm ciphertext, **sealed once** at enqueue time (plus the plaintext envelope, for one reseal)
 flush (on enqueue, after each ack, every 30 s): send rows in queue order, ≤ 2 in flight per device
              # queue order is the priority (history sync); the next row starts when one is acked
 Ack{id}                     → drop row; chat rows mark the message Delivered (any device suffices)
-Rejected(InvalidMessage)    → drop row; chat → Failed (unless already Delivered)
+Rejected(InvalidMessage)    → drop row; chat → Failed (unless already Delivered)   # the payload itself is refused
+Rejected(Undecryptable)     → reseal once on a fresh session (from the device's fallback key), keep the queue position;
+                              a second Undecryptable → drop row, chat → Failed
 Rejected(other) / unreachable → keep row, retry   # e.g. contact hasn't processed our new device list yet
 unreachable → also post the same ciphertext once to the device's Nostr mailbox (§8) → Sent
               (every row queued for that device, not only the ones in flight)
 ```
 - **Seal once, resend the same bytes.** Re-encrypting on every retry would advance the ratchet without bound while a
   device is offline, beyond Olm's skipped-message-key window.
+- **Receivers reject finally only what they refuse.** A ciphertext no session opens (the receiver lost or evicted the
+  session) is `Undecryptable`, a local failure (storage) is `TryLater`; neither ever makes the sender drop the envelope.
+  The fresh session for a reseal is shared: it is only started again if the failed envelope was sealed after it.
 - The receiver keeps `blake3(ciphertext) → envelope id` for processed envelopes and **re-acks duplicates**
   (a retry whose ack was lost) instead of failing to decrypt. Pruned with message retention.
 - Status shown in the UI: `Pending` 🕓 → `Sent` ✔ (in the mailbox) → `Delivered` ✔✔ (acknowledged by at least one
@@ -198,7 +205,27 @@ unreachable → also post the same ciphertext once to the device's Nostr mailbox
 
 ### 6.3 Ordering & deduplication
 - `id` is random; receivers deduplicate by `(sender_user, id)`.
-- Messages are shown in `sent_at_ms` order (sender clock); the receive time is stored too.
+- Messages are shown in `sent_at_ms` order (sender clock, ties in arrival order); the receive time is stored too.
+  A message arriving late (mailbox, sync) is inserted at its place in the open chat, not appended.
+- Deletions are final: a deleted `(conversation, id)` is remembered (`deleted_messages`) and never inserted again, also
+  when the delete arrives before the message. Kept as long as messages are (Notes: forever).
+
+### 6.4 Own-device consistency check (anti-entropy) [Multi ✅]
+Delivery is reliable, but anything lost on the way (a bug, a dropped session, a relay that lost a letter) would stay
+lost. So every pair of own devices compares what it holds and repairs the difference:
+```
+A → B  SyncDigest { since_ms, [(conversation, week, blake3(sorted ids)[..16])] }     direct, no outbox
+B → A  SyncHave   { since_ms, [(conversation, week, all of B's ids)] }  for differing buckets, direct
+A → B  SyncMessages(HistoryItem…)  what B lacks                                       via outbox
+       DeleteSync                  what B has but A deleted                           via outbox
+B: SyncMessages item that B deleted → refused, DeleteSync back to A
+```
+- Window: Notes in full, other chats from `now − retention + 1 day` (both sides use the sender's `since_ms`).
+- A round starts at startup, when the other device acks or sends something directly, and every 5 minutes while it was
+  seen in the last 6 rounds; at most once per interval per device, and **never while envelopes for it are queued**
+  (B does not answer while it has envelopes queued for A). The reverse direction is B's own round.
+- Digest and answer go out directly (no outbox), so an offline device does not accumulate them; the repairs are
+  ordinary envelopes. Reactions and delivery status are not compared.
 
 ---
 
@@ -279,7 +306,7 @@ and `relay.primal.net` (each device publishes its own list, max 3).
 - [M5] SQLCipher with a random DB key held in the **OS keychain** (Signal Desktop style), so there is still no prompt.
   Optional app lock later.
 - Tables: `meta` (seed phrase, device secret, profile, Olm account, last opened chat), `contacts`, `devices`,
-  `olm_sessions`, `messages`, `invites`. `PRAGMA user_version` = schema version; pre-release
+  `olm_sessions`, `messages`, `deleted_messages`, `invites`, `outbox` (ciphertext + plaintext envelope until resealed), … `PRAGMA user_version` = schema version; pre-release
   schemas are rejected with a "delete profile" hint.
 - **Retention**: messages older than 60 days (configurable) are pruned at startup and every 6 h.
 

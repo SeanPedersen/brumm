@@ -56,12 +56,13 @@ impl Node {
             mailbox_relays,
             me,
             link_target,
+            reconcile_interval,
             ..
         } = self;
         shutdown_network(me, link_target).await;
         store.wipe()?;
         tracing::info!("logged out; local data erased");
-        let fresh = Node::with_store(store, events.clone(), mailbox_relays);
+        let fresh = Node::with_store(store, events.clone(), mailbox_relays, reconcile_interval);
         events.emit(Event::LoggedOut);
         Ok(fresh)
     }

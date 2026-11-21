@@ -37,3 +37,5 @@ universal-time = "0.3.1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber.workspace = true
 nostr-sdk = { workspace = true, features = ["local-relay"] }
+# Tests reach into a stopped node's database to simulate lost envelopes and sessions.
+rusqlite.workspace = true

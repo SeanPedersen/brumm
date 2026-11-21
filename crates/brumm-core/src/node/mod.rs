@@ -8,6 +8,7 @@
 //! - [`linking`]: adding / removing devices of our own identity (both sides)
 //! - [`delivery`]: per-device outbox, fan-out, acks and the Nostr mailbox fallback
 //! - [`inbound`]: decrypting and applying envelopes from peers (direct or via mailbox)
+//! - [`reconcile`]: periodic consistency check between own devices (repairs any gap)
 
 mod commands;
 mod contacts;
@@ -16,6 +17,7 @@ mod history_sync;
 mod inbound;
 mod linking;
 mod logout;
+mod reconcile;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -57,6 +59,8 @@ pub struct NodeConfig {
     pub retry_interval: Duration,
     /// Nostr relays this device receives offline letters on (published in its device entry).
     pub mailbox_relays: Vec<String>,
+    /// Minimum time between two consistency checks with the same own device.
+    pub reconcile_interval: Duration,
 }
 
 impl NodeConfig {
@@ -65,6 +69,7 @@ impl NodeConfig {
             data_dir,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             mailbox_relays: mailbox::default_relays(),
+            reconcile_interval: reconcile::DEFAULT_RECONCILE_INTERVAL,
         }
     }
 }
@@ -86,6 +91,7 @@ pub async fn run(
 
     let mut retry = time::interval(config.retry_interval);
     let mut prune = time::interval(PRUNE_INTERVAL);
+    let mut reconcile = time::interval(config.reconcile_interval);
     loop {
         let result = tokio::select! {
             command = commands.recv() => match command {
@@ -100,6 +106,7 @@ pub async fn run(
             Some(letter) = node.letters_rx.recv() => node.receive_letter(letter),
             _ = retry.tick() => node.flush_outbox(),
             _ = prune.tick() => node.prune(),
+            _ = reconcile.tick() => node.reconcile_tick(),
         };
         node.report(result);
         if node.logout_ready() {
@@ -178,6 +185,12 @@ enum Outcome {
         envelope_id: EnvelopeId,
         result: Result<()>,
     },
+    /// Reply to an envelope sent without the outbox ([`Node::send_direct`]).
+    Direct {
+        device: EndpointId,
+        sealed_at_ms: u64,
+        reply: Result<Reply>,
+    },
     MailboxReady(Arc<Mailbox>),
     /// The log-out grace period ended; erase now even if some announcements are still pending.
     LogoutDeadline,
@@ -195,6 +208,10 @@ struct Node {
     in_flight: HashSet<(EndpointId, EnvelopeId)>,
     /// Envelopes currently being posted to a mailbox.
     mailboxing: HashSet<(EndpointId, EnvelopeId)>,
+    /// When we last restarted the session to a device that could not decrypt (Unix ms).
+    fresh_sessions: HashMap<EndpointId, u64>,
+    reconcile: reconcile::ReconcileState,
+    reconcile_interval: Duration,
     inbound_tx: mpsc::Sender<InboundRequest>,
     inbound_rx: mpsc::Receiver<InboundRequest>,
     outcomes_tx: mpsc::UnboundedSender<Outcome>,
@@ -215,12 +232,18 @@ impl Node {
             store,
             events,
             config.mailbox_relays.clone(),
+            config.reconcile_interval,
         ))
     }
 
     /// Fresh in-memory state over an opened store. New channels, so results of network tasks
     /// spawned by an earlier node (before a log-out) are dropped.
-    fn with_store(store: Store, events: EventSink, mailbox_relays: Vec<String>) -> Self {
+    fn with_store(
+        store: Store,
+        events: EventSink,
+        mailbox_relays: Vec<String>,
+        reconcile_interval: Duration,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let (letters_tx, letters_rx) = mpsc::channel(INBOUND_QUEUE);
@@ -234,6 +257,9 @@ impl Node {
             pending_links: HashMap::new(),
             in_flight: HashSet::new(),
             mailboxing: HashSet::new(),
+            fresh_sessions: HashMap::new(),
+            reconcile: reconcile::ReconcileState::default(),
+            reconcile_interval,
             inbound_tx,
             inbound_rx,
             outcomes_tx,
@@ -389,6 +415,11 @@ impl Node {
                 envelope_id,
                 result,
             } => self.finish_mailboxing(device, envelope_id, result),
+            Outcome::Direct {
+                device,
+                sealed_at_ms,
+                reply,
+            } => self.finish_direct(device, sealed_at_ms, reply),
             Outcome::MailboxReady(mailbox) => {
                 if let Some(me) = self.me.as_mut() {
                     me.mailbox = Some(mailbox);

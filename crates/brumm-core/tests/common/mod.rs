@@ -6,6 +6,7 @@ use std::{collections::VecDeque, path::PathBuf, time::Duration};
 use brumm_core::{
     api::{
         Command, ContactView, DeliveryStatus, DeviceId, DeviceView, Direction, Event, EventSink,
+        MessageView,
     },
     identity::UserKey,
     node::{self, NodeConfig},
@@ -15,6 +16,10 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub const EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const TEST_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Own devices compare their messages this often in tests (minutes in production).
+pub const TEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const CONVERSATION_POLL: Duration = Duration::from_millis(300);
+const DATABASE_FILE: &str = "brumm.db";
 /// Nothing listens here: tests without a mailbox relay get no offline delivery.
 const NO_RELAY: &str = "ws://127.0.0.1:9";
 
@@ -55,6 +60,7 @@ impl TestNode {
         let config = NodeConfig {
             retry_interval: TEST_RETRY_INTERVAL,
             mailbox_relays: relays.clone(),
+            reconcile_interval: TEST_RECONCILE_INTERVAL,
             ..NodeConfig::new(data_dir.clone())
         };
         let task = tokio::spawn(node::run(
@@ -161,6 +167,39 @@ impl TestNode {
             _ => None,
         })
         .await
+    }
+
+    /// The whole stored conversation, oldest first.
+    pub async fn conversation(&mut self, contact: UserKey) -> Vec<MessageView> {
+        self.send(Command::LoadConversation {
+            contact,
+            limit: None,
+        });
+        self.expect(|event| match event {
+            Event::Conversation {
+                contact: loaded,
+                messages,
+                ..
+            } if *loaded == contact => Some(messages.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Texts of the conversation once they equal `expected` (in order); panics on timeout.
+    pub async fn wait_texts(&mut self, contact: UserKey, expected: &[&str]) {
+        let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+        loop {
+            let texts = texts(&self.conversation(contact).await);
+            if texts == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "conversation stayed at {texts:?}, expected {expected:?}"
+            );
+            tokio::time::sleep(CONVERSATION_POLL).await;
+        }
     }
 
     pub async fn ready(&mut self) {
@@ -270,6 +309,28 @@ impl Stopped {
     pub fn start(self) -> TestNode {
         TestNode::spawn_in(self.data_dir, self.relays)
     }
+
+    /// Edits the stopped node's database, e.g. to drop envelopes as if they were lost.
+    pub fn sql(&self, statement: &str) -> usize {
+        let db = rusqlite::Connection::open(self.data_dir.join(DATABASE_FILE)).expect("open db");
+        db.execute(statement, []).expect("statement runs")
+    }
+}
+
+impl TestNode {
+    /// A number from the running node's database (WAL allows a second reader).
+    pub fn sql_number(&self, query: &str) -> i64 {
+        let db = rusqlite::Connection::open(self.data_dir.join(DATABASE_FILE)).expect("open db");
+        db.query_row(query, [], |row| row.get(0))
+            .expect("query runs")
+    }
+}
+
+pub fn texts(messages: &[MessageView]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| message.text.clone())
+        .collect()
 }
 
 /// In-memory Nostr relay for mailbox tests; keep the handle alive for the test's duration.

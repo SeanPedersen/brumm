@@ -64,7 +64,13 @@ pub enum RejectReason {
     UnknownInvite,
     InvalidProfile,
     UnknownSender,
+    /// Final: the envelope decrypted but its payload is not acceptable.
     InvalidMessage,
+    /// No session of the receiver opens this ciphertext (e.g. it dropped the session). Resending
+    /// the same bytes cannot help; the sender encrypts the envelope again on a fresh session.
+    Undecryptable,
+    /// A local failure on the receiver (e.g. storage); the sender retries the same ciphertext.
+    TryLater,
 }
 
 /// Unit of reliable delivery to one device; acked by `id`.
@@ -111,6 +117,44 @@ pub enum Payload {
     /// Own-device sync, sent before the [`Payload::History`] chunks for a freshly linked
     /// device: how many history items follow per conversation, so it can show progress.
     HistoryManifest(Vec<HistoryCount>),
+    /// Own-device consistency check, step 1: a hash of the message ids per conversation and week.
+    SyncDigest(SyncDigest),
+    /// Step 2, the answer: this device's ids in every bucket whose hash differed.
+    SyncHave(SyncHave),
+    /// Step 3: messages the other device lacks (no history-sync progress counting).
+    SyncMessages(Vec<HistoryItem>),
+}
+
+/// Messages from `since_ms` on (Notes: all of them), summarized per bucket. Both sides compare
+/// the same window: the receiver builds its own buckets with the sender's `since_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncDigest {
+    pub since_ms: u64,
+    pub buckets: Vec<SyncBucket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncBucket {
+    pub contact: UserKey,
+    /// `sent_at_ms` / one week.
+    pub week: u32,
+    pub hash: BucketHash,
+}
+
+pub type BucketHash = [u8; 16];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncHave {
+    pub since_ms: u64,
+    pub buckets: Vec<SyncBucketIds>,
+}
+
+/// All ids one device holds in a bucket (empty if it has none there).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncBucketIds {
+    pub contact: UserKey,
+    pub week: u32,
+    pub ids: Vec<MessageId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

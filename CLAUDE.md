@@ -11,6 +11,15 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **Multi-device done:** signed `DeviceList` (seq, ≤ 8 devices, fallback keys), linking via a
   `brumm://link/` ticket with contact + history sync, removal/revocation, a per-device outbox
   (sealed once, resent as-is), several Olm sessions per device, and re-acking duplicate ciphertexts.
+- **Consistency between own devices:** receivers answer `Undecryptable` (no session opens it) or `TryLater` (local
+  error) instead of the final `InvalidMessage`, so a sender never drops an envelope for a problem on the receiver's side.
+  On `Undecryptable` the outbox entry is resealed **once** on a fresh session from the fallback key (schema v8 keeps the
+  plaintext envelope in `outbox.envelope` until then). Own devices run an anti-entropy round (`reconcile.rs` pure
+  compare, `node/reconcile.rs` triggers): digest of message ids per chat and week → ids of differing buckets → missing
+  messages (`SyncMessages`) and lost deletes (`DeleteSync`) via the outbox. Rounds start at startup, on direct contact
+  and every `reconcile_interval` (5 min) while the device was seen recently, never while its outbox is non-empty.
+  Deleted ids are kept in `deleted_messages` and never re-inserted (also when a delete overtakes its message).
+  The UI inserts a live `MessageAdded` at its `sent_at_ms` position (`state.rs insert_in_order`), not at the end.
 - **Log out** (☰ menu, and "Erase this device" on the removed screen): `Command::LogOut` signs a device list without
   this device (any device holds the seed) and announces it to own devices + contacts, waits until no delivery/mailbox post
   is in flight (max 20 s), then `Store::wipe` (every row, `secure_delete` + `VACUUM`) and a fresh node → `Event::LoggedOut`
@@ -94,6 +103,8 @@ crates/brumm-core/        no UI; everything async/network/storage
   src/node/linking.rs     link / remove devices, apply own DeviceList, revocation
   src/node/delivery.rs    per-device outbox: enqueue (seal once), flush, acks, mailbox fallback, receipts
   src/node/inbound.rs     decrypt + dedupe + apply Envelope payloads
+  src/node/reconcile.rs   own-device consistency rounds: when to run, apply digest / have / missing messages
+  src/reconcile.rs        pure bucket digest + compare (no I/O)
   src/identity.rs         UserIdentity (BIP-39 → Ed25519 via blake3 derive_key), DeviceCert,
                           DeviceEntry, signed DeviceList, Profile {display_name, devices}
   src/crypto.rs           thin vodozemac wrapper: OlmDevice, Sealed, seal/open, pickles
@@ -109,6 +120,8 @@ crates/brumm-core/        no UI; everything async/network/storage
   tests/two_nodes.rs      e2e: invite + chat + invite reuse rejection
   tests/multi_device.rs   e2e: link, contact/history sync, fan-out, transcripts, revocation
   tests/mailbox.rs        e2e via in-memory Nostr relay: never online together, receipts
+  tests/consistency.rs    e2e: lost envelopes/deletes/sessions repaired, mailbox notes once + in order
+                          (simulates losses by editing a stopped node's DB, `Stopped::sql`)
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
 crates/brumm-worker/      browser only: runs brumm-core in a Web Worker (OPFS storage, message pump)
 crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html + Trunk.toml for the web
@@ -145,7 +158,9 @@ crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html 
 - New schema changes: bump `SCHEMA_VERSION` in store.rs and add a migration step (pre-release
   schemas are currently just rejected).
 - Never persist plaintext Olm state, and always save the session after `seal`/`open`. `e2ee.rs` does this.
-- Never re-encrypt an outbox entry on retry: always resend the stored ciphertext (ratchet gap limit).
+- Never re-encrypt an outbox entry on retry: always resend the stored ciphertext (ratchet gap limit). The only
+  exception is the single reseal after the receiver answered `Undecryptable`.
+- Only answer `InvalidMessage` for a payload we refuse; it makes the sender drop the envelope for good.
 - Own-device-only payloads (`SentTranscript`, `ContactSync`, `History`) must be rejected from contacts.
 - Names for constants, no magic numbers. Module doc comment at the top of every file.
 

@@ -11,6 +11,7 @@ pub mod invite;
 pub mod link;
 pub mod mailbox;
 pub mod node;
+mod reconcile;
 mod store;
 mod transport;
 pub mod wire;

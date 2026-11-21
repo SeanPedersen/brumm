@@ -23,8 +23,9 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 7;
-/// Oldest schema that [`SCHEMA`] upgrades in place (v5–v7 only added tables).
+const SCHEMA_VERSION: i64 = 8;
+/// Oldest schema that [`SCHEMA`] upgrades in place (v5–v8 added tables; v8 also
+/// [`OUTBOX_ENVELOPE_COLUMN`]).
 const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     is_receipt    INTEGER NOT NULL,
     mailboxed     INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
+    envelope      BLOB,
     PRIMARY KEY (device_id, envelope_id)
 );
 CREATE TABLE IF NOT EXISTS avatars (
@@ -102,7 +104,15 @@ CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     envelope_id BLOB NOT NULL,
     seen_at_ms  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deleted_messages (
+    contact       BLOB NOT NULL,
+    id            BLOB NOT NULL,
+    deleted_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (contact, id)
+);
 ";
+/// Plaintext envelope of an outbox entry, kept until its one re-encryption (v8).
+const OUTBOX_ENVELOPE_COLUMN: &str = "envelope";
 
 const META_SEED_PHRASE: &str = "seed_phrase";
 const META_DEVICE_SECRET: &str = "device_secret";
@@ -124,6 +134,7 @@ pub struct StoredIdentity {
 }
 
 /// One envelope, encrypted once at enqueue time, waiting for an ack from one device.
+/// The plaintext stays next to it only for one re-encryption ([`Store::reseal`]).
 pub struct OutboxItem {
     pub device: EndpointId,
     pub envelope_id: EnvelopeId,
@@ -136,6 +147,14 @@ pub struct OutboxItem {
 
 pub struct Store {
     db: Connection,
+}
+
+/// A message's identity and bucket time, without its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedMessage {
+    pub contact: UserKey,
+    pub id: MessageId,
+    pub sent_at_ms: u64,
 }
 
 pub struct ConversationPage {
@@ -196,6 +215,7 @@ impl Store {
         }
         if version != SCHEMA_VERSION {
             db.execute_batch(SCHEMA)?;
+            add_column_if_missing(&db, "outbox", OUTBOX_ENVELOPE_COLUMN, "BLOB")?;
             db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(Self { db })
@@ -521,28 +541,77 @@ impl Store {
 
     // ── outbox ──────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         device: &EndpointId,
         envelope_id: &EnvelopeId,
         sealed: &Sealed,
+        envelope: &[u8],
         chat_contact: Option<&UserKey>,
         is_receipt: bool,
         now_ms: u64,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT OR IGNORE INTO outbox (device_id, envelope_id, sealed, chat_contact, is_receipt, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO outbox (device_id, envelope_id, sealed, envelope, chat_contact, is_receipt, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 device.as_bytes().as_slice(),
                 envelope_id.as_slice(),
                 wire::encode(sealed),
+                envelope,
                 chat_contact.map(|contact| contact.as_slice()),
                 is_receipt,
                 now_ms as i64
             ],
         )?;
         Ok(())
+    }
+
+    /// The plaintext envelope and enqueue time of an entry that was not re-encrypted yet.
+    pub fn outbox_envelope(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        let row: Option<(Option<Vec<u8>>, i64)> = self
+            .db
+            .query_row(
+                "SELECT envelope, created_at_ms FROM outbox WHERE device_id = ?1 AND envelope_id = ?2",
+                params![device.as_bytes().as_slice(), envelope_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(envelope, created_at_ms)| Some((envelope?, created_at_ms as u64))))
+    }
+
+    /// Replaces an entry's ciphertext with a fresh one and drops its plaintext, so an entry is
+    /// re-encrypted at most once. Queue position stays; the new bytes may go to the mailbox again.
+    pub fn reseal(
+        &self,
+        device: &EndpointId,
+        envelope_id: &EnvelopeId,
+        sealed: &Sealed,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE outbox SET sealed = ?3, envelope = NULL, mailboxed = 0
+             WHERE device_id = ?1 AND envelope_id = ?2",
+            params![
+                device.as_bytes().as_slice(),
+                envelope_id.as_slice(),
+                wire::encode(sealed)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether anything is still queued for `device`.
+    pub fn has_outbox_for(&self, device: &EndpointId) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE device_id = ?1)",
+            params![device.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn outbox_item(
@@ -699,7 +768,8 @@ impl Store {
 
     // ── messages ────────────────────────────────────────────────────────────
 
-    /// Returns `false` if the message was already stored (duplicate delivery or sync).
+    /// Returns `false` if the message was already stored (duplicate delivery or sync) or was
+    /// deleted here before (a late copy must not bring it back).
     pub fn insert_message(
         &self,
         contact: &UserKey,
@@ -710,7 +780,8 @@ impl Store {
     ) -> Result<bool> {
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (contact, id, direction, body, sent_at_ms, received_at_ms, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE contact = ?1 AND id = ?2)",
             params![
                 contact.as_slice(),
                 message.id.as_slice(),
@@ -918,14 +989,74 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// `(contact, id, sent_at_ms)` of every message from `since_ms` on, plus all of `keep_all`
+    /// (Notes). The ids-only input of the own-device consistency check ([`crate::reconcile`]).
+    pub fn message_index(&self, since_ms: u64, keep_all: &UserKey) -> Result<Vec<IndexedMessage>> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT contact, id, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 OR contact = ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ms as i64, keep_all], |row| {
+            Ok(IndexedMessage {
+                contact: blob_array(row, 0)?,
+                id: blob_array(row, 1)?,
+                sent_at_ms: row.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Stored messages of one conversation among `ids`, as history items (with their bodies).
+    pub fn history_items(&self, contact: &UserKey, ids: &[MessageId]) -> Result<Vec<HistoryItem>> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT direction, body, sent_at_ms FROM messages WHERE contact = ?1 AND id = ?2",
+        )?;
+        let mut items = Vec::new();
+        for id in ids {
+            let item = stmt
+                .query_row(params![contact.as_slice(), id.as_slice()], |row| {
+                    Ok(HistoryItem {
+                        contact: *contact,
+                        outgoing: direction_from_code(row.get(0)?) == Direction::Outgoing,
+                        message: ChatMessage {
+                            id: *id,
+                            body: body_from_blob(row, 1)?,
+                            sent_at_ms: row.get::<_, i64>(2)? as u64,
+                        },
+                    })
+                })
+                .optional()?;
+            items.extend(item);
+        }
+        Ok(items)
+    }
+
+    /// The ids among `ids` that were deleted in this conversation.
+    pub fn deleted_among(&self, contact: &UserKey, ids: &[MessageId]) -> Result<Vec<MessageId>> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM deleted_messages WHERE contact = ?1 AND id = ?2)",
+        )?;
+        let mut deleted = Vec::new();
+        for id in ids {
+            if stmt.query_row(params![contact.as_slice(), id.as_slice()], |row| {
+                row.get::<_, bool>(0)
+            })? {
+                deleted.push(*id);
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Removes messages of one conversation; `only` restricts it to one direction (a contact may
     /// only delete what they sent). Returns the ids that were actually removed.
+    /// Every removed id, and every id not stored at all (its copy may still be on the way), is
+    /// remembered as deleted so it is never inserted again. A kept message (other direction) is not.
     pub fn delete_messages(
         &self,
         contact: &UserKey,
         ids: &[MessageId],
         only: Option<Direction>,
     ) -> Result<Vec<MessageId>> {
+        let deleted_at_ms = crate::clock::now_ms();
         let mut removed = Vec::new();
         for id in ids {
             let deleted = match only {
@@ -940,6 +1071,12 @@ impl Store {
             };
             if deleted == 1 {
                 removed.push(*id);
+            }
+            if deleted == 1 || !self.message_exists(contact, id)? {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO deleted_messages (contact, id, deleted_at_ms) VALUES (?1, ?2, ?3)",
+                    params![contact.as_slice(), id.as_slice(), deleted_at_ms as i64],
+                )?;
             }
         }
         self.purge_orphan_reactions()?;
@@ -1021,6 +1158,11 @@ impl Store {
         )?;
         let removed = self.db.execute(
             "DELETE FROM messages WHERE sent_at_ms < ?1 AND contact != ?2",
+            params![cutoff_ms as i64, keep],
+        )?;
+        // Notes keep their messages forever, so they keep their deletions too.
+        self.db.execute(
+            "DELETE FROM deleted_messages WHERE deleted_at_ms < ?1 AND contact != ?2",
             params![cutoff_ms as i64, keep],
         )?;
         self.purge_orphan_reactions()?;
@@ -1138,6 +1280,19 @@ fn replace_devices(
         )?;
     }
     Ok(removed)
+}
+
+/// In-place upgrade step: `CREATE TABLE IF NOT EXISTS` leaves an older table without new columns.
+fn add_column_if_missing(db: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let exists: bool = db.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+        params![column],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
+    Ok(())
 }
 
 fn set_meta(db: &Connection, key: &str, value: &[u8]) -> Result<()> {
@@ -1447,10 +1602,10 @@ mod tests {
         };
         let id = [7; 16];
         store
-            .enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0)
+            .enqueue(&device, &id, &sealed, b"plain", Some(&[9; 32]), false, 0)
             .unwrap();
         store
-            .enqueue(&device, &id, &sealed, Some(&[9; 32]), false, 0)
+            .enqueue(&device, &id, &sealed, b"plain", Some(&[9; 32]), false, 0)
             .unwrap();
         let outbox = store.outbox().unwrap();
         assert_eq!(outbox.len(), 1);
@@ -1577,5 +1732,167 @@ mod tests {
 
         store.delete_messages(&contact, &[id], None).unwrap();
         assert!(store.image_preview(&contact, &id, 320).unwrap().is_none());
+    }
+
+    fn text(id: u8, sent_at_ms: u64) -> ChatMessage {
+        ChatMessage {
+            id: [id; 16],
+            sent_at_ms,
+            body: Body::Text(format!("m{id}")),
+        }
+    }
+
+    fn insert(
+        store: &Store,
+        contact: &UserKey,
+        message: &ChatMessage,
+        direction: Direction,
+    ) -> bool {
+        store
+            .insert_message(contact, message, direction, DeliveryStatus::Delivered, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_outbox_entry_is_resealed_at_most_once() {
+        let store = Store::open_in_memory().unwrap();
+        let device = SecretKey::generate().public();
+        let id = [1; 16];
+        let sealed = |byte| Sealed {
+            message_type: 0,
+            ciphertext: vec![byte],
+        };
+        store
+            .enqueue(&device, &id, &sealed(1), b"envelope", None, false, 42)
+            .unwrap();
+        store.mark_mailboxed(&device, &id).unwrap();
+        assert!(store.has_outbox_for(&device).unwrap());
+        assert_eq!(
+            store.outbox_envelope(&device, &id).unwrap(),
+            Some((b"envelope".to_vec(), 42))
+        );
+
+        store.reseal(&device, &id, &sealed(2)).unwrap();
+        let item = store.outbox_item(&device, &id).unwrap().unwrap();
+        assert_eq!(item.sealed, sealed(2));
+        assert!(
+            !item.mailboxed,
+            "the new ciphertext goes to the mailbox again"
+        );
+        assert_eq!(store.outbox_envelope(&device, &id).unwrap(), None);
+        store.dequeue(&device, &id).unwrap();
+        assert!(!store.has_outbox_for(&device).unwrap());
+    }
+
+    #[test]
+    fn deleted_messages_never_come_back() {
+        let store = Store::open_in_memory().unwrap();
+        let contact = [2; 32];
+        assert!(insert(&store, &contact, &text(1, 10), Direction::Outgoing));
+        assert_eq!(
+            store.delete_messages(&contact, &[[1; 16]], None).unwrap(),
+            vec![[1; 16]]
+        );
+        assert!(!insert(&store, &contact, &text(1, 10), Direction::Outgoing));
+
+        // A delete that overtakes its message: the late copy is refused.
+        assert!(
+            store
+                .delete_messages(&contact, &[[2; 16]], None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!insert(&store, &contact, &text(2, 20), Direction::Incoming));
+        assert_eq!(
+            store
+                .deleted_among(&contact, &[[1; 16], [2; 16], [3; 16]])
+                .unwrap(),
+            vec![[1; 16], [2; 16]]
+        );
+        // The same id in another chat is unaffected.
+        assert!(insert(&store, &[3; 32], &text(1, 10), Direction::Outgoing));
+    }
+
+    #[test]
+    fn a_contact_delete_cannot_mark_our_own_messages() {
+        let store = Store::open_in_memory().unwrap();
+        let contact = [2; 32];
+        assert!(insert(&store, &contact, &text(1, 10), Direction::Outgoing));
+        let removed = store
+            .delete_messages(&contact, &[[1; 16]], Some(Direction::Incoming))
+            .unwrap();
+        assert!(removed.is_empty());
+        assert!(
+            store
+                .deleted_among(&contact, &[[1; 16]])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.message_exists(&contact, &[1; 16]).unwrap());
+    }
+
+    #[test]
+    fn pruning_drops_old_deletions_except_in_notes() {
+        let store = Store::open_in_memory().unwrap();
+        let (notes, bob) = ([1; 32], [2; 32]);
+        store.delete_messages(&notes, &[[1; 16]], None).unwrap();
+        store.delete_messages(&bob, &[[1; 16]], None).unwrap();
+        store.prune_messages_before(u64::MAX / 2, &notes).unwrap();
+        assert_eq!(store.deleted_among(&notes, &[[1; 16]]).unwrap().len(), 1);
+        assert!(store.deleted_among(&bob, &[[1; 16]]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_index_covers_the_window_and_all_notes() {
+        let store = Store::open_in_memory().unwrap();
+        let (notes, bob) = ([1; 32], [2; 32]);
+        insert(&store, &notes, &text(1, 5), Direction::Outgoing);
+        insert(&store, &bob, &text(2, 5), Direction::Incoming);
+        insert(&store, &bob, &text(3, 50), Direction::Outgoing);
+        let mut index = store.message_index(10, &notes).unwrap();
+        index.sort_by_key(|entry| entry.id);
+        assert_eq!(
+            index,
+            vec![
+                IndexedMessage {
+                    contact: notes,
+                    id: [1; 16],
+                    sent_at_ms: 5
+                },
+                IndexedMessage {
+                    contact: bob,
+                    id: [3; 16],
+                    sent_at_ms: 50
+                },
+            ]
+        );
+        let items = store.history_items(&bob, &[[3; 16], [9; 16]]).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].outgoing);
+        assert_eq!(items[0].message, text(3, 50));
+    }
+
+    #[test]
+    fn a_v7_database_upgrades_in_place() {
+        let db = Connection::open_in_memory().unwrap();
+        let v7_schema = SCHEMA
+            .replace("    envelope      BLOB,\n", "")
+            .replace("deleted_messages", "unused_in_v7");
+        assert!(!v7_schema.contains("envelope      BLOB"));
+        db.execute_batch(&v7_schema).unwrap();
+        let device = SecretKey::generate().public();
+        db.execute(
+            "INSERT INTO outbox (device_id, envelope_id, sealed, is_receipt, created_at_ms) VALUES (?1, ?2, ?3, 0, 1)",
+            params![device.as_bytes().as_slice(), [6u8; 16].as_slice(), [0u8].as_slice()],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 7).unwrap();
+
+        let store = Store::init(db).unwrap();
+        // Entries from before v8 have no plaintext, so they are never re-encrypted.
+        assert_eq!(store.outbox_envelope(&device, &[6; 16]).unwrap(), None);
+        assert!(store.has_outbox_for(&device).unwrap());
+        store.delete_messages(&[1; 32], &[[1; 16]], None).unwrap();
+        assert_eq!(store.deleted_among(&[1; 32], &[[1; 16]]).unwrap().len(), 1);
     }
 }

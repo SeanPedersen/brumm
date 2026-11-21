@@ -3,6 +3,10 @@
 //! ciphertext (re-encrypting would advance the ratchet unboundedly while a device is offline).
 //! An ack from the device removes the entry; for chat messages it marks the message delivered.
 //!
+//! The one exception: a device that answers `Undecryptable` (it no longer has the session) gets
+//! the envelope encrypted again, once, on a fresh session from its fallback key. Any other
+//! rejection except `InvalidMessage` is retried with the same bytes.
+//!
 //! If a device is unreachable, the same ciphertext is posted once to its Nostr mailbox
 //! (status `Sent`). The recipient later answers with a `Payload::Receipt`, which counts as the
 //! ack. Direct retries continue meanwhile; duplicates are re-acked by the receiver.
@@ -111,11 +115,13 @@ impl Node {
     ) -> Result<()> {
         let Self { store, me, .. } = self;
         let me = me.as_mut().context("no identity")?;
-        let sealed = me.crypto.seal(store, entry, &wire::encode(envelope))?;
+        let plaintext = wire::encode(envelope);
+        let sealed = me.crypto.seal(store, entry, &plaintext)?;
         store.enqueue(
             &entry.device_id(),
             &envelope.id,
             &sealed,
+            &plaintext,
             chat_contact,
             is_receipt,
             now_ms(),
@@ -166,6 +172,7 @@ impl Node {
         match reply {
             Ok(Reply::Ack { id }) if id == envelope_id => {
                 self.acknowledge(&device, &envelope_id, DeliveryStatus::Delivered)?;
+                self.own_device_reachable(device)?;
                 // A slot for this device is free: send the next queued envelope.
                 self.flush_outbox()
             }
@@ -173,18 +180,118 @@ impl Node {
                 tracing::warn!(%device, "envelope rejected as invalid");
                 self.acknowledge(&device, &envelope_id, DeliveryStatus::Failed)
             }
+            Ok(Reply::Rejected(RejectReason::Undecryptable)) => self.reseal(device, envelope_id),
             Ok(other) => {
                 tracing::debug!(%device, ?other, "not accepted yet, will retry");
                 Ok(())
             }
             Err(err) => {
                 tracing::debug!(%device, ?err, "device unreachable, falling back to its mailbox");
+                self.own_device_unreachable(&device);
                 // Everything queued for it, not only the envelopes that had a slot.
                 for (queued_device, queued_id) in self.store.outbox_keys()? {
                     if queued_device == device {
                         self.post_to_mailbox(device, queued_id)?;
                     }
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// The device cannot decrypt the stored ciphertext: encrypt the envelope again on a fresh
+    /// session. Only once per entry; after that (or for entries from before schema v8, which
+    /// have no plaintext) the envelope fails like an invalid one.
+    fn reseal(&mut self, device: EndpointId, envelope_id: EnvelopeId) -> Result<()> {
+        let (Some((plaintext, sealed_at_ms)), Some(entry)) = (
+            self.store.outbox_envelope(&device, &envelope_id)?,
+            self.store.device_entry(&device)?,
+        ) else {
+            tracing::warn!(%device, "envelope undecryptable again, giving up");
+            return self.acknowledge(&device, &envelope_id, DeliveryStatus::Failed);
+        };
+        tracing::info!(%device, "envelope undecryptable, encrypting it again on a fresh session");
+        self.ensure_fresh_session(&entry, sealed_at_ms)?;
+        let Self { store, me, .. } = self;
+        let me = me.as_mut().context("no identity")?;
+        let sealed = me.crypto.seal(store, &entry, &plaintext)?;
+        store.reseal(&device, &envelope_id, &sealed)?;
+        self.flush_outbox()
+    }
+
+    /// Starts a fresh session to `entry`, unless one was started after `sealed_at_ms` already
+    /// (then that one is new to the peer too). Many queued envelopes failing together therefore
+    /// share one new session instead of each replacing the previous one.
+    pub(super) fn ensure_fresh_session(
+        &mut self,
+        entry: &DeviceEntry,
+        sealed_at_ms: u64,
+    ) -> Result<()> {
+        let device = entry.device_id();
+        if self
+            .fresh_sessions
+            .get(&device)
+            .is_some_and(|started_ms| *started_ms > sealed_at_ms)
+        {
+            return Ok(());
+        }
+        let Self { store, me, .. } = self;
+        me.as_mut()
+            .context("no identity")?
+            .crypto
+            .restart_session(store, entry)?;
+        // Strictly after anything sealed before this point, also within the same millisecond.
+        self.fresh_sessions
+            .insert(device, now_ms().max(sealed_at_ms) + 1);
+        Ok(())
+    }
+
+    /// Sends `payload` once, directly and without the outbox: for the steps of the consistency
+    /// check, which are only useful while the device is reachable and are repeated anyway.
+    pub(super) fn send_direct(&mut self, entry: &DeviceEntry, payload: Payload) -> Result<()> {
+        let Self { store, me, .. } = self;
+        let me = me.as_mut().context("no identity")?;
+        let envelope = Envelope {
+            id: rand::random(),
+            payload,
+        };
+        let sealed_at_ms = now_ms();
+        let sealed = me.crypto.seal(store, entry, &wire::encode(&envelope))?;
+        let transport = me.transport.clone();
+        let outcomes = self.outcomes_tx.clone();
+        let device = entry.device_id();
+        n0_future::task::spawn(async move {
+            let reply = transport.request(device, &Frame::Sealed(sealed)).await;
+            let _ = outcomes.send(Outcome::Direct {
+                device,
+                sealed_at_ms,
+                reply,
+            });
+        });
+        Ok(())
+    }
+
+    pub(super) fn finish_direct(
+        &mut self,
+        device: EndpointId,
+        sealed_at_ms: u64,
+        reply: Result<Reply>,
+    ) -> Result<()> {
+        match reply {
+            Ok(Reply::Ack { .. }) => Ok(()),
+            Ok(Reply::Rejected(RejectReason::Undecryptable)) => {
+                let Some(entry) = self.store.device_entry(&device)? else {
+                    return Ok(());
+                };
+                self.ensure_fresh_session(&entry, sealed_at_ms)
+            }
+            Ok(other) => {
+                tracing::debug!(%device, ?other, "direct envelope not accepted");
+                Ok(())
+            }
+            Err(err) => {
+                tracing::debug!(%device, ?err, "device unreachable for a direct envelope");
+                self.own_device_unreachable(&device);
                 Ok(())
             }
         }

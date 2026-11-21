@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use iroh::EndpointId;
 use vodozemac::olm::Session;
 
@@ -157,23 +157,35 @@ impl DeviceCrypto {
 
     /// Decrypts a message from `device`, trying every known session. A pre-key message from the
     /// device's *certified* identity key that no session can decrypt opens a new session.
+    /// `Ok(None)`: nothing here can decrypt it (a final answer, unlike a storage error).
     pub fn open(
         &mut self,
         store: &Store,
         device: &EndpointId,
         certified_identity: &OlmIdentityKey,
         sealed: &Sealed,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         self.load_sessions(store, device)?;
         if let Some(plaintext) = self.try_existing(store, device, sealed)? {
-            return Ok(plaintext);
+            return Ok(Some(plaintext));
         }
         if sealed.pre_key_sender().as_ref() != Some(certified_identity) {
-            bail!("no session can decrypt this message");
+            return Ok(None);
         }
-        let (session, plaintext, _) = self.accept_inbound(store, sealed)?;
+        let Ok((session, plaintext, _)) = self.accept_inbound_unsaved(sealed) else {
+            return Ok(None);
+        };
+        self.save_account(store)?;
         self.adopt(store, *device, session)?;
-        Ok(plaintext)
+        Ok(Some(plaintext))
+    }
+
+    /// Opens a fresh session from the peer's fallback key and makes it the one `seal` uses.
+    /// For a peer that reported it cannot decrypt what the current session produces: its first
+    /// messages are pre-key messages, which the peer can always open via its fallback key.
+    pub fn restart_session(&mut self, store: &Store, peer: &DeviceEntry) -> Result<()> {
+        let session = self.start_outbound(&peer.cert.olm_identity_key, &peer.fallback_key)?;
+        self.adopt(store, peer.device_id(), session)
     }
 
     fn try_existing(
@@ -275,7 +287,9 @@ mod tests {
         let sealed = from.crypto.seal(&from.store, &to.entry, text)?;
         let sender = from.entry.device_id();
         let identity = from.entry.cert.olm_identity_key;
-        to.crypto.open(&to.store, &sender, &identity, &sealed)
+        to.crypto
+            .open(&to.store, &sender, &identity, &sealed)?
+            .context("undecryptable")
     }
 
     #[test]
@@ -290,6 +304,7 @@ mod tests {
         assert_eq!(
             bob.crypto
                 .open(&bob.store, &alice_id, &alice_identity, &from_alice)
+                .unwrap()
                 .unwrap(),
             b"a1"
         );
@@ -297,6 +312,7 @@ mod tests {
             alice
                 .crypto
                 .open(&alice.store, &bob_id, &bob_identity, &from_bob)
+                .unwrap()
                 .unwrap(),
             b"b1"
         );
@@ -339,7 +355,79 @@ mod tests {
             &alice_identity,
             &sealed,
         );
-        assert!(opened.is_err());
+        assert!(matches!(opened, Ok(None)));
         assert_eq!(deliver(&mut alice, &mut bob, b"real").unwrap(), b"real");
+    }
+
+    /// Bob dropped the session Alice still encrypts with (evicted, or a restored backup):
+    /// Alice's next message is undecryptable until she restarts the session, then it converges.
+    #[test]
+    fn a_lost_session_is_reported_and_recovered_by_a_restart() {
+        let (mut alice, mut bob) = (peer(), peer());
+        assert_eq!(deliver(&mut alice, &mut bob, b"one").unwrap(), b"one");
+        // Bob replies, so Alice switches from pre-key to normal messages.
+        assert_eq!(deliver(&mut bob, &mut alice, b"two").unwrap(), b"two");
+        let alice_id = alice.entry.device_id();
+        bob.crypto.forget_device(&bob.store, &alice_id).unwrap();
+
+        let stale = alice
+            .crypto
+            .seal(&alice.store, &bob.entry, b"lost")
+            .unwrap();
+        let identity = alice.entry.cert.olm_identity_key;
+        let opened = bob.crypto.open(&bob.store, &alice_id, &identity, &stale);
+        assert!(matches!(opened, Ok(None)), "a final answer, not an error");
+
+        alice
+            .crypto
+            .restart_session(&alice.store, &bob.entry)
+            .unwrap();
+        let resealed = alice
+            .crypto
+            .seal(&alice.store, &bob.entry, b"lost")
+            .unwrap();
+        assert_eq!(
+            bob.crypto
+                .open(&bob.store, &alice_id, &identity, &resealed)
+                .unwrap()
+                .unwrap(),
+            b"lost"
+        );
+        for round in 0..3u8 {
+            assert_eq!(deliver(&mut bob, &mut alice, &[round]).unwrap(), [round]);
+            assert_eq!(
+                deliver(&mut alice, &mut bob, &[round, 1]).unwrap(),
+                [round, 1]
+            );
+        }
+    }
+
+    /// Pre-key messages of a session the receiver evicted still open via the fallback key.
+    #[test]
+    fn a_delayed_pre_key_message_opens_after_its_session_was_evicted() {
+        let (mut alice, mut bob) = (peer(), peer());
+        let first = alice
+            .crypto
+            .seal(&alice.store, &bob.entry, b"delayed")
+            .unwrap();
+        let (alice_id, identity) = (alice.entry.device_id(), alice.entry.cert.olm_identity_key);
+        assert!(
+            bob.crypto
+                .open(&bob.store, &alice_id, &identity, &first)
+                .unwrap()
+                .is_some()
+        );
+        bob.crypto.forget_device(&bob.store, &alice_id).unwrap();
+        let second = alice
+            .crypto
+            .seal(&alice.store, &bob.entry, b"later")
+            .unwrap();
+        assert_eq!(
+            bob.crypto
+                .open(&bob.store, &alice_id, &identity, &second)
+                .unwrap()
+                .unwrap(),
+            b"later"
+        );
     }
 }
