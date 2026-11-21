@@ -127,6 +127,10 @@ fn handle_file_events(
                 Ok(image) => commands.push(Command::SetAvatar { image }),
                 Err(message) => state.errors.push(message),
             },
+            files::Picked::AvatarData(bytes) => match files::avatar_from_bytes(&bytes) {
+                Ok(image) => commands.push(Command::SetAvatar { image }),
+                Err(message) => state.errors.push(message),
+            },
             files::Picked::SaveAs { contact, id, path } => {
                 commands.push(Command::SaveAttachment { contact, id, path })
             }

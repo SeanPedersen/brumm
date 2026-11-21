@@ -188,6 +188,12 @@ pub enum Event {
     /// Chats whose initial history is still arriving on this freshly linked device.
     /// Empty once everything arrived.
     HistorySync(Vec<HistorySyncView>),
+    /// Browser only: the bytes of a file message the user asked to save. The UI hands them to
+    /// the browser as a download (there is no path to write to).
+    FileExport {
+        name: String,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

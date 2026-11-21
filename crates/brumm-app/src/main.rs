@@ -8,6 +8,7 @@ mod preview;
 mod state;
 mod touch;
 mod ui;
+mod web_files;
 
 #[cfg(not(target_family = "wasm"))]
 mod native;

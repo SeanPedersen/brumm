@@ -1,4 +1,5 @@
-//! Native file dialogs (run on helper threads so the UI never blocks) and the file/image
+//! File dialogs (native ones run on helper threads so the UI never blocks; the browser uses
+//! `web_files`) and the file/image
 //! preparation that goes with them: reading an attachment, shrinking a profile photo, and
 //! building a bubble-sized preview. JPEG previews are scaled during decode. Callers run
 //! `prepare_chat_image` off the UI thread.
@@ -26,7 +27,11 @@ pub enum Picked {
         contact: UserKey,
         path: PathBuf,
     },
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Avatar(PathBuf),
+    /// A profile photo chosen in the browser (bytes, no path).
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    AvatarData(Vec<u8>),
     SaveAs {
         contact: UserKey,
         id: MessageId,
@@ -39,8 +44,8 @@ pub enum Picked {
         name: String,
         data: Vec<u8>,
     },
+    /// A failure to report to the user (the browser could not read a chosen file).
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-    /// The browser build has no file dialogs yet; files arrive by drag & drop or paste there.
     Unavailable(&'static str),
 }
 
@@ -58,17 +63,27 @@ impl Default for FileDialogs {
 
 impl FileDialogs {
     pub fn pick_attachment(&self, ctx: &egui::Context, contact: UserKey) {
+        #[cfg(not(target_family = "wasm"))]
         self.spawn(ctx, move || {
             native_dialog::pick_file("Send file", None)
                 .map(|path| Picked::Attachment { contact, path })
         });
+        #[cfg(target_family = "wasm")]
+        self.pick_in_browser(ctx, None, move |name, data| Picked::Dropped {
+            contact,
+            name,
+            data,
+        });
     }
 
     pub fn pick_avatar(&self, ctx: &egui::Context) {
+        #[cfg(not(target_family = "wasm"))]
         self.spawn(ctx, || {
             native_dialog::pick_file("Choose a profile photo", Some(&IMAGE_EXTENSIONS))
                 .map(Picked::Avatar)
         });
+        #[cfg(target_family = "wasm")]
+        self.pick_in_browser(ctx, Some("image/*"), |_name, data| Picked::AvatarData(data));
     }
 
     pub fn pick_save_path(
@@ -78,6 +93,7 @@ impl FileDialogs {
         id: MessageId,
         file_name: String,
     ) {
+        #[cfg(not(target_family = "wasm"))]
         self.spawn(ctx, move || {
             native_dialog::save_file("Save file", file_name).map(|path| Picked::SaveAs {
                 contact,
@@ -85,6 +101,16 @@ impl FileDialogs {
                 path,
             })
         });
+        // The browser saves to its download folder; the worker answers with `Event::FileExport`.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self.tx.send(Picked::SaveAs {
+                contact,
+                id,
+                path: PathBuf::from(file_name),
+            });
+            ctx.request_repaint();
+        }
     }
 
     /// A file dropped on the window. Natively it is opened by path later; in the browser its
@@ -143,15 +169,20 @@ impl FileDialogs {
     }
 
     #[cfg(target_family = "wasm")]
-    fn spawn(
+    fn pick_in_browser(
         &self,
         ctx: &egui::Context,
-        _dialog: impl FnOnce() -> Option<Picked> + Send + 'static,
+        accept: Option<&str>,
+        picked: impl FnOnce(String, Vec<u8>) -> Picked + 'static,
     ) {
-        let _ = self.tx.send(Picked::Unavailable(
-            "file dialogs are not available in the browser yet; drop the file on the chat instead",
-        ));
-        ctx.request_repaint();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        crate::web_files::pick(accept, move |result| {
+            let _ = tx.send(match result {
+                Ok((name, data)) => picked(name, data),
+                Err(message) => Picked::Unavailable(message),
+            });
+            ctx.request_repaint();
+        });
     }
 }
 
@@ -173,20 +204,6 @@ mod native_dialog {
             .set_title(title)
             .set_file_name(file_name)
             .save_file()
-    }
-}
-
-/// Never called: the wasm `FileDialogs::spawn` drops the dialog closure unrun.
-#[cfg(target_family = "wasm")]
-mod native_dialog {
-    use std::path::PathBuf;
-
-    pub fn pick_file(_title: &str, _extensions: Option<&[&str]>) -> Option<PathBuf> {
-        None
-    }
-
-    pub fn save_file(_title: &str, _file_name: String) -> Option<PathBuf> {
-        None
     }
 }
 
@@ -571,6 +588,16 @@ fn shrink_to_fit(source: &DynamicImage, stem: &str) -> Result<(String, Vec<u8>),
 /// Center-crops to a square and shrinks until the JPEG fits the avatar budget.
 pub fn avatar_from_file(path: &Path) -> Result<Vec<u8>, String> {
     let source = image::open(path).map_err(|err| format!("cannot open image: {err}"))?;
+    avatar_from_image(source)
+}
+
+pub fn avatar_from_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let source =
+        image::load_from_memory(bytes).map_err(|err| format!("cannot open image: {err}"))?;
+    avatar_from_image(source)
+}
+
+fn avatar_from_image(source: DynamicImage) -> Result<Vec<u8>, String> {
     let square = center_square(source);
     for edge in AVATAR_EDGE_STEPS {
         let resized = square

@@ -409,6 +409,7 @@ impl AppState {
                     ..Self::default()
                 };
             }
+            Event::FileExport { name, data } => crate::web_files::download(&name, &data),
             Event::Error(error) => {
                 self.connecting = false;
                 self.logging_out = false;

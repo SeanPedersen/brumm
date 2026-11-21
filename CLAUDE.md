@@ -39,8 +39,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   in the browser. Relays are iroh's n0 relays **without the DNS root dot** (`transport::relay_map`):
   WebKit (every iOS browser) fails `fetch`/WebSocket to `….iroh.link.`, so with iroh's default names no
   relay is ever chosen. Peer addresses are normalized the same way before dialing. A ticket (link or
-  invite) is only issued with a relay address (`Transport::addr` fails after 30 s instead). Not on the web yet: file dialogs (send by drag & drop), Save As, clipboard file paste,
-  system color emoji. Core code uses `n0_future::{task::spawn, time}` (tokio natively,
+  invite) is only issued with a relay address (`Transport::addr` fails after 30 s instead). File picking uses a hidden `<input type=file>` (`web_files.rs`, bytes as `Picked::Dropped` /
+  `AvatarData`); Save As has no dialog: the worker answers `SaveAttachment` with `Event::FileExport`
+  and the UI starts a Blob download into the browser's download folder. Not on the web yet:
+  clipboard file paste, system color emoji. Core code uses `n0_future::{task::spawn, time}` (tokio natively,
   setTimeout/spawn_local in wasm), never `tokio::spawn` / `tokio::time` / `std::time::Instant`.
 - **Responsive layout:** below `NARROW_BREAKPOINT` (600 logical px, width-based, so a narrowed desktop window too) only one pane
   shows, Telegram style (`ui/narrow.rs`): the chat list is home (also after a restart, `last_opened` only preselects), a tap opens
