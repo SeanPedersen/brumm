@@ -1,16 +1,21 @@
 //! Message composer: attach button, a one-line pill that grows with its content (Shift+Enter adds
-//! a line) and an emoji picker. Enter sends.
+//! a line), an emoji picker and a round send button. Enter sends too, except on touch devices.
 
 use brumm_core::{api::Command, identity::UserKey};
-use egui::{Rect, Sense, Vec2};
+use egui::{Color32, Rect, Sense, Vec2};
 
-use crate::ui::{emoji, files::FileDialogs, icons, theme};
+use crate::{
+    touch,
+    ui::{emoji, files::FileDialogs, icons, theme},
+};
 
 const PILL_MIN_HEIGHT: f32 = 44.0;
 const PILL_MAX_TEXT_HEIGHT: f32 = 140.0;
 const ATTACH_BUTTON_WIDTH: f32 = ICON_SIZE;
 const ATTACH_GAP: f32 = 6.0;
 const ICON_SIZE: f32 = 24.0;
+const SEND_BUTTON_SIZE: f32 = 40.0;
+const SEND_ICON_SIZE: f32 = 20.0;
 const EMOJI_BUTTON_SIZE: f32 = 32.0;
 
 pub struct Composer<'a> {
@@ -32,7 +37,10 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
     } = composer;
     let input_id = ui.make_persistent_id(("composer", contact));
     let had_focus = ui.memory(|memory| memory.has_focus(input_id));
+    // On touch devices Enter belongs to the text field (newline); the send button sends.
+    let enter_sends = !touch::is_touch_device();
     let enter_pressed = had_focus
+        && enter_sends
         && ui.input_mut(|input| {
             !input.modifiers.shift && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
         });
@@ -40,15 +48,21 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
 
+    let mut send_clicked = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = ATTACH_GAP;
         if attach_button(ui) {
             dialogs.pick_attachment(ui.ctx(), contact);
         }
-        pill(ui, input_id, draft);
+        // Right-to-left: the send button takes its space first, the pill fills the rest. A
+        // hand-computed width would overflow and fight the sidebar resize.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            send_clicked = send_button(ui, input_id, !draft.trim().is_empty());
+            pill(ui, input_id, draft);
+        });
     });
 
-    if enter_pressed && !draft.trim().is_empty() {
+    if (enter_pressed || send_clicked) && !draft.trim().is_empty() {
         commands.push(Command::SendText {
             contact,
             text: draft.trim().to_owned(),
@@ -86,7 +100,7 @@ fn pill(ui: &mut egui::Ui, input_id: egui::Id, draft: &mut String) {
                     Rect::from_center_size(emoji_rect.center(), Vec2::splat(ICON_SIZE)),
                     emoji_color,
                 );
-                if let Some(chosen) = emoji::picker(&emoji_button.on_hover_text("Emoji")) {
+                if let Some(chosen) = emoji::picker(&emoji_button) {
                     emoji::insert_at_cursor(ui.ctx(), input_id, draft, chosen);
                     ui.memory_mut(|memory| memory.request_focus(input_id));
                 }
@@ -142,7 +156,10 @@ fn paste_menu(response: &egui::Response, input_id: egui::Id) {
 
 /// Paperclip button: narrow, but as tall as the input pill so the icon is centered on it.
 fn attach_button(ui: &mut egui::Ui) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(ATTACH_BUTTON_WIDTH, PILL_MIN_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ATTACH_BUTTON_WIDTH, PILL_MIN_HEIGHT),
+        Sense::click(),
+    );
     let color = if response.hovered() {
         theme::TEXT
     } else {
@@ -154,6 +171,32 @@ fn attach_button(ui: &mut egui::Ui) -> bool {
         color,
     );
     response.on_hover_text("Send a file").clicked()
+}
+
+/// Round send button: accent-filled once there is text to send. Clicking keeps the input
+/// focused, so the on-screen keyboard stays open on phones.
+fn send_button(ui: &mut egui::Ui, input_id: egui::Id, active: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SEND_BUTTON_SIZE), Sense::click());
+    touch::send_button_at(ui.ctx(), rect);
+    // Pressing the button must not move keyboard focus to it (or the keyboard would close).
+    // On touch devices the tap never reaches egui: a DOM overlay takes it (see `touch.rs`).
+    let tapped = touch::take_send_tap();
+    if response.is_pointer_button_down_on() || response.clicked() || tapped {
+        ui.memory_mut(|memory| memory.request_focus(input_id));
+    }
+    let (fill, icon_color) = match (active, response.hovered()) {
+        (true, true) => (theme::ACCENT_HOVER, Color32::WHITE),
+        (true, false) => (theme::ACCENT, Color32::WHITE),
+        (false, _) => (Color32::TRANSPARENT, theme::MUTED_TEXT),
+    };
+    ui.painter()
+        .circle_filled(rect.center(), SEND_BUTTON_SIZE / 2.0, fill);
+    icons::send_plane(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(SEND_ICON_SIZE)),
+        icon_color,
+    );
+    (response.clicked() || tapped) && active
 }
 
 #[cfg(test)]

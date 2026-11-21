@@ -16,6 +16,7 @@ mod icons;
 mod links;
 pub mod logout;
 pub mod main_screen;
+pub mod narrow;
 pub mod onboarding;
 pub mod qr;
 pub mod revoked;
@@ -38,6 +39,7 @@ pub struct ViewState {
     pub devices: devices::DevicesView,
     pub logout: logout::LogoutView,
     pub chat: chat::ChatView,
+    pub narrow: narrow::NarrowNav,
     pub drafts: HashMap<UserKey, String>,
     pub search: String,
     pub remove_avatar_requested: bool,

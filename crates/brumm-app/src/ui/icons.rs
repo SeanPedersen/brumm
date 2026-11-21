@@ -52,7 +52,11 @@ fn rotate_around_center(path: &mut [Pos2], angle: f32) {
     let (sin, cos) = angle.sin_cos();
     for point in path {
         let offset: Vec2 = *point - GRID_CENTER;
-        *point = GRID_CENTER + vec2(offset.x * cos - offset.y * sin, offset.x * sin + offset.y * cos);
+        *point = GRID_CENTER
+            + vec2(
+                offset.x * cos - offset.y * sin,
+                offset.x * sin + offset.y * cos,
+            );
     }
 }
 
@@ -67,6 +71,15 @@ pub fn paperclip(painter: &Painter, rect: Rect, color: Color32) {
     path.push(Pos2::new(10.0, 9.0));
     rotate_around_center(&mut path, FRAC_PI_4);
     Canvas::new(painter, rect, color).polyline(&path);
+}
+
+/// Paper plane: outline plus the fold line from the cockpit to the tip.
+pub fn send_plane(painter: &Painter, rect: Rect, color: Color32) {
+    let canvas = Canvas::new(painter, rect, color);
+    let tip = Pos2::new(21.0, 3.0);
+    let fold = Pos2::new(10.0, 13.5);
+    canvas.polyline(&[tip, Pos2::new(3.0, 10.5), fold, Pos2::new(13.5, 21.0), tip]);
+    canvas.polyline(&[fold, tip]);
 }
 
 /// Smiley: outline, two eyes and a smile.

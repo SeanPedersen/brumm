@@ -6,7 +6,8 @@ use brumm_core::{api::Command, identity::UserKey};
 use crate::{
     state::AppState,
     ui::{
-        ViewState, add_contact, chat, composer, devices, files, logout, seed_phrase, sidebar, theme,
+        ViewState, add_contact, chat, composer, devices, files, logout, narrow::Mode, seed_phrase,
+        sidebar, theme,
     },
 };
 
@@ -17,21 +18,46 @@ pub fn show(
     commands: &mut Vec<Command>,
 ) {
     handle_file_events(ui, state, view, commands);
-    sidebar::show(ui, state, view, commands);
+    let search_active = view.chat.search.is_active();
+    if view.narrow.begin_frame(ui.available_width(), search_active) {
+        view.chat.search.close();
+    }
+    let mode = view
+        .narrow
+        .mode(state.selected.is_some(), view.chat.search.is_active());
+    if mode != Mode::Chat {
+        sidebar::show(ui, state, view, commands, mode == Mode::List);
+    }
+    if mode != Mode::List {
+        chat_pane(ui, state, view, commands, mode == Mode::Chat);
+    }
+    add_contact::show(ui, state, &mut view.add_contact, commands);
+    devices::show(ui, state, &mut view.devices, commands);
+    seed_phrase::show(ui, state);
+    logout::show(ui, state, &mut view.logout, commands);
+}
+
+fn chat_pane(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    view: &mut ViewState,
+    commands: &mut Vec<Command>,
+    narrow: bool,
+) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show(ui, |ui| match state.selected {
             Some(contact) => {
                 let draft = view.drafts.entry(contact).or_default();
-                chat::show(ui, state, &mut view.chat, contact, draft, commands);
+                let back = chat::show(ui, state, &mut view.chat, contact, draft, commands, narrow);
                 drop_overlay(ui);
+                if back {
+                    view.chat.search.close();
+                    view.narrow.back();
+                }
             }
             None => empty_state(ui),
         });
-    add_contact::show(ui, state, &mut view.add_contact, commands);
-    devices::show(ui, state, &mut view.devices, commands);
-    seed_phrase::show(ui, state);
-    logout::show(ui, state, &mut view.logout, commands);
 }
 
 fn handle_file_events(

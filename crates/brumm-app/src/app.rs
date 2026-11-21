@@ -83,6 +83,7 @@ impl eframe::App for BrummApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut commands: Vec<Command> = Vec::new();
+        crate::touch::begin_frame();
         ui::errors::show(ui, &mut self.state);
         match self.state.phase() {
             Phase::Starting => ui::starting::show(ui),
@@ -97,6 +98,7 @@ impl eframe::App for BrummApp {
             }
             Phase::Revoked => ui::revoked::show(ui, &mut self.state, &mut commands),
         }
+        crate::touch::end_frame();
         let stale = std::mem::take(&mut self.state.stale_conversations);
         for contact in stale {
             commands.push(self.state.load_command(contact));

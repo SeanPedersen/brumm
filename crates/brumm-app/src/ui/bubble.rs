@@ -11,9 +11,16 @@ use egui::{Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, Sense, Str
 
 use crate::{
     state::LoadedAttachment,
+    touch,
     ui::{emoji, files, links::TextLink, theme, time_fmt},
 };
 
+const REACTION_EMOJI_SIZE: f32 = 22.0;
+const MENU_FONT_SIZE: f32 = 18.0;
+const MENU_BUTTON_PADDING_X: f32 = 14.0;
+const MENU_BUTTON_PADDING_Y: f32 = 8.0;
+const MENU_ITEM_SPACING_Y: f32 = 4.0;
+const MENU_MIN_ROW_HEIGHT: f32 = 44.0;
 const META_FONT_SIZE: f32 = 12.0;
 const BODY_FONT_SIZE: f32 = 15.0;
 const CARD_NAME_FONT_SIZE: f32 = 15.0;
@@ -349,6 +356,9 @@ fn context_menu(
     selected: bool,
     actions: &mut Vec<Action>,
 ) {
+    if touch::is_touch_device() {
+        enlarge_for_touch(ui);
+    }
     reaction_bar(ui, &message.reactions, actions);
     ui.separator();
     if !message.text.is_empty() && ui.button("Copy text").clicked() {
@@ -374,6 +384,18 @@ fn context_menu(
         actions.push(Action::Delete);
         ui.close();
     }
+}
+
+/// Finger-sized menu rows: larger text, taller buttons and more room between them.
+fn enlarge_for_touch(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.button_padding = egui::vec2(MENU_BUTTON_PADDING_X, MENU_BUTTON_PADDING_Y);
+    style.spacing.item_spacing.y = MENU_ITEM_SPACING_Y;
+    style.spacing.interact_size.y = MENU_MIN_ROW_HEIGHT;
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        FontId::proportional(MENU_FONT_SIZE),
+    );
 }
 
 fn measure_content<'a>(
@@ -924,11 +946,12 @@ fn reaction_bar(ui: &mut egui::Ui, reactions: &ReactionsView, actions: &mut Vec<
     ui.horizontal(|ui| {
         for emoji in QUICK_REACTIONS {
             let mine = reactions.mine.as_deref() == Some(emoji);
-            let button = egui::Button::new(egui::RichText::new(emoji).size(20.0)).fill(if mine {
-                theme::ROW_SELECTED
-            } else {
-                Color32::TRANSPARENT
-            });
+            let button = egui::Button::new(egui::RichText::new(emoji).size(REACTION_EMOJI_SIZE))
+                .fill(if mine {
+                    theme::ROW_SELECTED
+                } else {
+                    Color32::TRANSPARENT
+                });
             if ui.add(button).clicked() {
                 actions.push(Action::React(emoji.to_owned()));
                 ui.close();

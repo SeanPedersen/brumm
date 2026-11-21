@@ -5,7 +5,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>brumm</title>
     <link data-trunk rel="icon" href="assets/icon.png" />
     <link data-trunk rel="rust" href="Cargo.toml" data-bin="brumm" data-wasm-opt="z"
@@ -14,9 +14,37 @@
           data-type="worker" data-loader-shim data-wasm-opt="z"
           data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue" />
     <style>
+      /* dvh follows the mobile browser bars and the on-screen keyboard; the padding keeps
+         the UI out of notches and the home-indicator area (the page background shows there). */
       html, body { margin: 0; height: 100%; overflow: hidden; background: #0e1621; }
+      body {
+        position: fixed; inset: 0; width: 100%;
+        box-sizing: border-box; height: 100dvh;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+                 env(safe-area-inset-bottom) env(safe-area-inset-left);
+      }
       #brumm-canvas { display: block; width: 100%; height: 100%; }
+      /* Keyboard open: the home-indicator inset is covered by the keyboard. */
+      body.keyboard { padding-bottom: 0; }
     </style>
+    <script>
+      // iOS Safari overlays the on-screen keyboard instead of resizing the page. Fit the body to
+      // the visual viewport so the composer and newest messages stay above the keyboard.
+      (() => {
+        const viewport = window.visualViewport;
+        if (!viewport) return;
+        const KEYBOARD_MIN_HEIGHT = 120;
+        const fit = () => {
+          const covered = window.innerHeight - viewport.height;
+          document.body.classList.toggle("keyboard", covered > KEYBOARD_MIN_HEIGHT);
+          document.body.style.height = covered > 0 ? viewport.height + "px" : "";
+          document.body.style.top = viewport.offsetTop + "px";
+          window.scrollTo(0, 0);
+        };
+        viewport.addEventListener("resize", fit);
+        viewport.addEventListener("scroll", fit);
+      })();
+    </script>
   </head>
   <body>
     <canvas id="brumm-canvas"></canvas>

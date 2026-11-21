@@ -17,6 +17,7 @@ use egui::{Color32, FontId, Rect, Sense, Vec2};
 
 use crate::{
     state::AppState,
+    touch,
     ui::{
         avatar,
         bubble::{self, Action},
@@ -87,6 +88,8 @@ const JUMP_TO_END_DELTA: f32 = -1.0e6;
 /// Soft band behind the message a search result jumped to.
 /// Accent light at alpha 40, stored premultiplied so it can be a constant.
 const SEARCH_HIT_TINT: Color32 = Color32::from_rgba_premultiplied(0x21, 0x38, 0x4C, 80);
+const BACK_ARROW_HALF_WIDTH: f32 = 8.0;
+const BACK_ARROW_HEAD: f32 = 7.0;
 const SEARCH_ICON_BUTTON: f32 = 36.0;
 
 /// View-local chat state: selection, delete confirmation and attachment bookkeeping.
@@ -112,6 +115,8 @@ pub struct ChatView {
     /// Scroll offset and bottom state of the last frame, to keep the view still when messages
     /// appear or vanish above it (older pages, reloads).
     last_offset: f32,
+    /// Height of the message list last frame; a change (on-screen keyboard) keeps the bottom pinned.
+    last_area_height: f32,
     was_at_bottom: bool,
     /// Height change of rows above the view measured this frame. The frame is discarded and
     /// laid out again with the offset moved by this much, so the visible rows never jump.
@@ -209,9 +214,10 @@ pub fn show(
     contact: UserKey,
     draft: &mut String,
     commands: &mut Vec<Command>,
-) {
+    show_back: bool,
+) -> bool {
     let Some(view) = state.contact(&contact) else {
-        return;
+        return false;
     };
     let messages = state
         .conversations
@@ -238,17 +244,22 @@ pub fn show(
         chat.search.open_or_focus(contact);
     }
 
+    let mut back_clicked = false;
     if chat.is_selecting() {
         selection_bar(ui, chat, messages);
     } else {
-        header(ui, state, chat, view);
+        back_clicked = header(ui, state, chat, view, show_back);
     }
     if chat.focused_contact != Some(contact) {
         chat.pending_focus = Some(contact);
     }
     chat.focused_contact = Some(contact);
     // The sidebar search field owns the keyboard while a room search is open.
-    let grab_focus = chat.pending_focus == Some(contact) && !chat.search.is_active();
+    // Touch devices never auto-focus: it would pop up the on-screen keyboard (even later, in the
+    // middle of a scroll) when the user only wants to read.
+    let grab_focus = chat.pending_focus == Some(contact)
+        && !chat.search.is_active()
+        && !touch::is_touch_device();
     egui::Panel::bottom("composer")
         .frame(
             egui::Frame::new()
@@ -298,6 +309,10 @@ pub fn show(
                 scroll_area = scroll_area.vertical_scroll_offset(chat.last_offset + shift);
                 ui.spacing_mut().scroll.kinetic.rubber_band = false;
             }
+            let area_height = ui.available_height();
+            let resized = (area_height - chat.last_area_height).abs() > AREA_RESIZE_EPSILON;
+            chat.last_area_height = area_height;
+            let keep_bottom = resized && chat.was_at_bottom;
             let output = scroll_area.show_viewport(ui, |ui, viewport| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let column_width =
@@ -307,6 +322,11 @@ pub fn show(
                 let total_height = LIST_PADDING_TOP + rows_height + LIST_PADDING_BOTTOM;
                 ui.set_height(total_height);
                 apply_pending_scroll(ui, chat, viewport.min.y, viewport.height(), total_height);
+                if keep_bottom {
+                    // The on-screen keyboard opened or closed: egui would keep the old offset
+                    // when the list grows back, leaving the newest messages off screen.
+                    scroll_to_bottom(ui);
+                }
                 // Scrolled up near the first row, or too few rows to scroll at all.
                 let near_top = viewport.min.y < LOAD_OLDER_MARGIN && !chat.was_at_bottom;
                 let fits = total_height <= viewport.height();
@@ -386,9 +406,18 @@ pub fn show(
             }
         });
     delete_dialog(ui, chat, contact, &view.display_name, commands);
+    back_clicked
 }
 
-fn header(ui: &mut egui::Ui, state: &AppState, chat: &mut ChatView, view: &ContactView) {
+/// Returns true when the back arrow (narrow layout only) was clicked.
+fn header(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    chat: &mut ChatView,
+    view: &ContactView,
+    show_back: bool,
+) -> bool {
+    let mut back_clicked = false;
     egui::Panel::top("chat_header")
         .frame(
             egui::Frame::new()
@@ -398,6 +427,9 @@ fn header(ui: &mut egui::Ui, state: &AppState, chat: &mut ChatView, view: &Conta
         .show(ui, |ui| {
             ui.set_min_height(theme::TOP_BAR_HEIGHT - 16.0);
             ui.horizontal_centered(|ui| {
+                if show_back {
+                    back_clicked = back_button(ui);
+                }
                 let is_notes = state.is_notes(&view.user_key);
                 let photo = if is_notes {
                     None
@@ -429,7 +461,8 @@ fn header(ui: &mut egui::Ui, state: &AppState, chat: &mut ChatView, view: &Conta
                     if search_button(ui, chat.search.is_active()) {
                         chat.search.toggle(view.user_key);
                     }
-                    if is_notes {
+                    // The narrow header has no room for the key details.
+                    if is_notes || show_back {
                         return;
                     }
                     ui.label(
@@ -447,6 +480,31 @@ fn header(ui: &mut egui::Ui, state: &AppState, chat: &mut ChatView, view: &Conta
                 });
             });
         });
+    back_clicked
+}
+
+/// Left arrow that returns from the chat to the chat list (narrow layout).
+fn back_button(ui: &mut egui::Ui) -> bool {
+    let size = Vec2::splat(theme::BACK_BUTTON_SIZE);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .circle_filled(rect.center(), size.x / 2.0, theme::ROW_HOVER);
+    }
+    let color = if response.hovered() {
+        theme::ACCENT_LIGHT
+    } else {
+        theme::MUTED_TEXT
+    };
+    let stroke = egui::Stroke::new(2.0, color);
+    let tip = rect.center() + egui::vec2(-BACK_ARROW_HALF_WIDTH, 0.0);
+    let tail = rect.center() + egui::vec2(BACK_ARROW_HALF_WIDTH, 0.0);
+    let wing = egui::vec2(BACK_ARROW_HEAD, BACK_ARROW_HEAD);
+    ui.painter().line_segment([tail, tip], stroke);
+    ui.painter().line_segment([tip, tip + wing], stroke);
+    ui.painter()
+        .line_segment([tip, tip + egui::vec2(wing.x, -wing.y)], stroke);
+    response.clicked()
 }
 
 /// Magnifying glass at the top right of the room. Active means the sidebar is searching this room.
@@ -1219,7 +1277,10 @@ fn paint_rows(
     slots
 }
 
+const AREA_RESIZE_EPSILON: f32 = 0.5;
 const DRAG_START_DISTANCE: f32 = 4.0;
+/// Touch: a finger wobbles; further than this is a scroll gesture, not a tap.
+const TOUCH_MOVE_SLOP: f32 = 10.0;
 const AUTOSCROLL_SPEED: f32 = 14.0;
 
 /// Telegram-style gestures: drag over messages to select them, Shift+click selects a range,
@@ -1240,6 +1301,7 @@ fn handle_pointer(
         )
     });
     let Some(position) = position else { return };
+    let touch = touch::is_touch_device();
     let selecting = chat.is_selecting();
     let in_viewport = ui.clip_rect().contains(position);
 
@@ -1261,11 +1323,20 @@ fn handle_pointer(
                 dragging: false,
             });
     }
+    // Touch: moving the finger is scrolling, never a selection gesture.
+    if touch
+        && chat
+            .press
+            .as_ref()
+            .is_some_and(|press| (position - press.origin).length() > TOUCH_MOVE_SLOP)
+    {
+        chat.press = None;
+    }
     let Some(press) = chat.press.as_mut() else {
         return;
     };
 
-    if down {
+    if down && !touch {
         let current = row_nearest_to(slots, position.y);
         let moved = (position - press.origin).length() > DRAG_START_DISTANCE;
         if moved && current.is_some_and(|current| current != press.anchor) {
@@ -1287,7 +1358,12 @@ fn handle_pointer(
         chat.last_clicked = Some(press.anchor);
         return;
     }
-    let clicked_in_place = (position - press.origin).length() <= DRAG_START_DISTANCE;
+    let slop = if touch {
+        TOUCH_MOVE_SLOP
+    } else {
+        DRAG_START_DISTANCE
+    };
+    let clicked_in_place = (position - press.origin).length() <= slop;
     if !clicked_in_place || press.anchor >= messages.len() {
         return;
     }
@@ -1523,7 +1599,7 @@ mod tests {
             } = self;
             let mut output = ctx.run_ui(input, |ui| {
                 let mut commands = Vec::new();
-                show(ui, state, chat, CONTACT, draft, &mut commands);
+                show(ui, state, chat, CONTACT, draft, &mut commands, false);
                 sent.extend(commands);
             });
             *opened_urls = output

@@ -39,6 +39,7 @@ pub fn main() {
                 canvas,
                 eframe::WebOptions::default(),
                 Box::new(move |cc| {
+                    crate::history::install(cc.egui_ctx.clone());
                     let core = CoreBridge::start(profile, cc.egui_ctx.clone());
                     Ok(Box::new(app::BrummApp::new(cc, core)))
                 }),

@@ -42,35 +42,45 @@ thread_local! {
     static END_RECT: std::cell::Cell<Option<Rect>> = const { std::cell::Cell::new(None) };
 }
 
+/// `full_width`: the narrow layout, where the list is the whole screen instead of a side panel.
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut AppState,
     view: &mut ViewState,
     commands: &mut Vec<Command>,
+    full_width: bool,
 ) {
+    let frame = egui::Frame::new().fill(theme::SIDEBAR_BG);
+    let content = |ui: &mut egui::Ui| {
+        view.chat.search.note_open_chat(state.selected);
+        top_bar(ui, state, view);
+        if view.chat.search.is_active() {
+            if let Some(contact) = state.selected {
+                let jumped = message_results(ui, state, view, contact);
+                if let Some(id) = jumped {
+                    view.chat.search.reveal(id);
+                    view.narrow.show_chat_after_search();
+                }
+            }
+        } else {
+            let clicked = chat_list(ui, state, &view.search);
+            if let Some(contact) = clicked {
+                state.select(contact, ui.ctx());
+                view.narrow.open_chat();
+                commands.push(state.load_command(contact));
+            }
+        }
+    };
+    if full_width {
+        egui::CentralPanel::default().frame(frame).show(ui, content);
+        return;
+    }
     egui::Panel::left("contacts")
         .resizable(true)
         .default_size(theme::SIDEBAR_WIDTH)
         .size_range(theme::SIDEBAR_MIN_WIDTH..=theme::SIDEBAR_MAX_WIDTH)
-        .frame(egui::Frame::new().fill(theme::SIDEBAR_BG))
-        .show(ui, |ui| {
-            view.chat.search.note_open_chat(state.selected);
-            top_bar(ui, state, view);
-            if view.chat.search.is_active() {
-                if let Some(contact) = state.selected {
-                    let jumped = message_results(ui, state, view, contact);
-                    if let Some(id) = jumped {
-                        view.chat.search.reveal(id);
-                    }
-                }
-            } else {
-                let clicked = chat_list(ui, state, &view.search);
-                if let Some(contact) = clicked {
-                    state.select(contact, ui.ctx());
-                    commands.push(state.load_command(contact));
-                }
-            }
-        });
+        .frame(frame)
+        .show(ui, content);
 }
 
 fn top_bar(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
@@ -632,7 +642,7 @@ mod tests {
         let mut width = 0.0;
         let mut output = ctx.run_ui(input, |ui| {
             let mut commands = Vec::new();
-            show(ui, state, view, &mut commands);
+            show(ui, state, view, &mut commands, false);
             width = ui.available_rect_before_wrap().left();
         });
         output.textures_delta.clear();
@@ -760,7 +770,7 @@ mod tests {
             },
             |ui| {
                 let mut commands = Vec::new();
-                show(ui, &mut state, &mut view, &mut commands);
+                show(ui, &mut state, &mut view, &mut commands, false);
                 assert!(
                     commands.is_empty(),
                     "a room search must not open another chat"

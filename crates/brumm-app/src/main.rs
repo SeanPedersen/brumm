@@ -3,8 +3,10 @@
 
 mod app;
 mod bridge;
+mod history;
 mod preview;
 mod state;
+mod touch;
 mod ui;
 
 #[cfg(not(target_family = "wasm"))]

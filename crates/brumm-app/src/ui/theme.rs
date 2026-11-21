@@ -9,6 +9,7 @@ pub const INPUT_BG: Color32 = Color32::from_rgb(0x24, 0x2F, 0x3D);
 pub const ROW_HOVER: Color32 = Color32::from_rgb(0x20, 0x2B, 0x36);
 pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x2B, 0x52, 0x78);
 pub const ACCENT: Color32 = Color32::from_rgb(0x52, 0x88, 0xC1);
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x4A, 0x7B, 0xB0);
 pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x6A, 0xB2, 0xF2);
 pub const OUTGOING_BUBBLE: Color32 = Color32::from_rgb(0x2B, 0x52, 0x78);
 pub const INCOMING_BUBBLE: Color32 = Color32::from_rgb(0x18, 0x25, 0x33);
@@ -37,6 +38,7 @@ pub const CONTACT_ROW_HEIGHT: f32 = 68.0;
 pub const CONTACT_AVATAR_SIZE: f32 = 50.0;
 pub const HEADER_AVATAR_SIZE: f32 = 40.0;
 pub const TOP_BAR_HEIGHT: f32 = 56.0;
+pub const BACK_BUTTON_SIZE: f32 = 40.0;
 
 pub const BUBBLE_RADIUS: u8 = 16;
 pub const BUBBLE_TAIL_RADIUS: u8 = 4;

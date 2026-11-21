@@ -42,6 +42,16 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   invite) is only issued with a relay address (`Transport::addr` fails after 30 s instead). Not on the web yet: file dialogs (send by drag & drop), Save As, clipboard file paste,
   system color emoji. Core code uses `n0_future::{task::spawn, time}` (tokio natively,
   setTimeout/spawn_local in wasm), never `tokio::spawn` / `tokio::time` / `std::time::Instant`.
+- **Responsive layout:** below `NARROW_BREAKPOINT` (600 logical px, width-based, so a narrowed desktop window too) only one pane
+  shows, Telegram style (`ui/narrow.rs`): the chat list is home (also after a restart, `last_opened` only preselects), a tap opens
+  the chat full-screen with a ← back arrow in its header. In-chat search shows its results in the list pane; picking a hit returns to the chat.
+  In the browser, opening a chat pushes a history entry and `popstate` closes it (`history.rs`), so the back gesture works; the arrow calls
+  `history.back()`. Desktop has no history and closes directly. `index.html` uses `viewport-fit=cover`, `100dvh` and safe-area padding.
+  The composer has a round send button (desktop and phone); on touch devices (`touch.rs`, `(pointer: coarse)`) Enter inserts a newline
+  and only the button sends. On the web the send button is backed by a transparent DOM overlay (`touch.rs`) that swallows the press, because a tap on the canvas blurs the hidden text input and closes the on-screen keyboard. On the web the body is sized to `visualViewport`, so the on-screen keyboard pushes the chat up (iOS overlays it otherwise).
+  Touch selection: a long tap opens the context menu (Select item), never selects by itself. Moving the finger (> `TOUCH_MOVE_SLOP`) is
+  scrolling and drops the press, drag-selection is off on touch. Once selection mode is on, a tap toggles.
+  Not yet phone-adapted: dialogs/devices/onboarding screens, touch-sized hit targets.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **Emoji:** the system color emoji font (Noto Color Emoji, via `fc-match emoji` if it is not
   in a well-known path) is installed after the text fonts and before discovered fallbacks.
@@ -104,11 +114,13 @@ crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html 
   src/bridge/native.rs    tokio runtime thread (2 workers) + channels; repaint on event;
                           detached thread, closing the command channel stops the core
   src/bridge/web.rs       starts brumm-worker, postcard messages, queues commands until Listening
+  src/history.rs          browser history push/back/popstate for the narrow layout (no-op on desktop)
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
   src/preview.rs          background thread: scale a chat photo, then the UI stores the preview
   src/window_size.rs      8-byte window size (`window-size`), read before the window is created
   src/ui/*.rs             one file per screen/widget (onboarding: create/link/restore, devices,
                           revoked, chat, …); screens push Commands, never call core
+                          narrow.rs (single-pane phone navigation state), main_screen.rs picks the layout.
                           Telegram-Desktop "Night" look: theme.rs (palette, metrics, global style),
                           avatar.rs (initials circles), sidebar.rs (contact search, or the open room's
                           message hits while in-chat search is on; chat list sorted by last
