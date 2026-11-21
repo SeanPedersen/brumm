@@ -11,6 +11,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **Multi-device done:** signed `DeviceList` (seq, ≤ 8 devices, fallback keys), linking via a
   `brumm://link/` ticket with contact + history sync, removal/revocation, a per-device outbox
   (sealed once, resent as-is), several Olm sessions per device, and re-acking duplicate ciphertexts.
+- **Log out** (☰ menu, and "Erase this device" on the removed screen): `Command::LogOut` signs a device list without
+  this device (any device holds the seed) and announces it to own devices + contacts, waits until no delivery/mailbox post
+  is in flight (max 20 s), then `Store::wipe` (every row, `secure_delete` + `VACUUM`) and a fresh node → `Event::LoggedOut`
+  → onboarding. Same path on desktop and in the browser (OPFS). Commands are refused while logging out.
 - **M3 mailbox done:** offline delivery via **public Nostr relays** (no own server). Unreachable
   device → the outbox ciphertext is posted once as a NIP-44 letter to its inbox key → status Sent ✔ →
   the recipient answers with `Payload::Receipt` → Delivered ✔✔.

@@ -22,6 +22,9 @@ use crate::{
 
 impl Node {
     pub(super) async fn handle_command(&mut self, command: Command) -> Result<()> {
+        if self.logging_out {
+            bail!("this device is logging out");
+        }
         match command {
             Command::CreateIdentity { display_name } => {
                 self.create_identity(UserIdentity::generate(), &display_name, true)
@@ -76,6 +79,7 @@ impl Node {
                 self.save_attachment(contact, id, path)
             }
             Command::React { contact, id, emoji } => self.react(contact, id, emoji),
+            Command::LogOut => self.begin_logout(),
         }
     }
 

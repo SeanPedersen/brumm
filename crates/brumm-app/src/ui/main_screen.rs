@@ -5,7 +5,9 @@ use brumm_core::{api::Command, identity::UserKey};
 
 use crate::{
     state::AppState,
-    ui::{ViewState, add_contact, chat, composer, devices, files, seed_phrase, sidebar, theme},
+    ui::{
+        ViewState, add_contact, chat, composer, devices, files, logout, seed_phrase, sidebar, theme,
+    },
 };
 
 pub fn show(
@@ -29,6 +31,7 @@ pub fn show(
     add_contact::show(ui, state, &mut view.add_contact, commands);
     devices::show(ui, state, &mut view.devices, commands);
     seed_phrase::show(ui, state);
+    logout::show(ui, state, &mut view.logout, commands);
 }
 
 fn handle_file_events(

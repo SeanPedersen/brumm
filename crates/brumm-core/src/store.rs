@@ -168,6 +168,29 @@ impl Store {
         Ok(Self { db })
     }
 
+    /// Log-out: deletes every row (seed phrase, keys, Olm state, chats) and rewrites the file.
+    /// `secure_delete` overwrites the freed pages; `VACUUM` and the WAL checkpoint leave no
+    /// old copies behind in the database or its write-ahead log. The schema stays.
+    pub fn wipe(&self) -> Result<()> {
+        self.db.pragma_update(None, "secure_delete", true)?;
+        let tables: Vec<String> = self
+            .db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let tx = self.db.unchecked_transaction()?;
+        for table in &tables {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        tx.commit()?;
+        self.db.execute_batch("VACUUM;")?;
+        #[cfg(not(target_family = "wasm"))]
+        self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     // ── own identity ────────────────────────────────────────────────────────
 
     pub fn save_identity(&self, identity: &StoredIdentity) -> Result<()> {

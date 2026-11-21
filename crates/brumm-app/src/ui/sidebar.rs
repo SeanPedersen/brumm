@@ -372,6 +372,14 @@ fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
                 view.devices.open = true;
                 ui.close();
             }
+            ui.separator();
+            if ui
+                .button(egui::RichText::new("Log out…").color(theme::DANGER))
+                .clicked()
+            {
+                view.logout.confirm_open = true;
+                ui.close();
+            }
         },
     );
 }

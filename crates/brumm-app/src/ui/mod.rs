@@ -14,6 +14,7 @@ pub mod errors;
 pub mod files;
 mod icons;
 mod links;
+pub mod logout;
 pub mod main_screen;
 pub mod onboarding;
 pub mod qr;
@@ -34,6 +35,7 @@ pub struct ViewState {
     pub onboarding: onboarding::OnboardingView,
     pub add_contact: add_contact::AddContactView,
     pub devices: devices::DevicesView,
+    pub logout: logout::LogoutView,
     pub chat: chat::ChatView,
     pub drafts: HashMap<UserKey, String>,
     pub search: String,

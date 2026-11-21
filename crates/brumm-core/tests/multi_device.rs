@@ -92,3 +92,50 @@ async fn notes_chat_syncs_between_own_devices_only() {
         .expect(|event| matches!(event, Event::MessagesDeleted { .. }).then_some(()))
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_removes_the_device_and_erases_it() {
+    let mut laptop = TestNode::spawn("logout-laptop");
+    let alice_key = laptop.create_identity("Alice").await;
+    let mut phone = TestNode::spawn("logout-phone");
+    let (_, phone_id) = laptop.link(&mut phone, 2).await;
+
+    // The phone announces its own removal, then erases itself.
+    phone.send(Command::LogOut);
+    phone
+        .expect(|event| matches!(event, Event::LoggedOut).then_some(()))
+        .await;
+    laptop
+        .expect(|event| match event {
+            Event::Devices(devices) if devices.iter().all(|d| d.device_id != phone_id) => Some(()),
+            _ => None,
+        })
+        .await;
+
+    // Nothing survives a restart: no identity, so onboarding again.
+    let mut phone = phone.restart().await;
+    let profile = phone
+        .expect(|event| match event {
+            Event::Ready { profile, .. } => Some(profile.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(profile.is_none());
+
+    // The erased device can be linked again (`Ready` was consumed above, so no `link` helper).
+    phone.send(Command::StartLinking);
+    let link = phone
+        .expect(|event| match event {
+            Event::LinkTicket { link } => Some(link.clone()),
+            _ => None,
+        })
+        .await;
+    laptop.send(Command::LinkDevice { link });
+    let relinked_key = phone
+        .expect(|event| match event {
+            Event::IdentityCreated { profile, .. } => Some(profile.user_key),
+            _ => None,
+        })
+        .await;
+    assert_eq!(relinked_key, alice_key);
+}

@@ -14,6 +14,7 @@ mod contacts;
 mod delivery;
 mod inbound;
 mod linking;
+mod logout;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -100,6 +101,15 @@ pub async fn run(
             _ = prune.tick() => node.prune(),
         };
         node.report(result);
+        if node.logout_ready() {
+            node = match node.finish_logout().await {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    events.emit(Event::Error(format!("logging out failed: {err:#}")));
+                    return;
+                }
+            };
+        }
     }
     node.shutdown().await;
 }
@@ -168,6 +178,8 @@ enum Outcome {
         result: Result<()>,
     },
     MailboxReady(Arc<Mailbox>),
+    /// The log-out grace period ended; erase now even if some announcements are still pending.
+    LogoutDeadline,
 }
 
 struct Node {
@@ -188,6 +200,9 @@ struct Node {
     outcomes_rx: mpsc::UnboundedReceiver<Outcome>,
     letters_tx: mpsc::Sender<MailboxDelivery>,
     letters_rx: mpsc::Receiver<MailboxDelivery>,
+    /// Set by `Command::LogOut`: the node only finishes network work, then erases itself.
+    logging_out: bool,
+    logout_deadline_passed: bool,
 }
 
 impl Node {
@@ -224,6 +239,8 @@ impl Node {
             outcomes_rx,
             letters_tx,
             letters_rx,
+            logging_out: false,
+            logout_deadline_passed: false,
         }
     }
 
@@ -305,15 +322,7 @@ impl Node {
     }
 
     async fn shutdown(self) {
-        if let Some(mailbox) = self.me.as_ref().and_then(|me| me.mailbox.as_ref()) {
-            mailbox.shutdown().await;
-        }
-        let transport = match (self.me, self.link_target) {
-            (Some(me), _) => me.transport,
-            (None, Some(target)) => target.transport,
-            (None, None) => return,
-        };
-        transport.shutdown().await;
+        shutdown_network(self.me, self.link_target).await;
     }
 
     fn report(&self, result: Result<()>) {
@@ -383,8 +392,24 @@ impl Node {
                 }
                 Ok(())
             }
+            Outcome::LogoutDeadline => {
+                self.logout_deadline_passed = true;
+                Ok(())
+            }
         }
     }
+}
+
+async fn shutdown_network(me: Option<Me>, link_target: Option<LinkTarget>) {
+    if let Some(mailbox) = me.as_ref().and_then(|me| me.mailbox.as_ref()) {
+        mailbox.shutdown().await;
+    }
+    let transport = match (me, link_target) {
+        (Some(me), _) => me.transport,
+        (None, Some(target)) => target.transport,
+        (None, None) => return,
+    };
+    transport.shutdown().await;
 }
 
 /// Next device-list sequence number: strictly increasing, and time-based so that a device

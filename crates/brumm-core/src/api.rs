@@ -87,6 +87,9 @@ pub enum Command {
         id: MessageId,
         emoji: String,
     },
+    /// Removes this device from the identity (other devices and contacts are told), then
+    /// erases every local row, keys and seed phrase included. Ends with [`Event::LoggedOut`].
+    LogOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +166,18 @@ pub enum Event {
         reactions: ReactionsView,
     },
     Error(String),
+    /// The local data is erased; the device is fresh again (onboarding).
+    LoggedOut,
+    /// Chats whose initial history is still arriving on this freshly linked device.
+    /// Empty once everything arrived.
+    HistorySync(Vec<HistorySyncView>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorySyncView {
+    pub contact: UserKey,
+    pub received: u32,
+    pub expected: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

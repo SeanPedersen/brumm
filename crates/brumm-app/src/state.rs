@@ -77,6 +77,10 @@ pub struct AppState {
     pub link_ticket: Option<String>,
     pub devices: Vec<DeviceView>,
     pub revoked: bool,
+    /// Chats whose initial history is still arriving (freshly linked device): received, expected.
+    pub history_sync: HashMap<UserKey, (u32, u32)>,
+    /// `Command::LogOut` was sent; the UI blocks until `Event::LoggedOut`.
+    pub logging_out: bool,
     /// Opened conversations changed in bulk; the app reloads them from the core.
     pub stale_conversations: Vec<UserKey>,
     pub connecting: bool,
@@ -319,8 +323,22 @@ impl AppState {
                     ctx,
                 );
             }
+            Event::HistorySync(chats) => {
+                self.history_sync = chats
+                    .into_iter()
+                    .map(|chat| (chat.contact, (chat.received, chat.expected)))
+                    .collect();
+            }
+            Event::LoggedOut => {
+                ctx.forget_all_images();
+                *self = Self {
+                    ready: true,
+                    ..Self::default()
+                };
+            }
             Event::Error(error) => {
                 self.connecting = false;
+                self.logging_out = false;
                 self.errors.push(error);
                 let overflow = self.errors.len().saturating_sub(MAX_VISIBLE_ERRORS);
                 self.errors.drain(..overflow);

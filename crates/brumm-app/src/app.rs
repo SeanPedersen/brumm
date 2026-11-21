@@ -54,8 +54,10 @@ impl eframe::App for BrummApp {
             self.window_size.flush_if_due();
         }
         for event in self.core.drain() {
-            if matches!(event, brumm_core::api::Event::Error(_)) {
-                self.view.onboarding.allow_retry();
+            match event {
+                brumm_core::api::Event::Error(_) => self.view.onboarding.allow_retry(),
+                brumm_core::api::Event::LoggedOut => self.view = ui::ViewState::default(),
+                _ => {}
             }
             self.state.apply(event, ctx);
         }
@@ -93,7 +95,7 @@ impl eframe::App for BrummApp {
             Phase::Main => {
                 ui::main_screen::show(ui, &mut self.state, &mut self.view, &mut commands)
             }
-            Phase::Revoked => ui::revoked::show(ui),
+            Phase::Revoked => ui::revoked::show(ui, &mut self.state, &mut commands),
         }
         for contact in self.state.stale_conversations.drain(..) {
             commands.push(Command::LoadConversation { contact });

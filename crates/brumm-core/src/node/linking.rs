@@ -287,7 +287,7 @@ impl Node {
         Ok(())
     }
 
-    fn announce_device_list(&mut self) -> Result<()> {
+    pub(super) fn announce_device_list(&mut self) -> Result<()> {
         let devices = self.me()?.profile.devices.clone();
         for contact in self.store.contacts()? {
             self.enqueue_to_user(
@@ -326,7 +326,7 @@ impl Node {
     }
 }
 
-fn other_devices(list: &DeviceList, me: &EndpointId) -> Vec<DeviceEntry> {
+pub(super) fn other_devices(list: &DeviceList, me: &EndpointId) -> Vec<DeviceEntry> {
     list.entries
         .iter()
         .filter(|entry| &entry.device_id() != me)
