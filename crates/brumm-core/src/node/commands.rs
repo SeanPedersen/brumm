@@ -193,8 +193,8 @@ impl Node {
         if !message.body.is_valid() {
             bail!("message is empty, too long or the file is too large");
         }
-        // Notes never leave our own devices, so there is no delivery to wait for.
-        let status = if is_notes {
+        // Notes are delivered to our other devices; with none, there is nobody to wait for.
+        let status = if is_notes && self.own_other_devices().is_empty() {
             DeliveryStatus::Delivered
         } else {
             DeliveryStatus::Pending
@@ -213,7 +213,14 @@ impl Node {
             Payload::Chat(message.clone()),
             Some(&contact),
         )?;
-        self.enqueue_to_own_devices(Payload::SentTranscript { contact, message })?;
+        let message_id = message.id;
+        let transcript = Payload::SentTranscript { contact, message };
+        if is_notes {
+            // Tracked: the transcript's ack is this message's delivery.
+            self.enqueue_to_own_devices_as(message_id, transcript, Some(&contact))?;
+        } else {
+            self.enqueue_to_own_devices(transcript)?;
+        }
         self.flush_outbox()
     }
 }

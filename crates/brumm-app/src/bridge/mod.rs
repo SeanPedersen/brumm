@@ -5,6 +5,8 @@
 #[cfg(not(target_family = "wasm"))]
 mod native;
 #[cfg(not(target_family = "wasm"))]
+mod profile_lock;
+#[cfg(not(target_family = "wasm"))]
 pub use native::CoreBridge;
 
 #[cfg(target_family = "wasm")]

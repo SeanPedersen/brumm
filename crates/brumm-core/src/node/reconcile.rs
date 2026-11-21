@@ -180,7 +180,7 @@ impl Node {
         Ok(())
     }
 
-    fn own_other_devices(&self) -> Vec<DeviceEntry> {
+    pub(super) fn own_other_devices(&self) -> Vec<DeviceEntry> {
         let Some(me) = self.me.as_ref().filter(|me| !me.revoked) else {
             return Vec::new();
         };

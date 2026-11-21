@@ -31,8 +31,10 @@ async fn linked_pair(name: &str, relays: Option<Vec<String>>) -> (TestNode, Test
 #[tokio::test(flavor = "multi_thread")]
 async fn notes_lost_in_both_directions_are_restored_in_order() {
     let (mut laptop, mut phone, notes) = linked_pair("lost-notes", None).await;
-    laptop.send_text(notes, "one").await;
+    let one = laptop.send_text(notes, "one").await;
     assert_eq!(phone.message_added(Direction::Outgoing).await, "one");
+    // Acked before the phone stops, or "one" would still be queued below.
+    laptop.delivered(one).await;
 
     // Each device writes a note while the other is offline...
     let phone_offline = phone.stop().await;

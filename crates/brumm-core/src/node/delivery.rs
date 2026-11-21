@@ -54,21 +54,29 @@ impl Node {
 
     /// Queues `payload` for each of our other devices.
     pub(super) fn enqueue_to_own_devices(&mut self, payload: Payload) -> Result<()> {
-        let me = self.me()?;
-        let others: Vec<DeviceEntry> = me
-            .profile
-            .devices
-            .entries
-            .iter()
-            .filter(|entry| entry.device_id() != me.device_id)
-            .cloned()
-            .collect();
+        self.enqueue_to_own_devices_as(rand::random(), payload, None)
+    }
+
+    /// Like [`Self::enqueue_to_own_devices`] under a given envelope id. With `chat_contact` the
+    /// message of that id in that chat shows the delivery state of this envelope (Notes: there
+    /// is no other recipient, so our other devices are the delivery).
+    pub(super) fn enqueue_to_own_devices_as(
+        &mut self,
+        envelope_id: EnvelopeId,
+        payload: Payload,
+        chat_contact: Option<&UserKey>,
+    ) -> Result<()> {
         let envelope = Envelope {
-            id: rand::random(),
+            id: envelope_id,
             payload,
         };
-        for entry in &others {
-            self.enqueue_sealed(entry, &envelope, None, false)?;
+        for entry in &self.own_other_devices() {
+            self.enqueue_sealed(entry, &envelope, chat_contact, false)?;
+            // A browser tab can end at any moment and gets no time for the shutdown drain
+            // (`drain.rs`), so it puts the letter on the relays now instead of after a failed
+            // direct attempt. Native builds drain on exit and avoid the extra relay traffic.
+            #[cfg(target_family = "wasm")]
+            self.post_to_mailbox(entry.device_id(), envelope.id)?;
         }
         Ok(())
     }
@@ -298,7 +306,7 @@ impl Node {
     }
 
     /// Posts a queued envelope once to the device's mailbox (no-op without mailbox / if done).
-    fn post_to_mailbox(&mut self, device: EndpointId, envelope_id: EnvelopeId) -> Result<()> {
+    pub(super) fn post_to_mailbox(&mut self, device: EndpointId, envelope_id: EnvelopeId) -> Result<()> {
         let Some(me) = self.me.as_ref() else {
             return Ok(());
         };

@@ -12,7 +12,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, Sense, Str
 use crate::{
     state::LoadedAttachment,
     touch,
-    ui::{emoji, files, links::TextLink, theme, time_fmt},
+    ui::{emoji, files, icons, links::TextLink, theme, time_fmt},
 };
 
 const REACTION_EMOJI_SIZE: f32 = 22.0;
@@ -27,6 +27,9 @@ const CARD_NAME_FONT_SIZE: f32 = 15.0;
 const META_GAP: f32 = 10.0;
 /// Fraction of a tick's width by which the second "delivered" tick is shifted over the first.
 const DOUBLE_TICK_SHIFT: f32 = 0.45;
+/// The pending clock icon: edge length as a share of the meta font size, and the gap before it.
+const CLOCK_SIZE_RATIO: f32 = 0.95;
+const CLOCK_GAP: f32 = 4.0;
 const BUBBLE_MAX_WIDTH_FRACTION: f32 = 0.85;
 const IMAGE_PADDING: f32 = 3.0;
 const IMAGE_MAX_SIZE: Vec2 = egui::vec2(files::IMAGE_BUBBLE_EDGE, files::IMAGE_BUBBLE_EDGE);
@@ -833,6 +836,8 @@ fn paint_meta(ui: &egui::Ui, bubble: Rect, meta: Meta, is_image: bool) {
 struct Meta {
     text: Arc<Galley>,
     second_tick: Option<(Arc<Galley>, f32)>,
+    /// Edge length of the clock icon drawn after the time while the message is pending.
+    clock: Option<f32>,
     size: Vec2,
 }
 
@@ -842,6 +847,14 @@ impl Meta {
         if let Some((tick, shift)) = self.second_tick {
             let tick_x = origin.x + self.text.size().x - tick.size().x + shift;
             painter.galley(Pos2::new(tick_x, origin.y), tick, fallback_color);
+        }
+        if let Some(edge) = self.clock {
+            let top_left = Pos2::new(
+                origin.x + self.text.size().x + CLOCK_GAP,
+                origin.y + (self.text.size().y - edge) / 2.0,
+            );
+            let rect = Rect::from_min_size(top_left, Vec2::splat(edge));
+            icons::clock(painter, rect, fallback_color);
         }
         painter.galley(origin, self.text, fallback_color);
     }
@@ -854,11 +867,22 @@ fn layout_meta(ui: &egui::Ui, message: &MessageView, color: Color32) -> Meta {
         .layout_no_wrap(meta_text(message), font.clone(), color);
     let is_delivered =
         message.direction == Direction::Outgoing && message.status == DeliveryStatus::Delivered;
+    if is_pending(message) {
+        let edge = META_FONT_SIZE * CLOCK_SIZE_RATIO;
+        let size = text.size() + egui::vec2(CLOCK_GAP + edge, 0.0);
+        return Meta {
+            text,
+            second_tick: None,
+            clock: Some(edge),
+            size,
+        };
+    }
     if !is_delivered {
         let size = text.size();
         return Meta {
             text,
             second_tick: None,
+            clock: None,
             size,
         };
     }
@@ -868,6 +892,7 @@ fn layout_meta(ui: &egui::Ui, message: &MessageView, color: Color32) -> Meta {
     Meta {
         text,
         second_tick: Some((tick, shift)),
+        clock: None,
         size,
     }
 }
@@ -919,6 +944,10 @@ fn bubble_radius(outgoing: bool, ends_group: bool) -> CornerRadius {
     radius
 }
 
+fn is_pending(message: &MessageView) -> bool {
+    message.direction == Direction::Outgoing && message.status == DeliveryStatus::Pending
+}
+
 fn meta_text(message: &MessageView) -> String {
     let time = time_fmt::clock(message.sent_at_ms);
     let marker = status_marker(message);
@@ -934,7 +963,8 @@ fn status_marker(message: &MessageView) -> &'static str {
         return "";
     }
     match message.status {
-        DeliveryStatus::Pending => "🕓",
+        // Drawn as an icon (`Meta::paint`), not as text.
+        DeliveryStatus::Pending => "",
         DeliveryStatus::Sent => "✓",
         DeliveryStatus::Delivered => "✓",
         DeliveryStatus::Failed => "⚠ not delivered",

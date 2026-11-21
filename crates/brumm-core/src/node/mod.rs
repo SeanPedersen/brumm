@@ -13,6 +13,8 @@
 mod commands;
 mod contacts;
 mod delivery;
+mod drain;
+pub use drain::SHUTDOWN_DRAIN_MAX;
 mod history_sync;
 mod inbound;
 mod linking;
@@ -119,6 +121,7 @@ pub async fn run(
             };
         }
     }
+    node.drain_outbox().await;
     node.shutdown().await;
 }
 

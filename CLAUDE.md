@@ -33,7 +33,9 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   emoji reactions (`Payload::Reaction` / own-device `ReactionSync`, one per user and message, last write wins by
   `at_ms`, `reactions` table; schema v6 upgrades v4/v5 in place). Reactions are not part of history sync.
 - **Notes chat done:** the conversation keyed by our own `UserKey` (no contacts row; the UI lists a pseudo-contact "Notes").
-  Messages are stored as Outgoing/Delivered and synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
+  Messages are stored as Outgoing and tick like any chat (🕓 drawn as `icons::clock` → ✓ on the relay → ✓✓ when another own device
+  has it; Delivered at once while this is the only device). The `SentTranscript` is enqueued under the message id with the Notes chat as
+  `chat_contact` (`enqueue_to_own_devices_as`), so acks and relay posts update the status. Contact messages' transcripts stay untracked. Synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
   devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning, and history sync to a new device sends it in full (other chats: last 60 days).
   Linking sends a `HistoryManifest` first; history chunks go one chat at a time, most recent chat first, newest messages
   first. The outbox keeps queue order (≤ 2 in flight per device, next on ack). The new device shows a per-chat
@@ -63,6 +65,13 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   Touch selection: a long tap opens the context menu (Select item), never selects by itself. Moving the finger (> `TOUCH_MOVE_SLOP`) is
   scrolling and drops the press, drag-selection is off on touch. Once selection mode is on, a tap toggles.
   Not yet phone-adapted: dialogs/devices/onboarding screens, touch-sized hit targets.
+- **Quit right after sending:** the Nostr post normally starts only after the direct attempt failed (5-10 s), so a quit
+  in that window used to leave the message in the outbox until the next launch. On shutdown `node/drain.rs` posts every
+  unmailboxed outbox entry to the relays at once (cap `SHUTDOWN_DRAIN_MAX`, 10 s), and `bridge/native.rs` `Drop` waits for
+  the core thread (the process used to kill it). `bridge/profile_lock.rs` (`brumm.lock`, held for the core's whole life
+  incl. the drain) makes a relaunch wait for it and refuses a second live instance: two processes on one DB would
+  diverge the Olm ratchets. A browser tab cannot drain, so on wasm `enqueue_to_own_devices` also posts to the mailbox
+  at enqueue time (not on native: no extra relay traffic). Tests: `tests/mailbox.rs` (quit right after send, Notes via relay).
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **Emoji:** the system color emoji font (Noto Color Emoji, via `fc-match emoji` if it is not
   in a well-known path) is installed after the text fonts and before discovered fallbacks.
@@ -103,6 +112,7 @@ crates/brumm-core/        no UI; everything async/network/storage
   src/node/linking.rs     link / remove devices, apply own DeviceList, revocation
   src/node/delivery.rs    per-device outbox: enqueue (seal once), flush, acks, mailbox fallback, receipts
   src/node/inbound.rs     decrypt + dedupe + apply Envelope payloads
+  src/node/drain.rs       shutdown: post the whole outbox to the Nostr relays, capped wait
   src/node/reconcile.rs   own-device consistency rounds: when to run, apply digest / have / missing messages
   src/reconcile.rs        pure bucket digest + compare (no I/O)
   src/identity.rs         UserIdentity (BIP-39 → Ed25519 via blake3 derive_key), DeviceCert,
@@ -127,7 +137,8 @@ crates/brumm-worker/      browser only: runs brumm-core in a Web Worker (OPFS st
 crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html + Trunk.toml for the web
   src/main.rs             picks native.rs (window, --profile, window size) or web.rs (canvas, ?profile=)
   src/bridge/native.rs    tokio runtime thread (2 workers) + channels; repaint on event;
-                          detached thread, closing the command channel stops the core
+                          closing the command channel stops the core, Drop waits for its drain
+  src/bridge/profile_lock.rs  one core per profile dir (file lock)
   src/bridge/web.rs       starts brumm-worker, postcard messages, queues commands until Listening
   src/history.rs          browser history push/back/popstate for the narrow layout (no-op on desktop)
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches

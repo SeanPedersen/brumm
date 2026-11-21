@@ -108,3 +108,13 @@ pub fn smiley(painter: &Painter, rect: Rect, color: Color32) {
     );
     canvas.polyline(&smile);
 }
+
+/// Clock: outline plus minute and hour hand ("still on its way").
+pub fn clock(painter: &Painter, rect: Rect, color: Color32) {
+    const FACE_RADIUS: f32 = 9.5;
+    let canvas = Canvas::new(painter, rect, color);
+    let mut face = Vec::new();
+    arc_to(&mut face, GRID_CENTER, FACE_RADIUS, 0.0, TAU);
+    canvas.polyline(&face);
+    canvas.polyline(&[Pos2::new(12.0, 6.0), GRID_CENTER, Pos2::new(16.0, 14.5)]);
+}
