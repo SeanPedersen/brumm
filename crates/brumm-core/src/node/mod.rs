@@ -63,6 +63,9 @@ pub struct NodeConfig {
     pub mailbox_relays: Vec<String>,
     /// Minimum time between two consistency checks with the same own device.
     pub reconcile_interval: Duration,
+    /// Called once the shutdown drain is over (everything unsent is on the relays), before the
+    /// slower graceful network teardown, so a host can let its process end at that point.
+    pub on_drained: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl NodeConfig {
@@ -72,13 +75,14 @@ impl NodeConfig {
             retry_interval: DEFAULT_RETRY_INTERVAL,
             mailbox_relays: mailbox::default_relays(),
             reconcile_interval: reconcile::DEFAULT_RECONCILE_INTERVAL,
+            on_drained: None,
         }
     }
 }
 
 /// Runs the node until the command channel closes.
 pub async fn run(
-    config: NodeConfig,
+    mut config: NodeConfig,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: EventSink,
 ) {
@@ -122,6 +126,9 @@ pub async fn run(
         }
     }
     node.drain_outbox().await;
+    if let Some(on_drained) = config.on_drained.take() {
+        on_drained();
+    }
     node.shutdown().await;
 }
 

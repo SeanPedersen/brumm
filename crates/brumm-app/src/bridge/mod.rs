@@ -7,7 +7,7 @@ mod native;
 #[cfg(not(target_family = "wasm"))]
 mod profile_lock;
 #[cfg(not(target_family = "wasm"))]
-pub use native::CoreBridge;
+pub use native::{CoreBridge, wait_for_drain};
 
 #[cfg(target_family = "wasm")]
 mod web;

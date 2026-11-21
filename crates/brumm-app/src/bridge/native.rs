@@ -1,7 +1,11 @@
 //! Native bridge: runs the async core on its own tokio thread and exposes a non-blocking
 //! command/event interface to the immediate-mode UI.
 
-use std::{path::PathBuf, sync::mpsc as std_mpsc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Mutex, mpsc as std_mpsc},
+    time::Duration,
+};
 
 use brumm_core::{
     api::{Command, Event, EventSink},
@@ -17,11 +21,24 @@ const CORE_WORKER_THREADS: usize = 2;
 /// Longest the exiting process waits for the core's shutdown drain (it is capped there too).
 const EXIT_WAIT: Duration = Duration::from_secs(SHUTDOWN_DRAIN_MAX.as_secs() + 3);
 
+/// Handed over by `CoreBridge::drop`, so the wait happens in `wait_for_drain` after the window
+/// is gone and not while it is still on screen.
+static DRAIN_SIGNAL: Mutex<Option<std_mpsc::Receiver<()>>> = Mutex::new(None);
+
+/// Blocks until the core has put unsent messages on the relays (a second or so, capped).
+/// Call after the UI loop ended; returns at once if nothing is pending.
+pub fn wait_for_drain() {
+    let signal = DRAIN_SIGNAL.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(signal) = signal {
+        let _ = signal.recv_timeout(EXIT_WAIT);
+    }
+}
+
 pub struct CoreBridge {
     commands: Option<mpsc::UnboundedSender<Command>>,
     events: mpsc::UnboundedReceiver<Event>,
-    /// Signalled when the core thread has finished, shutdown drain included.
-    core_done: std_mpsc::Receiver<()>,
+    /// Signalled when the core's shutdown drain is over (see [`wait_for_drain`]).
+    drained: Option<std_mpsc::Receiver<()>>,
 }
 
 impl CoreBridge {
@@ -29,7 +46,7 @@ impl CoreBridge {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let sink = EventSink::new(event_tx, move || ctx.request_repaint());
-        let (done_tx, core_done) = std_mpsc::channel();
+        let (done_tx, drained) = std_mpsc::channel();
         let failures = sink.clone();
         // The core stops when the command channel closes; `Drop` then waits for its drain.
         std::thread::Builder::new()
@@ -49,14 +66,19 @@ impl CoreBridge {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                runtime.block_on(node::run(NodeConfig::new(data_dir), command_rx, sink));
+                let mut config = NodeConfig::new(data_dir);
+                let drained_tx = done_tx.clone();
+                config.on_drained = Some(Box::new(move || {
+                    let _ = drained_tx.send(());
+                }));
+                runtime.block_on(node::run(config, command_rx, sink));
                 let _ = done_tx.send(());
             })
             .expect("spawn core thread");
         Self {
             commands: Some(command_tx),
             events: event_rx,
-            core_done,
+            drained: Some(drained),
         }
     }
 
@@ -73,9 +95,12 @@ impl CoreBridge {
 
 impl Drop for CoreBridge {
     /// Closing the command channel asks the node to stop. It first puts unsent messages on the
-    /// Nostr relays (a second or so), so the process waits for that, bounded by [`EXIT_WAIT`].
+    /// Nostr relays; the process waits for that in [`wait_for_drain`], not here (the window
+    /// would linger), and not for the graceful network teardown after it.
     fn drop(&mut self) {
         self.commands.take();
-        let _ = self.core_done.recv_timeout(EXIT_WAIT);
+        if let (Some(drained), Ok(mut slot)) = (self.drained.take(), DRAIN_SIGNAL.lock()) {
+            *slot = Some(drained);
+        }
     }
 }

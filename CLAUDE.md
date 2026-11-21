@@ -67,8 +67,9 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   Not yet phone-adapted: dialogs/devices/onboarding screens, touch-sized hit targets.
 - **Quit right after sending:** the Nostr post normally starts only after the direct attempt failed (5-10 s), so a quit
   in that window used to leave the message in the outbox until the next launch. On shutdown `node/drain.rs` posts every
-  unmailboxed outbox entry to the relays at once (cap `SHUTDOWN_DRAIN_MAX`, 10 s), and `bridge/native.rs` `Drop` waits for
-  the core thread (the process used to kill it). `bridge/profile_lock.rs` (`brumm.lock`, held for the core's whole life
+  unmailboxed outbox entry to the relays at once (cap `SHUTDOWN_DRAIN_MAX`, 10 s), and `main` waits for it in `bridge::wait_for_drain` after
+  the window is gone (`NodeConfig::on_drained` fires after the drain, not after the slow graceful network teardown, so closing
+  the window is instant; the process used to kill the core mid-drain). `bridge/profile_lock.rs` (`brumm.lock`, held for the core's whole life
   incl. the drain) makes a relaunch wait for it and refuses a second live instance: two processes on one DB would
   diverge the Olm ratchets. A browser tab cannot drain, so on wasm `enqueue_to_own_devices` also posts to the mailbox
   at enqueue time (not on native: no extra relay traffic). Tests: `tests/mailbox.rs` (quit right after send, Notes via relay).

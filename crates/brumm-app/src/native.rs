@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::{app, bridge::CoreBridge, window_size};
+use crate::{app, bridge::{self, CoreBridge}, window_size};
 
 const DEFAULT_PROFILE: &str = "default";
 const PROFILE_FLAG: &str = "--profile";
@@ -38,15 +38,17 @@ pub fn main() -> Result<()> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "brumm",
         options,
         Box::new(move |cc| {
             let core = CoreBridge::start(data_dir, cc.egui_ctx.clone());
             Ok(Box::new(app::BrummApp::new(cc, core, window_size)))
         }),
-    )
-    .map_err(|err| anyhow::anyhow!("ui failed: {err}"))
+    );
+    // The window is gone; the unsent messages still have to reach the relays.
+    bridge::wait_for_drain();
+    result.map_err(|err| anyhow::anyhow!("ui failed: {err}"))
 }
 
 fn init_tracing() {
