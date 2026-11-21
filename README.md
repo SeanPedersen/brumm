@@ -1,5 +1,7 @@
 # brumm
 
+![brumm desktop client](brumm-desktop.png)
+
 A fun, secure and decentralized messenger: no phone number, no account server.
 Devices talk **directly peer-to-peer** ([iroh](https://github.com/n0-computer/iroh)), everything is
 **end-to-end encrypted** (Olm double ratchet via [vodozemac](https://github.com/matrix-org/vodozemac)),
@@ -17,9 +19,15 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
 - **Offline delivery** through public Nostr relays (no own server). Letters are signed by throwaway keys and
   encrypted with NIP-44, so relays learn neither who is talking nor what is said.
   Statuses: 🕓 pending → ✔ sent (in the mailbox) → ✔✔ delivered.
-- **Desktop app** (Linux, macOS, Windows) built with [egui](https://github.com/emilk/egui).
 
-Planned: offline invites and contact introductions, file transfer, groups (MLS), stickers, mobile,
+## Clients
+- **Desktop app** (Linux, macOS, Windows) built with [egui](https://github.com/emilk/egui).
+- **Web client**: the same egui UI in the browser, optimized for mobile (single-pane chat list / chat,
+  touch-friendly composer, on-screen keyboard aware). The core runs in a Web Worker and stores data in the
+  browser's private storage (OPFS); it connects through iroh relays only.
+  Build with `(cd crates/brumm-app && trunk serve)`.
+
+Planned: offline invites and contact introductions, groups (MLS), stickers, native mobile apps,
 Bluetooth/Wi‑Fi mesh. See [SPEC.md](SPEC.md) for the full design and milestones.
 
 ## Run
@@ -49,7 +57,8 @@ cargo test -p brumm-core --test network -- --ignored          # needs internet: 
 ## Layout
 ```
 crates/brumm-core   protocol, crypto, storage, networking (no UI) — talks to UIs via Command/Event
-crates/brumm-app    egui desktop app
+crates/brumm-worker browser only: runs brumm-core in a Web Worker
+crates/brumm-app    egui app (desktop + web)
 SPEC.md             protocol + architecture specification
 ```
 
