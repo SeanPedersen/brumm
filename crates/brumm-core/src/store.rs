@@ -18,7 +18,8 @@ use crate::{
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
     wire::{
-        self, Body, ChatMessage, EnvelopeId, HistoryCount, HistoryItem, InviteSecret, MessageId,
+        self, Body, ChatMessage, EnvelopeId, HistoryCount, HistoryItem, InviteSecret,
+        MAX_FILE_NAME_CHARS, MessageId,
     },
 };
 
@@ -135,6 +136,27 @@ pub struct OutboxItem {
 
 pub struct Store {
     db: Connection,
+}
+
+pub struct ConversationPage {
+    pub messages: Vec<MessageView>,
+    pub has_older: bool,
+}
+
+/// `LIMIT -1` is SQLite's "no limit".
+const SQL_NO_LIMIT: i64 = -1;
+/// postcard writes the enum variant index first; `Body::File` is variant 1.
+const FILE_BODY_TAG: u8 = 1;
+/// Variant tag, name length varint, the longest name (4 bytes per char), data length varint.
+const FILE_HEAD_BYTES: usize = 1 + MAX_VARINT_BYTES + 4 * MAX_FILE_NAME_CHARS + MAX_VARINT_BYTES;
+const MAX_VARINT_BYTES: usize = 10;
+
+/// Body column for message lists: a file is cut to its head (name and size), so listing a
+/// chat never reads multi-megabyte attachments. Text bodies are read whole.
+fn list_body_column() -> String {
+    format!(
+        "CASE WHEN substr(body, 1, 1) = x'{FILE_BODY_TAG:02x}' THEN substr(body, 1, {FILE_HEAD_BYTES}) ELSE body END"
+    )
 }
 
 /// Initial history sync on a freshly linked device. `expected` comes from the linking device's
@@ -731,18 +753,47 @@ impl Store {
         Ok(status.map(status_from_code))
     }
 
+    #[cfg(test)]
     pub fn conversation(&self, contact: &UserKey) -> Result<Vec<MessageView>> {
-        let mut stmt = self.db.prepare(
-            "SELECT contact, id, direction, body, sent_at_ms, status FROM messages
-             WHERE contact = ?1 ORDER BY sent_at_ms, rowid",
+        Ok(self.conversation_page(contact, None, None)?.messages)
+    }
+
+    /// The newest `limit` messages of a conversation (all if `None`), oldest first, or those
+    /// older than `before`. File bodies are read only up to their name and size.
+    pub fn conversation_page(
+        &self,
+        contact: &UserKey,
+        before: Option<&MessageId>,
+        limit: Option<u32>,
+    ) -> Result<ConversationPage> {
+        let sql = format!(
+            "SELECT contact, id, direction, {}, sent_at_ms, status FROM messages
+             WHERE contact = ?1 AND (?2 IS NULL OR (sent_at_ms, rowid) <
+                 (SELECT sent_at_ms, rowid FROM messages WHERE contact = ?1 AND id = ?2))
+             ORDER BY sent_at_ms DESC, rowid DESC LIMIT ?3",
+            list_body_column()
+        );
+        // One extra row tells whether anything older is left.
+        let fetch = limit.map_or(SQL_NO_LIMIT, |limit| i64::from(limit) + 1);
+        let mut stmt = self.db.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![contact.as_slice(), before.map(|id| id.as_slice()), fetch],
+            message_from_row,
         )?;
-        let rows = stmt.query_map(params![contact.as_slice()], message_from_row)?;
         let mut messages: Vec<MessageView> = rows.collect::<Result<_, _>>()?;
+        let has_older = limit.is_some_and(|limit| messages.len() > limit as usize);
+        if has_older {
+            messages.pop();
+        }
+        messages.reverse();
         let mut reactions = self.conversation_reactions(contact)?;
         for message in &mut messages {
             message.reactions = reactions.remove(&message.id).unwrap_or_default();
         }
-        Ok(messages)
+        Ok(ConversationPage {
+            messages,
+            has_older,
+        })
     }
 
     /// Latest message per conversation, for the chat list. Avoids loading full histories at
@@ -1119,15 +1170,19 @@ fn contact_from_row(row: &rusqlite::Row) -> rusqlite::Result<ContactView> {
 }
 
 fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
-    let (text, attachment) = match body_from_blob(row, 3)? {
-        Body::Text(text) => (text, None),
-        Body::File { name, data } => (
-            String::new(),
-            Some(AttachmentView {
-                name,
-                size: data.len(),
-            }),
-        ),
+    let blob: &[u8] = row.get_ref(3)?.as_blob()?;
+    let (text, attachment) = match file_head(blob) {
+        Some((name, size)) => (String::new(), Some(AttachmentView { name, size })),
+        None => match body_from_blob(row, 3)? {
+            Body::Text(text) => (text, None),
+            Body::File { name, data } => (
+                String::new(),
+                Some(AttachmentView {
+                    name,
+                    size: data.len(),
+                }),
+            ),
+        },
     };
     Ok(MessageView {
         contact: blob_array(row, 0)?,
@@ -1150,6 +1205,30 @@ fn blob_array<const N: usize>(row: &rusqlite::Row, index: usize) -> rusqlite::Re
             format!("expected {N} bytes, got {}", blob.len()).into(),
         )
     })
+}
+
+/// A file message's name and size from the start of its encoded body (see [`list_body_column`]).
+fn file_head(blob: &[u8]) -> Option<(String, usize)> {
+    let (tag, rest) = read_varint(blob)?;
+    if tag != usize::from(FILE_BODY_TAG) {
+        return None;
+    }
+    let (name_len, rest) = read_varint(rest)?;
+    let name = std::str::from_utf8(rest.get(..name_len)?).ok()?.to_owned();
+    let (size, _) = read_varint(&rest[name_len..])?;
+    Some((name, size))
+}
+
+/// postcard's unsigned LEB128 varint.
+fn read_varint(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    let mut value: usize = 0;
+    for (index, byte) in bytes.iter().take(MAX_VARINT_BYTES).enumerate() {
+        value |= usize::from(byte & 0x7f).checked_shl(7 * index as u32)?;
+        if byte & 0x80 == 0 {
+            return Some((value, &bytes[index + 1..]));
+        }
+    }
+    None
 }
 
 fn body_from_blob(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Body> {
@@ -1205,6 +1284,92 @@ fn status_from_code(code: i64) -> DeliveryStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_head_reads_name_and_size_without_the_data() {
+        let name = "ä photo.jpg".to_owned();
+        let body = wire::encode(&Body::File {
+            name: name.clone(),
+            data: vec![7; 300],
+        });
+        assert_eq!(body[0], FILE_BODY_TAG);
+        assert_eq!(file_head(&body), Some((name.clone(), 300)));
+        let head = &body[..body.len().min(FILE_HEAD_BYTES)];
+        let cut = &head[..head.len() - 300];
+        assert_eq!(file_head(cut), Some((name, 300)));
+        assert_eq!(file_head(&wire::encode(&Body::Text("hi".into()))), None);
+    }
+
+    #[test]
+    fn conversation_pages_walk_back_without_gaps() {
+        let store = Store::open_in_memory().unwrap();
+        let contact = [3; 32];
+        for index in 0..5u8 {
+            let message = ChatMessage {
+                id: [index; 16],
+                // Two messages share a timestamp: the rowid keeps their order.
+                sent_at_ms: u64::from(index.min(3)),
+                body: if index == 2 {
+                    Body::File {
+                        name: "big.bin".into(),
+                        data: vec![1; 4096],
+                    }
+                } else {
+                    Body::Text(format!("m{index}"))
+                },
+            };
+            store
+                .insert_message(
+                    &contact,
+                    &message,
+                    Direction::Incoming,
+                    DeliveryStatus::Delivered,
+                    None,
+                )
+                .unwrap();
+        }
+        let ids =
+            |page: &ConversationPage| page.messages.iter().map(|m| m.id[0]).collect::<Vec<_>>();
+
+        let newest = store.conversation_page(&contact, None, Some(2)).unwrap();
+        assert_eq!(ids(&newest), vec![3, 4]);
+        assert!(newest.has_older);
+        let older = store
+            .conversation_page(&contact, Some(&[3; 16]), Some(2))
+            .unwrap();
+        assert_eq!(ids(&older), vec![1, 2]);
+        assert!(older.has_older);
+        let file = &older.messages[1].attachment.as_ref().unwrap();
+        assert_eq!((file.name.as_str(), file.size), ("big.bin", 4096));
+        let rest = store
+            .conversation_page(&contact, Some(&[1; 16]), None)
+            .unwrap();
+        assert_eq!(ids(&rest), vec![0]);
+        assert!(!rest.has_older);
+        assert_eq!(
+            store
+                .conversation_page(&contact, None, None)
+                .unwrap()
+                .messages
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn wipe_erases_every_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_last_opened(&[7; 32]).unwrap();
+        assert_eq!(store.last_opened().unwrap(), Some([7; 32]));
+        store.wipe().unwrap();
+        assert_eq!(store.last_opened().unwrap(), None);
+        assert!(store.load_identity().unwrap().is_none());
+        let rows: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
     use crate::identity::{UserIdentity, tests::entry};
 
     fn profile(identity: &UserIdentity, devices: &[EndpointId]) -> Profile {

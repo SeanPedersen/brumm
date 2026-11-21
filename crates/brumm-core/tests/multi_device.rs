@@ -33,7 +33,17 @@ async fn link_sync_fanout_and_revoke() {
         })
         .await;
     assert_eq!(synced, vec![bob_key]);
-    phone.send(Command::LoadConversation { contact: bob_key });
+    // The manifest lets the phone tell when the initial history is complete.
+    phone
+        .expect(|event| match event {
+            Event::HistorySync(pending) if pending.is_empty() => Some(()),
+            _ => None,
+        })
+        .await;
+    phone.send(Command::LoadConversation {
+        contact: bob_key,
+        limit: None,
+    });
     let history = phone
         .expect(|event| match event {
             Event::Conversation { messages, .. } => Some(messages.clone()),

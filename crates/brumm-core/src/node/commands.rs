@@ -42,9 +42,28 @@ impl Node {
             Command::AcceptInvite { link } => self.accept_invite(&link),
             Command::LinkDevice { link } => self.link_device(&link),
             Command::RemoveDevice { device_id } => self.remove_device(device_id),
-            Command::LoadConversation { contact } => {
-                let messages = self.store.conversation(&contact)?;
-                self.events.emit(Event::Conversation { contact, messages });
+            Command::LoadConversation { contact, limit } => {
+                let page = self.store.conversation_page(&contact, None, limit)?;
+                self.events.emit(Event::Conversation {
+                    contact,
+                    messages: page.messages,
+                    has_older: page.has_older,
+                });
+                Ok(())
+            }
+            Command::LoadOlder {
+                contact,
+                before,
+                limit,
+            } => {
+                let page = self
+                    .store
+                    .conversation_page(&contact, Some(&before), limit)?;
+                self.events.emit(Event::OlderMessages {
+                    contact,
+                    messages: page.messages,
+                    has_older: page.has_older,
+                });
                 Ok(())
             }
             Command::RememberOpenChat { contact } => self.store.set_last_opened(&contact),

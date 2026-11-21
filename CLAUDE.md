@@ -142,8 +142,14 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
 - **`Event::Ready` must never wait for the network.** `Transport::start` binds iroh lazily in the
   background (`OnceCell`); mailbox startup and the outbox flush happen after Ready.
 - **Never load every conversation at startup.** `Store::conversation_previews` returns one
-  `MessageView` per chat for the sidebar; `Command::LoadConversation` loads a full history only
-  when a chat is opened. Bulk changes emit `Event::PreviewChanged` instead of a full reload.
+  `MessageView` per chat for the sidebar. Opening a chat loads only its newest page
+  (`LoadConversation { limit }`, `CONVERSATION_PAGE` = 50, keyset `conversation_page`). File bodies
+  are read only up to their head (name + size), never the data. Older pages come with `LoadOlder`
+  once the view is within `LOAD_OLDER_MARGIN` of the top (all of them while in-chat search is on).
+  A reload after a bulk change asks for as many messages as are already loaded.
+  No visual shift: when rows appear above the view (older page) or rows above the message being
+  read get measured, `chat.rs` moves the scroll offset by the same height in the same frame (with
+  rubber-banding off for that frame, since egui's physics still has the old bounds). Bulk changes emit `Event::PreviewChanged` instead of a full reload.
 - **Last opened chat** is one `meta` row (`last_opened`, the user key). `Ready` carries that key
   from a single primary-key read and does not load the history. The UI selects the chat if it
   still exists (including Notes) and then sends `LoadConversation`. Opening a different chat

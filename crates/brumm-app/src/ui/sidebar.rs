@@ -67,7 +67,7 @@ pub fn show(
                 let clicked = chat_list(ui, state, &view.search);
                 if let Some(contact) = clicked {
                     state.select(contact, ui.ctx());
-                    commands.push(Command::LoadConversation { contact });
+                    commands.push(state.load_command(contact));
                 }
             }
         });

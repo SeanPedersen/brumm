@@ -76,6 +76,9 @@ const COAST_STOP_DISTANCE: f32 = 0.5;
 const COAST_MAX_DT: f32 = 1.0 / 30.0;
 /// The jump-to-latest button stays hidden while the list is within this of the bottom.
 const BOTTOM_SLACK: f32 = 24.0;
+/// Older messages are requested when the viewport top comes this close to the first row,
+/// so they are usually there before the user reaches the top.
+const LOAD_OLDER_MARGIN: f32 = 1200.0;
 const JUMP_BUTTON_DIAMETER: f32 = 44.0;
 const JUMP_BUTTON_MARGIN: f32 = 14.0;
 /// Large upward content move. The scroll area clamps it to the exact end, which re-enables
@@ -106,6 +109,18 @@ pub struct ChatView {
     rows_contact: Option<UserKey>,
     /// Column width the cached heights were estimated for, in whole pixels.
     rows_width: i32,
+    /// Scroll offset and bottom state of the last frame, to keep the view still when messages
+    /// appear or vanish above it (older pages, reloads).
+    last_offset: f32,
+    was_at_bottom: bool,
+    /// Height change of rows above the view measured this frame. The frame is discarded and
+    /// laid out again with the offset moved by this much, so the visible rows never jump.
+    measured_shift: f32,
+    /// Message at the middle of the view last frame. Height changes above it are compensated,
+    /// so what the user reads stays put while rows above get measured.
+    view_anchor: Option<MessageId>,
+    /// Oldest loaded message an older page was requested for; avoids asking twice.
+    older_requested: Option<MessageId>,
     /// Wheel and two-finger acceleration for the message list.
     wheel: WheelAccel,
     /// In-chat search. While it is active the sidebar lists matches instead of contacts.
@@ -130,6 +145,9 @@ struct CachedRow {
     /// Changes when the text, attachment or reactions change, so the height is recomputed.
     stamp: u64,
     height: f32,
+    /// Part of `height` above the bubble: the day pill or the gap to the previous message.
+    /// It depends on the predecessor, so it is recomputed when older messages are prepended.
+    separator: f32,
     /// Visual-line byte offsets for a long note. Empty for an ordinary message.
     line_starts: Vec<u32>,
     /// True after this row has been laid out, so `height` is no longer an estimate.
@@ -261,49 +279,88 @@ pub fn show(
             if chat.search.pending() != Pending::None {
                 chat.wheel.coast = 0.0;
             }
-            let output = egui::ScrollArea::vertical()
+            if chat.rows_contact != Some(contact) {
+                // A chat opens at its newest message.
+                chat.was_at_bottom = true;
+            }
+            let anchor_shift = anchor_shift(chat, contact, messages);
+            let mut scroll_area = egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .animated(false)
-                .stick_to_bottom(true)
-                .show_viewport(ui, |ui, viewport| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let column_width =
-                        (ui.available_width() - COLUMN_PADDING_LEFT - COLUMN_PADDING_RIGHT)
-                            .max(1.0);
-                    sync_row_heights(chat, contact, messages, column_width);
-                    let rows_height: f32 = chat.rows.iter().map(|row| row.height).sum();
-                    let total_height = LIST_PADDING_TOP + rows_height + LIST_PADDING_BOTTOM;
-                    ui.set_height(total_height);
-                    apply_pending_scroll(ui, chat, viewport.min.y, viewport.height(), total_height);
+                .stick_to_bottom(true);
+            let shift = anchor_shift + std::mem::take(&mut chat.measured_shift);
+            let anchoring = shift != 0.0 && !chat.was_at_bottom;
+            let rubber_band = ui.spacing().scroll.kinetic.rubber_band;
+            if anchoring {
+                // Same frame as the change: the messages on screen do not move. The scroll
+                // physics still has last frame's bounds, so the new offset would look like
+                // overscroll and spring back; no rubber band for this one frame.
+                scroll_area = scroll_area.vertical_scroll_offset(chat.last_offset + shift);
+                ui.spacing_mut().scroll.kinetic.rubber_band = false;
+            }
+            let output = scroll_area.show_viewport(ui, |ui, viewport| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let column_width =
+                    (ui.available_width() - COLUMN_PADDING_LEFT - COLUMN_PADDING_RIGHT).max(1.0);
+                sync_row_heights(chat, contact, messages, column_width);
+                let rows_height: f32 = chat.rows.iter().map(|row| row.height).sum();
+                let total_height = LIST_PADDING_TOP + rows_height + LIST_PADDING_BOTTOM;
+                ui.set_height(total_height);
+                apply_pending_scroll(ui, chat, viewport.min.y, viewport.height(), total_height);
+                // Scrolled up near the first row, or too few rows to scroll at all.
+                let near_top = viewport.min.y < LOAD_OLDER_MARGIN && !chat.was_at_bottom;
+                let fits = total_height <= viewport.height();
+                if near_top || fits || chat.search.is_active() {
+                    request_older(state, chat, contact, commands);
+                }
 
-                    let (start, end, prefix) =
-                        visible_span(&chat.rows, viewport.min.y, viewport.max.y);
-                    if start == end {
-                        return;
-                    }
-                    let visible_height: f32 =
-                        chat.rows[start..end].iter().map(|row| row.height).sum();
-                    let y_min = ui.max_rect().top() + LIST_PADDING_TOP + prefix;
-                    let rect = Rect::from_x_y_ranges(
-                        (ui.max_rect().left() + COLUMN_PADDING_LEFT)
-                            ..=(ui.max_rect().right() - COLUMN_PADDING_RIGHT),
-                        y_min..=(y_min + visible_height).max(y_min + 1.0),
-                    );
-                    let slots = ui
-                        .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                            ui.set_width(rect.width());
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            paint_rows(ui, state, chat, contact, messages, start..end, commands)
-                        })
-                        .inner;
-                    handle_pointer(ui, chat, messages, &slots);
-                });
+                let (start, end, prefix) = visible_span(&chat.rows, viewport.min.y, viewport.max.y);
+                if start == end {
+                    return;
+                }
+                let visible_height: f32 = chat.rows[start..end].iter().map(|row| row.height).sum();
+                let y_min = ui.max_rect().top() + LIST_PADDING_TOP + prefix;
+                let rect = Rect::from_x_y_ranges(
+                    (ui.max_rect().left() + COLUMN_PADDING_LEFT)
+                        ..=(ui.max_rect().right() - COLUMN_PADDING_RIGHT),
+                    y_min..=(y_min + visible_height).max(y_min + 1.0),
+                );
+                let slots = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.set_width(rect.width());
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        paint_rows(ui, state, chat, contact, messages, start..end, commands)
+                    })
+                    .inner;
+                let middle = ui.clip_rect().center().y;
+                chat.view_anchor = slots
+                    .iter()
+                    .find(|slot| slot.row.y_range().contains(middle))
+                    .or_else(|| slots.get(slots.len() / 2))
+                    .map(|slot| messages[slot.index].id);
+                handle_pointer(ui, chat, messages, &slots);
+            });
             if let Some(&(received, expected)) = state.history_sync.get(&contact) {
                 let progress = sync_hint::SyncProgress { received, expected };
                 // Once one message exists, only the small pill shows (no switching back).
                 let chat_is_empty = !state.has_messages(&contact);
                 sync_hint::show(ui, output.inner_rect, &progress, chat_is_empty);
             }
+            if chat.measured_shift != 0.0 {
+                if chat.was_at_bottom {
+                    chat.measured_shift = 0.0;
+                } else {
+                    ui.ctx()
+                        .request_discard("chat rows above the view were measured");
+                }
+            }
+            ui.spacing_mut().scroll.kinetic.rubber_band = rubber_band;
+            chat.last_offset = output.state.clamped_offset().y;
+            chat.was_at_bottom = !away_from_bottom(
+                output.state.clamped_offset().y,
+                output.content_size.y,
+                output.inner_rect.height(),
+            );
             let jumped = chat.search.take_jumped();
             chat.search
                 .note_offset(output.state.clamped_offset().y, jumped);
@@ -431,6 +488,68 @@ fn jump_offset(row_top: f32, row_height: f32, viewport: f32, total: f32) -> f32 
         row_top - (viewport - row_height) * 0.5
     };
     desired.clamp(0.0, max_offset)
+}
+
+/// Asks for the next older page once per oldest message. Search needs every message, so an
+/// active search loads all of them.
+fn request_older(
+    state: &AppState,
+    chat: &mut ChatView,
+    contact: UserKey,
+    commands: &mut Vec<Command>,
+) {
+    let Some(oldest) = state
+        .conversations
+        .get(&contact)
+        .and_then(|messages| messages.first())
+    else {
+        return;
+    };
+    if chat.older_requested == Some(oldest.id) {
+        return;
+    }
+    if let Some(command) = state.older_command(contact, chat.search.is_active()) {
+        chat.older_requested = Some(oldest.id);
+        commands.push(command);
+    }
+}
+
+/// How far the content above the first still-present message moved since the last frame
+/// (older messages prepended, or rows above it removed). Rebuilds the row cache with the last
+/// frame's width so the shift is known before the list is laid out.
+fn anchor_shift(chat: &mut ChatView, contact: UserKey, messages: &[MessageView]) -> f32 {
+    if chat.rows_contact != Some(contact) || chat.rows.is_empty() || rows_match(chat, messages) {
+        return 0.0;
+    }
+    let new_index: HashMap<MessageId, usize> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id, index))
+        .collect();
+    let Some((old_position, anchor)) = chat
+        .rows
+        .iter()
+        .position(|row| new_index.contains_key(&row.id))
+        .map(|position| (position, chat.rows[position].id))
+    else {
+        return 0.0;
+    };
+    // The anchor's bubble, not its row top: its own day pill may turn into a gap.
+    let bubble_top = |rows: &[CachedRow], index: usize| {
+        rows[..index].iter().map(|row| row.height).sum::<f32>() + rows[index].separator
+    };
+    let old_top = bubble_top(&chat.rows, old_position);
+    sync_row_heights(chat, contact, messages, chat.rows_width as f32);
+    bubble_top(&chat.rows, new_index[&anchor]) - old_top
+}
+
+fn rows_match(chat: &ChatView, messages: &[MessageView]) -> bool {
+    chat.rows.len() == messages.len()
+        && chat
+            .rows
+            .iter()
+            .zip(messages)
+            .all(|(row, message)| row.id == message.id && row.stamp == row_stamp(message))
 }
 
 fn away_from_bottom(offset: f32, content: f32, viewport: f32) -> bool {
@@ -905,21 +1024,24 @@ fn estimate_row(
     previous: Option<&MessageView>,
     message: &MessageView,
     column_width: f32,
-) -> (f32, Vec<u32>) {
+) -> (f32, f32, Vec<u32>) {
     let (bubble, line_starts) = bubble::estimated_height(message, column_width);
-    let mut height = bubble;
+    let separator = estimate_separator(previous, message);
+    ((bubble + separator).max(1.0), separator, line_starts)
+}
+
+/// Day pill when the day changes, otherwise the gap between bubbles (none for the first row).
+fn estimate_separator(previous: Option<&MessageView>, message: &MessageView) -> f32 {
     let day = time_fmt::day_of(message.sent_at_ms);
     let new_day = previous.is_none_or(|prev| time_fmt::day_of(prev.sent_at_ms) != day);
     if new_day && day.is_some() {
-        height += DAY_HEADER_ESTIMATE;
-    } else if let Some(prev) = previous {
-        height += if prev.direction == message.direction {
-            theme::GROUP_GAP
-        } else {
-            theme::SENDER_CHANGE_GAP
-        };
+        return DAY_HEADER_ESTIMATE;
     }
-    (height.max(1.0), line_starts)
+    match previous {
+        Some(prev) if prev.direction == message.direction => theme::GROUP_GAP,
+        Some(_) => theme::SENDER_CHANGE_GAP,
+        None => 0.0,
+    }
 }
 
 /// Keeps one height per message. Unseen rows get an estimate that does not shape their text.
@@ -935,37 +1057,45 @@ fn sync_row_heights(
         chat.rows_contact = Some(contact);
         chat.rows_width = width;
     }
-    if chat.rows.len() == messages.len()
-        && chat
-            .rows
-            .iter()
-            .zip(messages)
-            .all(|(row, message)| row.id == message.id && row.stamp == row_stamp(message))
-    {
+    if rows_match(chat, messages) {
         return;
     }
-    let mut previous: HashMap<MessageId, CachedRow> =
-        chat.rows.drain(..).map(|row| (row.id, row)).collect();
+    let mut previous: HashMap<MessageId, (CachedRow, Option<MessageId>)> = HashMap::new();
+    let mut prior_id = None;
+    for row in chat.rows.drain(..) {
+        let id = row.id;
+        previous.insert(id, (row, prior_id));
+        prior_id = Some(id);
+    }
     let mut prev_message: Option<&MessageView> = None;
     chat.rows.reserve(messages.len());
     for message in messages {
         let stamp = row_stamp(message);
-        let (height, line_starts, measured) = match previous.remove(&message.id) {
-            Some(cached) if cached.stamp == stamp => {
-                (cached.height, cached.line_starts, cached.measured)
+        let row = match previous.remove(&message.id) {
+            Some((mut cached, prior)) if cached.stamp == stamp => {
+                // A new predecessor (older page prepended, or one deleted) can turn a day pill
+                // into a plain gap: swap only the separator, keep the measured bubble height.
+                if prior != prev_message.map(|prev| prev.id) {
+                    let separator = estimate_separator(prev_message, message);
+                    cached.height = (cached.height - cached.separator + separator).max(1.0);
+                    cached.separator = separator;
+                }
+                cached
             }
             _ => {
-                let (height, line_starts) = estimate_row(prev_message, message, column_width);
-                (height, line_starts, false)
+                let (height, separator, line_starts) =
+                    estimate_row(prev_message, message, column_width);
+                CachedRow {
+                    id: message.id,
+                    stamp,
+                    height,
+                    separator,
+                    line_starts,
+                    measured: false,
+                }
             }
         };
-        chat.rows.push(CachedRow {
-            id: message.id,
-            stamp,
-            height,
-            line_starts,
-            measured,
-        });
+        chat.rows.push(row);
         prev_message = Some(message);
     }
 }
@@ -1002,6 +1132,9 @@ fn paint_rows(
     chat.link_rects.clear();
     let mut slots = Vec::with_capacity(range.end - range.start);
     let mut heights_changed = false;
+    let anchor_index = chat
+        .view_anchor
+        .and_then(|anchor| messages.iter().position(|message| message.id == anchor));
     for index in range {
         let message = &messages[index];
         let previous = index.checked_sub(1).map(|prev| &messages[prev]);
@@ -1052,7 +1185,14 @@ fn paint_rows(
                 .set(band, egui::Shape::rect_filled(rect, 0.0, SEARCH_HIT_TINT));
         }
         chat.rows[index].measured = true;
+        chat.rows[index].separator = bubble_top - top;
         let used = (ui.cursor().min.y - top).max(1.0);
+        if (used - chat.rows[index].height).abs() > HEIGHT_EPSILON
+            && anchor_index.is_some_and(|anchor| index < anchor)
+        {
+            // Above the message being read: its new height would push that message.
+            chat.measured_shift += used - chat.rows[index].height;
+        }
         if (used - chat.rows[index].height).abs() > HEIGHT_EPSILON {
             chat.rows[index].height = used;
             heights_changed = true;
@@ -1300,7 +1440,7 @@ fn day_pill(ui: &mut egui::Ui, label: &str) {
 
 #[cfg(test)]
 mod tests {
-    use brumm_core::api::{ContactView, DeliveryStatus, Trust};
+    use brumm_core::api::{ContactView, DeliveryStatus, Event, Trust};
 
     use super::*;
 
@@ -1821,6 +1961,77 @@ mod tests {
                 status: DeliveryStatus::Delivered,
             })
             .collect()
+    }
+
+    fn painted_top(harness: &Harness, id: u8) -> Option<f32> {
+        let index = harness
+            .chat
+            .painted
+            .iter()
+            .position(|painted| painted[0] == id)?;
+        Some(harness.chat.row_rects[index].top())
+    }
+
+    #[test]
+    fn scrolling_up_loads_older_messages_without_moving_the_view() {
+        let mut harness = Harness::new();
+        let all = history(120);
+        harness
+            .state
+            .conversations
+            .insert(CONTACT, all[60..].to_vec());
+        harness.state.has_older.insert(CONTACT);
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        let older_requests = |harness: &Harness| {
+            harness
+                .sent
+                .iter()
+                .filter(|command| matches!(command, Command::LoadOlder { before, .. } if *before == [60; 16]))
+                .count()
+        };
+        assert_eq!(
+            older_requests(&harness),
+            0,
+            "at the bottom nothing older is needed"
+        );
+
+        // Near the top of the loaded page: the next page is requested once.
+        harness.chat.search.reveal([62; 16]);
+        // Let the jump and any spring-back settle, so only the prepend can move the view.
+        for _ in 0..120 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert_eq!(older_requests(&harness), 1);
+        let anchor = 66;
+        let before = painted_top(&harness, anchor).expect("anchor message on screen");
+
+        // The page arrives: rows appear above, the message on screen stays where it was.
+        harness.state.apply(
+            Event::OlderMessages {
+                contact: CONTACT,
+                messages: all[..60].to_vec(),
+                has_older: false,
+            },
+            &harness.ctx.clone(),
+        );
+        harness.frame(vec![], egui::Modifiers::NONE);
+        let after = painted_top(&harness, anchor).expect("anchor still on screen");
+        assert!(
+            (after - before).abs() < 1.0,
+            "view moved by {} when older messages arrived",
+            after - before
+        );
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        let settled = painted_top(&harness, anchor).expect("anchor still on screen");
+        assert!(
+            (settled - before).abs() < 1.0,
+            "view drifted by {} after the older rows were measured",
+            settled - before
+        );
     }
 
     #[test]

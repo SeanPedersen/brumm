@@ -97,8 +97,9 @@ impl eframe::App for BrummApp {
             }
             Phase::Revoked => ui::revoked::show(ui, &mut self.state, &mut commands),
         }
-        for contact in self.state.stale_conversations.drain(..) {
-            commands.push(Command::LoadConversation { contact });
+        let stale = std::mem::take(&mut self.state.stale_conversations);
+        for contact in stale {
+            commands.push(self.state.load_command(contact));
         }
         if let Some(contact) = self.state.remember_open.take() {
             commands.push(Command::RememberOpenChat { contact });

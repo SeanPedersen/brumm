@@ -32,8 +32,17 @@ pub enum Command {
     RemoveDevice {
         device_id: DeviceId,
     },
+    /// The newest `limit` messages of a chat (all if `None`). Answered with [`Event::Conversation`].
     LoadConversation {
         contact: UserKey,
+        limit: Option<u32>,
+    },
+    /// Up to `limit` messages older than `before` (all if `None`), for scrolling up.
+    /// Answered with [`Event::OlderMessages`].
+    LoadOlder {
+        contact: UserKey,
+        before: MessageId,
+        limit: Option<u32>,
     },
     /// Remembers which chat was open on this device. A single meta-row write; it does not load history.
     RememberOpenChat {
@@ -120,9 +129,17 @@ pub enum Event {
         link: String,
     },
     ContactAdded(ContactView),
+    /// The newest messages of a chat, oldest first; `has_older` if more are stored.
     Conversation {
         contact: UserKey,
         messages: Vec<MessageView>,
+        has_older: bool,
+    },
+    /// Messages right before the oldest one the UI has, oldest first.
+    OlderMessages {
+        contact: UserKey,
+        messages: Vec<MessageView>,
+        has_older: bool,
     },
     /// The last message of a conversation changed (e.g. after a bulk delete or history sync).
     PreviewChanged {

@@ -43,7 +43,10 @@ async fn last_opened_chat_is_restored_on_startup() {
     // Remember, then load: the actor applies commands in order, so the meta write is committed
     // before Conversation is emitted and the restart begins.
     node.send(Command::RememberOpenChat { contact: me });
-    node.send(Command::LoadConversation { contact: me });
+    node.send(Command::LoadConversation {
+        contact: me,
+        limit: None,
+    });
     node.expect(|event| {
         matches!(event, brumm_core::api::Event::Conversation { contact, .. } if *contact == me)
             .then_some(())

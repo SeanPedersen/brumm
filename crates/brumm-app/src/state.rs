@@ -1,23 +1,27 @@
 //! UI-side mirror of core state, updated only by applying core [`Event`]s.
 //!
 //! Startup stays cheap: the core sends one [`ConversationPreview`] per chat instead of the full
-//! history. A conversation's messages are loaded only when it is opened, and caches for
+//! history. A conversation's messages are loaded only when it is opened (its newest page; older
+//! pages follow on scroll-up), and caches for
 //! conversations and file bytes are bounded so long chats cannot grow RAM without limit.
 //! Photo bytes are not decoded here. An attachment event is queued and a background thread
 //! builds the preview.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use brumm_core::{
-    api::{ContactView, DeviceView, Event, MessageView, ProfileView, Trust},
+    api::{Command, ContactView, DeviceView, Event, MessageView, ProfileView, Trust},
     identity::UserKey,
     wire::MessageId,
 };
 
 const MAX_VISIBLE_ERRORS: usize = 3;
+/// Messages loaded when a chat opens and per scroll-up page: more than a tall window shows,
+/// few enough that opening any chat is instant.
+pub const CONVERSATION_PAGE: u32 = 50;
 const NOTES_NAME: &str = "Notes";
 /// File bytes kept in memory across all chats; older entries are dropped first.
 const ATTACHMENT_CACHE_BYTES: usize = 48 * 1024 * 1024;
@@ -65,8 +69,10 @@ pub struct AppState {
     pub selected: Option<UserKey>,
     /// Chat the user just opened. The app sends [`brumm_core::api::Command::RememberOpenChat`] once.
     pub remember_open: Option<UserKey>,
-    /// Messages of opened chats only.
+    /// Messages of opened chats only: the newest page, plus older pages loaded on scroll-up.
     pub conversations: HashMap<UserKey, Vec<MessageView>>,
+    /// Chats with more stored messages above the loaded ones.
+    pub has_older: HashSet<UserKey>,
     /// Newest message per chat, for the sidebar's preview and ordering.
     pub previews: HashMap<UserKey, MessageView>,
     pub unread: HashMap<UserKey, usize>,
@@ -98,6 +104,38 @@ pub(crate) struct PendingPreview {
 }
 
 impl AppState {
+    /// Loads the newest page of a chat, or as many messages as are already shown (a reload
+    /// after a bulk change keeps the pages the user scrolled through).
+    pub fn load_command(&self, contact: UserKey) -> Command {
+        let loaded = self.conversations.get(&contact).map_or(0, Vec::len);
+        let limit = (loaded as u32).max(CONVERSATION_PAGE);
+        Command::LoadConversation {
+            contact,
+            limit: Some(limit),
+        }
+    }
+
+    /// The next older page (or everything older for `all`), if any is left.
+    pub fn older_command(&self, contact: UserKey, all: bool) -> Option<Command> {
+        if !self.has_older.contains(&contact) {
+            return None;
+        }
+        let oldest = self.conversations.get(&contact)?.first()?;
+        Some(Command::LoadOlder {
+            contact,
+            before: oldest.id,
+            limit: (!all).then_some(CONVERSATION_PAGE),
+        })
+    }
+
+    fn set_has_older(&mut self, contact: UserKey, has_older: bool) {
+        if has_older {
+            self.has_older.insert(contact);
+        } else {
+            self.has_older.remove(&contact);
+        }
+    }
+
     /// Any message of this chat is known (loaded, or as the sidebar preview).
     pub fn has_messages(&self, contact: &UserKey) -> bool {
         self.previews.contains_key(contact)
@@ -235,11 +273,34 @@ impl AppState {
                     }
                 }
             }
-            Event::Conversation { contact, messages } => {
+            Event::Conversation {
+                contact,
+                messages,
+                has_older,
+            } => {
                 if let Some(last) = messages.last() {
                     self.remember_preview(last.clone());
                 }
                 self.conversations.insert(contact, messages);
+                self.set_has_older(contact, has_older);
+            }
+            Event::OlderMessages {
+                contact,
+                messages,
+                has_older,
+            } => {
+                // A reload may have replaced the list meanwhile; never insert a message twice.
+                let Some(loaded) = self.conversations.get_mut(&contact) else {
+                    return;
+                };
+                let known: HashSet<MessageId> = loaded.iter().map(|message| message.id).collect();
+                let mut merged: Vec<MessageView> = messages
+                    .into_iter()
+                    .filter(|message| !known.contains(&message.id))
+                    .collect();
+                merged.append(loaded);
+                *loaded = merged;
+                self.set_has_older(contact, has_older);
             }
             Event::PreviewChanged { contact, last } => match last {
                 Some(last) => {
@@ -459,6 +520,19 @@ mod tests {
         }
     }
 
+    fn message(contact: UserKey, id: u8) -> MessageView {
+        MessageView {
+            id: [id; 16],
+            contact,
+            direction: brumm_core::api::Direction::Incoming,
+            text: "hi".into(),
+            attachment: None,
+            reactions: Default::default(),
+            sent_at_ms: u64::from(id),
+            status: brumm_core::api::DeliveryStatus::Delivered,
+        }
+    }
+
     fn ready(
         state: &mut AppState,
         me: UserKey,
@@ -489,6 +563,80 @@ mod tests {
         assert_eq!(state.selected, Some(bob));
         assert_eq!(state.stale_conversations, vec![bob]);
         assert_eq!(state.remember_open, None);
+    }
+
+    #[test]
+    fn bulk_change_keeps_the_open_chat_until_it_is_reloaded() {
+        let mut state = AppState::default();
+        let (me, bob, carol) = ([1; 32], [2; 32], [3; 32]);
+        ready(
+            &mut state,
+            me,
+            vec![contact(bob, "Bob"), contact(carol, "Carol")],
+            Some(bob),
+        );
+        state.stale_conversations.clear();
+        let ctx = egui::Context::default();
+        for chat in [bob, carol] {
+            state.apply(
+                Event::Conversation {
+                    contact: chat,
+                    messages: vec![message(chat, 1)],
+                    has_older: false,
+                },
+                &ctx,
+            );
+        }
+
+        state.apply(Event::ConversationsChanged(vec![bob, carol]), &ctx);
+        assert_eq!(
+            state.conversations[&bob].len(),
+            1,
+            "open chat stays visible"
+        );
+        assert!(!state.conversations.contains_key(&carol));
+        assert_eq!(state.stale_conversations, vec![bob]);
+        assert!(state.has_messages(&carol), "its preview still counts");
+    }
+
+    #[test]
+    fn older_pages_prepend_once_and_reloads_keep_the_loaded_extent() {
+        let mut state = AppState::default();
+        let (me, bob) = ([1; 32], [2; 32]);
+        ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
+        let ctx = egui::Context::default();
+        state.apply(
+            Event::Conversation {
+                contact: bob,
+                messages: vec![message(bob, 3), message(bob, 4)],
+                has_older: true,
+            },
+            &ctx,
+        );
+        assert!(matches!(
+            state.older_command(bob, false),
+            Some(Command::LoadOlder { before, limit: Some(CONVERSATION_PAGE), .. }) if before == [3; 16]
+        ));
+
+        // A duplicate (id 3) from a racing reload is not inserted twice.
+        state.apply(
+            Event::OlderMessages {
+                contact: bob,
+                messages: vec![message(bob, 1), message(bob, 2), message(bob, 3)],
+                has_older: false,
+            },
+            &ctx,
+        );
+        let ids: Vec<u8> = state.conversations[&bob].iter().map(|m| m.id[0]).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!(state.older_command(bob, false).is_none());
+        assert!(matches!(
+            state.load_command(bob),
+            Command::LoadConversation {
+                limit: Some(CONVERSATION_PAGE),
+                ..
+            }
+        ));
     }
 
     #[test]
