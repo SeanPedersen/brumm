@@ -4,8 +4,8 @@
 //! when the query or the conversation changes, so a long note is not folded every frame.
 
 use brumm_core::{
+    api::ConversationId,
     api::{Direction, MessageView},
-    identity::UserKey,
     wire::MessageId,
 };
 
@@ -25,6 +25,8 @@ pub struct SearchHit {
     pub id: MessageId,
     pub sent_at_ms: u64,
     pub direction: Direction,
+    /// Author's name in a group (`None` in a 1:1 chat).
+    pub sender: Option<String>,
     /// Text before the match, with a leading ellipsis when the body was cut.
     pub before: String,
     /// The matched slice, in the message's own casing.
@@ -52,7 +54,7 @@ pub(crate) enum Pending {
 #[derive(Default)]
 pub struct Session {
     active: bool,
-    contact: Option<UserKey>,
+    conversation: Option<ConversationId>,
     query: String,
     /// The sidebar field should take keyboard focus.
     focus: bool,
@@ -95,29 +97,29 @@ impl Session {
     }
 
     /// Start a fresh search in `contact`. The contact-list filter is left untouched.
-    pub(crate) fn open(&mut self, contact: UserKey) {
+    pub(crate) fn open(&mut self, conversation: ConversationId) {
         let focus = true;
         *self = Self::default();
         self.active = true;
-        self.contact = Some(contact);
+        self.conversation = Some(conversation);
         self.focus = focus;
     }
 
     /// Icon click: open this room, or leave search and restore the chat list.
-    pub(crate) fn toggle(&mut self, contact: UserKey) {
+    pub(crate) fn toggle(&mut self, conversation: ConversationId) {
         if self.active {
             self.close();
         } else {
-            self.open(contact);
+            self.open(conversation);
         }
     }
 
     /// Ctrl+F: open, or focus the field again without clearing the query.
-    pub(crate) fn open_or_focus(&mut self, contact: UserKey) {
-        if self.active && self.contact == Some(contact) {
+    pub(crate) fn open_or_focus(&mut self, conversation: ConversationId) {
+        if self.active && self.conversation == Some(conversation) {
             self.focus = true;
         } else {
-            self.open(contact);
+            self.open(conversation);
         }
     }
 
@@ -126,8 +128,8 @@ impl Session {
     }
 
     /// Leave search when the open room changes. The sidebar is showing that other room's hits otherwise.
-    pub(crate) fn note_open_chat(&mut self, contact: Option<UserKey>) {
-        if self.active && self.contact != contact {
+    pub(crate) fn note_open_chat(&mut self, conversation: Option<ConversationId>) {
+        if self.active && self.conversation != conversation {
             self.close();
         }
     }
@@ -201,7 +203,7 @@ impl Session {
         self.truncated = false;
         if !query.is_empty() {
             let needle = query.to_lowercase();
-            for message in messages.iter().rev() {
+            for message in messages.iter().rev().filter(|message| !message.system) {
                 let text = searchable(message);
                 let Some((start, end)) = find_ignore_case(text, &needle) else {
                     continue;
@@ -215,6 +217,7 @@ impl Session {
                     id: message.id,
                     sent_at_ms: message.sent_at_ms,
                     direction: message.direction,
+                    sender: message.sender.as_ref().map(|sender| sender.display_name.clone()),
                     before,
                     matched,
                     after,
@@ -423,13 +426,15 @@ mod tests {
     fn message(id: u8, direction: Direction, text: &str) -> MessageView {
         MessageView {
             id: [id; 16],
-            contact: [1; 32],
+            conversation: ConversationId::Direct([1; 32]),
             direction,
             text: text.to_owned(),
             attachment: None,
             reactions: Default::default(),
             sent_at_ms: 1_700_000_000_000 + u64::from(id) * 1000,
             status: DeliveryStatus::Delivered,
+            sender: None,
+            system: false,
         }
     }
 

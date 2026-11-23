@@ -7,12 +7,16 @@ use iroh::SecretKey;
 
 use super::{Me, Node, next_seq, profile_view};
 use crate::{
-    api::{AttachmentView, Command, DeliveryStatus, Direction, Event, MessageView, ReactionsView},
+    api::{
+        AttachmentView, Command, ConversationId, DeliveryStatus, Direction, Event, MessageView,
+        ReactionsView,
+    },
     clock::now_ms,
     e2ee::DeviceCrypto,
     identity::{
         DeviceEntry, Profile, UserIdentity, UserKey, default_device_label, normalize_display_name,
     },
+    group::OpKind,
     invite::Invite,
     mailbox,
     store::StoredIdentity,
@@ -42,63 +46,114 @@ impl Node {
             Command::AcceptInvite { link } => self.accept_invite(&link),
             Command::LinkDevice { link } => self.link_device(&link),
             Command::RemoveDevice { device_id } => self.remove_device(device_id),
-            Command::LoadConversation { contact, limit } => {
-                let page = self.store.conversation_page(&contact, None, limit)?;
+            Command::LoadConversation {
+                conversation,
+                limit,
+            } => {
+                let page = self.store.conversation_page(&conversation, None, limit)?;
                 self.events.emit(Event::Conversation {
-                    contact,
+                    conversation,
                     messages: page.messages,
                     has_older: page.has_older,
                 });
                 Ok(())
             }
             Command::LoadOlder {
-                contact,
+                conversation,
                 before,
                 limit,
             } => {
                 let page = self
                     .store
-                    .conversation_page(&contact, Some(&before), limit)?;
+                    .conversation_page(&conversation, Some(&before), limit)?;
                 self.events.emit(Event::OlderMessages {
-                    contact,
+                    conversation,
                     messages: page.messages,
                     has_older: page.has_older,
                 });
                 Ok(())
             }
-            Command::RememberOpenChat { contact } => self.store.set_last_opened(&contact),
-            Command::SendText { contact, text } => {
-                self.send_text(contact, Body::Text(text.trim().to_owned()))
+            Command::RememberOpenChat { conversation } => self.store.set_last_opened(&conversation),
+            Command::SendText { conversation, text } => {
+                self.send_any(conversation, Body::Text(text.trim().to_owned()))
             }
             Command::SendFile {
-                contact,
+                conversation,
                 name,
                 data,
-            } => self.send_text(contact, Body::File { name, data }),
+            } => self.send_any(conversation, Body::File { name, data }),
             Command::DeleteMessages {
-                contact,
+                conversation: ConversationId::Group(group),
                 ids,
                 for_everyone,
-            } => self.delete_messages(contact, ids, for_everyone),
+            } => self.delete_group_messages(group, ids, for_everyone),
+            Command::DeleteMessages {
+                conversation,
+                ids,
+                for_everyone,
+            } => self.delete_messages(conversation, ids, for_everyone),
             Command::SetAvatar { image } => self.set_avatar(image),
             Command::LoadAttachment {
-                contact,
+                conversation,
                 id,
                 max_edge,
-            } => self.load_attachment(contact, id, max_edge),
+            } => self.load_attachment(conversation, id, max_edge),
             Command::StoreImagePreview {
-                contact,
+                conversation,
                 id,
                 width,
                 height,
                 max_edge,
                 bytes,
-            } => self.store_image_preview(contact, id, width, height, max_edge, bytes),
-            Command::SaveAttachment { contact, id, path } => {
-                self.save_attachment(contact, id, path)
-            }
-            Command::React { contact, id, emoji } => self.react(contact, id, emoji),
+            } => self.store_image_preview(conversation, id, width, height, max_edge, bytes),
+            Command::SaveAttachment {
+                conversation,
+                id,
+                path,
+            } => self.save_attachment(conversation, id, path),
+            Command::React {
+                conversation: ConversationId::Group(group),
+                id,
+                emoji,
+            } => self.react_in_group(group, id, emoji),
+            Command::React {
+                conversation,
+                id,
+                emoji,
+            } => self.react(conversation, id, emoji),
             Command::LogOut => self.begin_logout(),
+            Command::CreateGroup {
+                name,
+                announcement,
+                members,
+            } => self.create_group(name, announcement, members),
+            Command::InviteToGroup { group, users } => self.invite_to_group(group, users),
+            Command::AcceptGroupInvitation { group } => self.answer_group_invitation(group, true),
+            Command::DeclineGroupInvitation { group } => {
+                self.answer_group_invitation(group, false)
+            }
+            Command::RemoveMember { group, user } => self
+                .change_group(group, OpKind::Remove { user })
+                .map(drop),
+            Command::SetRole { group, user, admin } => self
+                .change_group(group, OpKind::SetRole { user, admin })
+                .map(drop),
+            Command::RenameGroup { group, name } => self.rename_group(group, name),
+            Command::SetAnnouncement { group, on } => self
+                .change_group(group, OpKind::SetAnnouncement(on))
+                .map(drop),
+            Command::SetHistorySharing { group, on } => self
+                .change_group(group, OpKind::SetHistorySharing(on))
+                .map(drop),
+            Command::SetGroupAvatar { group, image } => self.set_group_avatar(group, image),
+            Command::LeaveGroup { group } => self.leave_group(group),
+            Command::LoadMembers {
+                group,
+                query,
+                offset,
+                limit,
+            } => self.load_members(group, query, offset, limit),
+            Command::RefreshGroupKeys { group } => self.refresh_group_keys(&group),
         }
     }
 
@@ -140,6 +195,7 @@ impl Node {
         });
         self.me = Some(Me {
             user,
+            device_secret: device_secret.to_bytes(),
             profile,
             device_id: device_secret.public(),
             crypto,
@@ -178,9 +234,17 @@ impl Node {
         Ok(())
     }
 
+    fn send_any(&mut self, conversation: ConversationId, body: Body) -> Result<()> {
+        match conversation {
+            ConversationId::Group(group) => self.send_group_message(group, body),
+            ConversationId::Direct(_) => self.send_text(conversation, body),
+        }
+    }
+
     /// Sends a text or file message to a contact (and a transcript to our other devices).
     /// The conversation keyed by our own user key is the "Notes" chat: it only syncs to our devices.
-    fn send_text(&mut self, contact: UserKey, body: Body) -> Result<()> {
+    fn send_text(&mut self, conversation: ConversationId, body: Body) -> Result<()> {
+        let contact = direct_only(conversation)?;
         let is_notes = contact == self.active_me()?.user_key();
         if !is_notes {
             self.store.contact(&contact)?.context("unknown contact")?;
@@ -200,9 +264,9 @@ impl Node {
             DeliveryStatus::Pending
         };
         self.store
-            .insert_message(&contact, &message, Direction::Outgoing, status, None)?;
+            .insert_message(&conversation, &message, Direction::Outgoing, status, None)?;
         self.events.emit(Event::MessageAdded(message_view(
-            contact,
+            conversation,
             &message,
             Direction::Outgoing,
             status,
@@ -211,13 +275,13 @@ impl Node {
             &contact,
             message.id,
             Payload::Chat(message.clone()),
-            Some(&contact),
+            Some(&conversation),
         )?;
         let message_id = message.id;
         let transcript = Payload::SentTranscript { contact, message };
         if is_notes {
             // Tracked: the transcript's ack is this message's delivery.
-            self.enqueue_to_own_devices_as(message_id, transcript, Some(&contact))?;
+            self.enqueue_to_own_devices_as(message_id, transcript, Some(&conversation))?;
         } else {
             self.enqueue_to_own_devices(transcript)?;
         }
@@ -228,26 +292,27 @@ impl Node {
 impl Node {
     fn delete_messages(
         &mut self,
-        contact: UserKey,
+        conversation: ConversationId,
         ids: Vec<MessageId>,
         for_everyone: bool,
     ) -> Result<()> {
         self.active_me()?;
+        let contact = direct_only(conversation)?;
         if ids.is_empty() || ids.len() > MAX_DELETE_IDS {
             bail!("nothing to delete or too many messages at once");
         }
-        if for_everyone && !self.store.all_outgoing(&contact, &ids)? {
+        if for_everyone && !self.store.all_outgoing(&conversation, &ids)? {
             bail!("you can only delete your own messages for everyone");
         }
-        let removed = self.store.delete_messages(&contact, &ids, None)?;
+        let removed = self.store.delete_messages(&conversation, &ids, None)?;
         if removed.is_empty() {
             return Ok(());
         }
         self.events.emit(Event::MessagesDeleted {
-            contact,
+            conversation,
             ids: removed.clone(),
         });
-        self.emit_preview(&contact)?;
+        self.emit_preview(&conversation)?;
         if for_everyone {
             self.store.drop_outbox_envelopes(&removed)?;
             self.enqueue_to_user(
@@ -264,19 +329,20 @@ impl Node {
         self.flush_outbox()
     }
 
-    fn react(&mut self, contact: UserKey, id: MessageId, emoji: String) -> Result<()> {
+    fn react(&mut self, conversation: ConversationId, id: MessageId, emoji: String) -> Result<()> {
         self.active_me()?;
+        let contact = direct_only(conversation)?;
         let reaction = Reaction {
             message_id: id,
             emoji,
             at_ms: now_ms(),
         };
-        if !reaction.is_valid() || !self.store.message_exists(&contact, &id)? {
+        if !reaction.is_valid() || !self.store.message_exists(&conversation, &id)? {
             bail!("cannot react to this message");
         }
-        if let Some(reactions) = self.store.set_reaction(&contact, &reaction, true)? {
+        if let Some(reactions) = self.store.set_reaction(&conversation, &reaction, true)? {
             self.events.emit(Event::ReactionsChanged {
-                contact,
+                conversation,
                 id,
                 reactions,
             });
@@ -291,10 +357,15 @@ impl Node {
         self.flush_outbox()
     }
 
-    fn load_attachment(&mut self, contact: UserKey, id: MessageId, max_edge: u32) -> Result<()> {
-        if let Some(preview) = self.store.image_preview(&contact, &id, max_edge)? {
+    fn load_attachment(
+        &mut self,
+        conversation: ConversationId,
+        id: MessageId,
+        max_edge: u32,
+    ) -> Result<()> {
+        if let Some(preview) = self.store.image_preview(&conversation, &id, max_edge)? {
             self.events.emit(Event::ImagePreview {
-                contact,
+                conversation,
                 id,
                 width: preview.width,
                 height: preview.height,
@@ -302,9 +373,9 @@ impl Node {
             });
             return Ok(());
         }
-        if let Some(Body::File { data, .. }) = self.store.message_body(&contact, &id)? {
+        if let Some(Body::File { data, .. }) = self.store.message_body(&conversation, &id)? {
             self.events.emit(Event::Attachment {
-                contact,
+                conversation,
                 id,
                 data: Arc::new(data),
             });
@@ -315,7 +386,7 @@ impl Node {
     /// Ignores a preview that does not belong to a stored message or is larger than a bubble image.
     fn store_image_preview(
         &mut self,
-        contact: UserKey,
+        conversation: ConversationId,
         id: MessageId,
         width: u32,
         height: u32,
@@ -323,22 +394,22 @@ impl Node {
         bytes: Vec<u8>,
     ) -> Result<()> {
         if !preview_is_storable(width, height, max_edge, bytes.len())
-            || !self.store.message_exists(&contact, &id)?
+            || !self.store.message_exists(&conversation, &id)?
         {
             return Ok(());
         }
         self.store
-            .set_image_preview(&contact, &id, width, height, max_edge, &bytes)
+            .set_image_preview(&conversation, &id, width, height, max_edge, &bytes)
     }
 
     /// Reads the file from the database and writes it on another thread. The buffer dies with that thread.
     fn save_attachment(
         &mut self,
-        contact: UserKey,
+        conversation: ConversationId,
         id: MessageId,
         path: std::path::PathBuf,
     ) -> Result<()> {
-        let Some(Body::File { name, data }) = self.store.message_body(&contact, &id)? else {
+        let Some(Body::File { name, data }) = self.store.message_body(&conversation, &id)? else {
             bail!("message has no file");
         };
         #[cfg(target_family = "wasm")]
@@ -391,14 +462,19 @@ impl Node {
     }
 
     /// Tells the UI the new last message after a bulk change (delete, history sync).
-    pub(super) fn emit_preview(&self, contact: &UserKey) -> Result<()> {
-        let last = self.store.last_message(contact)?;
+    pub(super) fn emit_preview(&self, conversation: &ConversationId) -> Result<()> {
+        let last = self.store.last_message(conversation)?;
         self.events.emit(Event::PreviewChanged {
-            contact: *contact,
+            conversation: *conversation,
             last,
         });
         Ok(())
     }
+}
+
+/// The contact of a 1:1 conversation (group conversations are routed before this).
+fn direct_only(conversation: ConversationId) -> Result<UserKey> {
+    conversation.direct().context("not a 1:1 conversation")
 }
 
 /// A preview is a small re-encode. Anything larger is the original, which stays in `messages`.
@@ -417,7 +493,7 @@ fn preview_is_storable(width: u32, height: u32, max_edge: u32, len: usize) -> bo
 }
 
 pub(super) fn message_view(
-    contact: UserKey,
+    conversation: ConversationId,
     message: &ChatMessage,
     direction: Direction,
     status: DeliveryStatus,
@@ -434,12 +510,14 @@ pub(super) fn message_view(
     };
     MessageView {
         id: message.id,
-        contact,
+        conversation,
         direction,
         text,
         attachment,
         reactions: ReactionsView::default(),
         sent_at_ms: message.sent_at_ms,
         status,
+        sender: None,
+        system: false,
     }
 }

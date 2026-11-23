@@ -3,7 +3,7 @@
 mod common;
 
 use brumm_core::{
-    api::{Command, Direction, Event},
+    api::{Command, ConversationId, Direction, Event},
     wire::MAX_FILE_BYTES,
 };
 use common::TestNode;
@@ -25,7 +25,7 @@ async fn file_round_trip_and_size_limit() {
     let (mut alice, mut bob, alice_key, bob_key) = connected_pair("files").await;
     let data = vec![7u8; 100_000];
     alice.send(Command::SendFile {
-        contact: bob_key,
+        conversation: ConversationId::Direct(bob_key),
         name: "photo.png".into(),
         data: data.clone(),
     });
@@ -43,7 +43,7 @@ async fn file_round_trip_and_size_limit() {
         })
         .await;
     bob.send(Command::LoadAttachment {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         id,
         max_edge: 960,
     });
@@ -56,7 +56,7 @@ async fn file_round_trip_and_size_limit() {
     assert_eq!(*received, data);
 
     alice.send(Command::SendFile {
-        contact: bob_key,
+        conversation: ConversationId::Direct(bob_key),
         name: "huge.bin".into(),
         data: vec![1; MAX_FILE_BYTES + 1],
     });
@@ -71,14 +71,14 @@ async fn delete_for_everyone_removes_on_both_sides() {
 
     // Bob cannot delete Alice's message for everyone (it is not his).
     bob.send(Command::DeleteMessages {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         ids: vec![sent],
         for_everyone: true,
     });
     bob.expect_error().await;
 
     alice.send(Command::DeleteMessages {
-        contact: bob_key,
+        conversation: ConversationId::Direct(bob_key),
         ids: vec![sent],
         for_everyone: true,
     });
@@ -113,7 +113,7 @@ async fn reactions_sync_both_ways_and_can_be_removed() {
     assert_eq!(bob.received_text().await, "react to me");
 
     bob.send(Command::React {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         id: sent,
         emoji: "👍".into(),
     });
@@ -134,7 +134,7 @@ async fn reactions_sync_both_ways_and_can_be_removed() {
 
     // Alice reacts too, Bob removes his own.
     alice.send(Command::React {
-        contact: bob_key,
+        conversation: ConversationId::Direct(bob_key),
         id: sent,
         emoji: "❤".into(),
     });
@@ -144,7 +144,7 @@ async fn reactions_sync_both_ways_and_can_be_removed() {
         (Some("👍"), Some("❤"))
     );
     bob.send(Command::React {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         id: sent,
         emoji: String::new(),
     });
@@ -158,7 +158,7 @@ async fn reactions_sync_both_ways_and_can_be_removed() {
     );
 
     bob.send(Command::React {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         id: sent,
         emoji: "two words".into(),
     });

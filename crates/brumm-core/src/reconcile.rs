@@ -10,11 +10,12 @@
 //!    either deleted on A (A tells B to delete them) or arrive with B's own round.
 //!
 //! Only ids are compared, never bodies: message ids are random and a message never changes.
+//! Only 1:1 conversations (Notes included) take part; groups have their own catch-up (SPEC.md §14.4).
 
 use std::collections::BTreeMap;
 
 use crate::{
-    identity::UserKey,
+    conversation::ConversationId,
     store::IndexedMessage,
     wire::{BucketHash, MessageId, SyncBucket, SyncBucketIds, SyncDigest, SyncHave},
 };
@@ -23,15 +24,15 @@ use crate::{
 pub const BUCKET_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const BUCKET_HASH_CONTEXT: &str = "brumm 2026 sync bucket v1";
 
-type BucketKey = (UserKey, u32);
+type BucketKey = (ConversationId, u32);
 
-/// Sorted ids per bucket.
+/// Sorted ids per bucket of every 1:1 conversation.
 fn buckets(index: &[IndexedMessage]) -> BTreeMap<BucketKey, Vec<MessageId>> {
     let mut buckets: BTreeMap<BucketKey, Vec<MessageId>> = BTreeMap::new();
-    for message in index {
+    for message in index.iter().filter(|m| m.conversation.is_direct()) {
         let week = u32::try_from(message.sent_at_ms / BUCKET_MS).unwrap_or(u32::MAX);
         buckets
-            .entry((message.contact, week))
+            .entry((message.conversation, week))
             .or_default()
             .push(message.id);
     }
@@ -59,10 +60,12 @@ pub fn digest(since_ms: u64, index: &[IndexedMessage]) -> SyncDigest {
         since_ms,
         buckets: buckets(index)
             .into_iter()
-            .map(|((contact, week), ids)| SyncBucket {
-                contact,
-                week,
-                hash: bucket_hash(&ids),
+            .filter_map(|((conversation, week), ids)| {
+                Some(SyncBucket {
+                    contact: conversation.direct()?,
+                    week,
+                    hash: bucket_hash(&ids),
+                })
             })
             .collect(),
     }
@@ -74,56 +77,62 @@ pub fn answer(theirs: &SyncDigest, index: &[IndexedMessage]) -> Option<SyncHave>
     let mut ours = buckets(index);
     let mut differing = Vec::new();
     for bucket in &theirs.buckets {
-        let key = (bucket.contact, bucket.week);
+        let key = (ConversationId::Direct(bucket.contact), bucket.week);
         let ids = ours.remove(&key).unwrap_or_default();
         if bucket_hash(&ids) != bucket.hash {
-            differing.push(bucket_ids(key, ids));
+            differing.extend(bucket_ids(key, ids));
         }
     }
     // Buckets they do not have at all.
-    differing.extend(ours.into_iter().map(|(key, ids)| bucket_ids(key, ids)));
+    differing.extend(
+        ours.into_iter()
+            .filter_map(|(key, ids)| bucket_ids(key, ids)),
+    );
     (!differing.is_empty()).then_some(SyncHave {
         since_ms: theirs.since_ms,
         buckets: differing,
     })
 }
 
-fn bucket_ids((contact, week): BucketKey, ids: Vec<MessageId>) -> SyncBucketIds {
-    SyncBucketIds { contact, week, ids }
+fn bucket_ids((conversation, week): BucketKey, ids: Vec<MessageId>) -> Option<SyncBucketIds> {
+    Some(SyncBucketIds {
+        contact: conversation.direct()?,
+        week,
+        ids,
+    })
 }
 
 /// Step 3: what to do about the buckets the other device reported.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Repair {
     /// Ours, missing there: send them.
-    pub send: Vec<(UserKey, Vec<MessageId>)>,
+    pub send: Vec<(ConversationId, Vec<MessageId>)>,
     /// Theirs, missing here: deleted here (they must delete too), or new to us.
-    pub they_have: Vec<(UserKey, Vec<MessageId>)>,
+    pub they_have: Vec<(ConversationId, Vec<MessageId>)>,
 }
 
 /// `index` must use `theirs.since_ms`.
 pub fn repair(theirs: &SyncHave, index: &[IndexedMessage]) -> Repair {
     let ours = buckets(index);
-    let mut send: BTreeMap<UserKey, Vec<MessageId>> = BTreeMap::new();
-    let mut they_have: BTreeMap<UserKey, Vec<MessageId>> = BTreeMap::new();
+    let mut send: BTreeMap<ConversationId, Vec<MessageId>> = BTreeMap::new();
+    let mut they_have: BTreeMap<ConversationId, Vec<MessageId>> = BTreeMap::new();
     for bucket in &theirs.buckets {
+        let conversation = ConversationId::Direct(bucket.contact);
         let mine = ours
-            .get(&(bucket.contact, bucket.week))
+            .get(&(conversation, bucket.week))
             .map_or(&[][..], Vec::as_slice);
         let missing_there = mine.iter().filter(|id| !bucket.ids.contains(id));
-        send.entry(bucket.contact)
-            .or_default()
-            .extend(missing_there);
+        send.entry(conversation).or_default().extend(missing_there);
         let missing_here = bucket
             .ids
             .iter()
             .filter(|id| mine.binary_search(id).is_err());
         they_have
-            .entry(bucket.contact)
+            .entry(conversation)
             .or_default()
             .extend(missing_here);
     }
-    let non_empty = |map: BTreeMap<UserKey, Vec<MessageId>>| {
+    let non_empty = |map: BTreeMap<ConversationId, Vec<MessageId>>| {
         map.into_iter().filter(|(_, ids)| !ids.is_empty()).collect()
     };
     Repair {
@@ -135,13 +144,15 @@ pub fn repair(theirs: &SyncHave, index: &[IndexedMessage]) -> Repair {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::UserKey;
 
-    const NOTES: UserKey = [1; 32];
-    const BOB: UserKey = [2; 32];
+    const NOTES: ConversationId = ConversationId::Direct([1; 32]);
+    const BOB: ConversationId = ConversationId::Direct([2; 32]);
+    const NOTES_KEY: UserKey = [1; 32];
 
-    fn at(contact: UserKey, id: u8, sent_at_ms: u64) -> IndexedMessage {
+    fn at(conversation: ConversationId, id: u8, sent_at_ms: u64) -> IndexedMessage {
         IndexedMessage {
-            contact,
+            conversation,
             id: [id; 16],
             sent_at_ms,
         }
@@ -172,7 +183,7 @@ mod tests {
         assert_eq!(
             have.buckets,
             vec![SyncBucketIds {
-                contact: NOTES,
+                contact: NOTES_KEY,
                 week: 10,
                 ids: vec![],
             }],
@@ -257,9 +268,9 @@ mod tests {
                 )
             })
             .collect();
-        let lookup = |all: &[IndexedMessage], contact: UserKey, id: MessageId| {
+        let lookup = |all: &[IndexedMessage], conversation: ConversationId, id: MessageId| {
             *all.iter()
-                .find(|m| m.contact == contact && m.id == id)
+                .find(|m| m.conversation == conversation && m.id == id)
                 .expect("sender has it")
         };
         for from_a in [true, false] {
@@ -268,7 +279,9 @@ mod tests {
             let arriving: Vec<IndexedMessage> = fix
                 .send
                 .iter()
-                .flat_map(|(contact, ids)| ids.iter().map(|id| lookup(src, *contact, *id)))
+                .flat_map(|(conversation, ids)| {
+                    ids.iter().map(|id| lookup(src, *conversation, *id))
+                })
                 .collect();
             if from_a {
                 b.extend(arriving)
@@ -276,6 +289,16 @@ mod tests {
                 a.extend(arriving)
             }
         }
+        assert_eq!(answer(&digest(0, &a), &b), None);
+        assert_eq!(answer(&digest(0, &b), &a), None);
+    }
+
+    #[test]
+    fn group_messages_are_left_out() {
+        let group = ConversationId::Group([9; 32]);
+        let a = vec![at(BOB, 1, 10), at(group, 2, 10)];
+        let b = vec![at(BOB, 1, 10)];
+        assert_eq!(digest(0, &a).buckets.len(), 1);
         assert_eq!(answer(&digest(0, &a), &b), None);
         assert_eq!(answer(&digest(0, &b), &a), None);
     }

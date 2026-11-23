@@ -11,7 +11,7 @@ use std::{
 };
 
 use brumm_core::{
-    identity::UserKey,
+    api::ConversationId,
     wire::{MAX_AVATAR_BYTES, MAX_FILE_BYTES, MessageId},
 };
 use image::{DynamicImage, ImageEncoder, codecs::jpeg::JpegEncoder, imageops::FilterType};
@@ -22,25 +22,42 @@ const AVATAR_JPEG_QUALITY: u8 = 85;
 const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 
 /// Outcome of a dialog the user confirmed.
+/// Whose photo a picked image becomes.
+#[derive(Debug, Clone, Copy)]
+pub enum AvatarTarget {
+    Profile,
+    Group(brumm_core::api::GroupId),
+}
+
+impl AvatarTarget {
+    /// The command that sets (or, with empty bytes, removes) this photo.
+    pub fn command(self, image: Vec<u8>) -> brumm_core::api::Command {
+        match self {
+            Self::Profile => brumm_core::api::Command::SetAvatar { image },
+            Self::Group(group) => brumm_core::api::Command::SetGroupAvatar { group, image },
+        }
+    }
+}
+
 pub enum Picked {
     Attachment {
-        contact: UserKey,
+        conversation: ConversationId,
         path: PathBuf,
     },
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    Avatar(PathBuf),
-    /// A profile photo chosen in the browser (bytes, no path).
+    Avatar(AvatarTarget, PathBuf),
+    /// A photo chosen in the browser (bytes, no path).
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-    AvatarData(Vec<u8>),
+    AvatarData(AvatarTarget, Vec<u8>),
     SaveAs {
-        contact: UserKey,
+        conversation: ConversationId,
         id: MessageId,
         path: PathBuf,
     },
     /// A file dropped in the browser, read asynchronously (there is no path to open).
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     Dropped {
-        contact: UserKey,
+        conversation: ConversationId,
         name: String,
         data: Vec<u8>,
     },
@@ -62,41 +79,47 @@ impl Default for FileDialogs {
 }
 
 impl FileDialogs {
-    pub fn pick_attachment(&self, ctx: &egui::Context, contact: UserKey) {
+    pub fn pick_attachment(&self, ctx: &egui::Context, conversation: ConversationId) {
         #[cfg(not(target_family = "wasm"))]
         self.spawn(ctx, move || {
             native_dialog::pick_file("Send file", None)
-                .map(|path| Picked::Attachment { contact, path })
+                .map(|path| Picked::Attachment { conversation, path })
         });
         #[cfg(target_family = "wasm")]
         self.pick_in_browser(ctx, None, move |name, data| Picked::Dropped {
-            contact,
+            conversation,
             name,
             data,
         });
     }
 
-    pub fn pick_avatar(&self, ctx: &egui::Context) {
+    pub fn pick_avatar(&self, ctx: &egui::Context, target: AvatarTarget) {
         #[cfg(not(target_family = "wasm"))]
-        self.spawn(ctx, || {
-            native_dialog::pick_file("Choose a profile photo", Some(&IMAGE_EXTENSIONS))
-                .map(Picked::Avatar)
+        self.spawn(ctx, move || {
+            let title = match target {
+                AvatarTarget::Profile => "Choose a profile photo",
+                AvatarTarget::Group(_) => "Choose a group photo",
+            };
+            native_dialog::pick_file(title, Some(&IMAGE_EXTENSIONS))
+                .map(|path| Picked::Avatar(target, path))
         });
         #[cfg(target_family = "wasm")]
-        self.pick_in_browser(ctx, Some("image/*"), |_name, data| Picked::AvatarData(data));
+        self.pick_in_browser(ctx, Some("image/*"), move |_name, data| {
+            Picked::AvatarData(target, data)
+        });
     }
 
     pub fn pick_save_path(
         &self,
         ctx: &egui::Context,
-        contact: UserKey,
+        conversation: ConversationId,
         id: MessageId,
         file_name: String,
     ) {
         #[cfg(not(target_family = "wasm"))]
         self.spawn(ctx, move || {
             native_dialog::save_file("Save file", file_name).map(|path| Picked::SaveAs {
-                contact,
+                conversation,
                 id,
                 path,
             })
@@ -105,7 +128,7 @@ impl FileDialogs {
         #[cfg(target_family = "wasm")]
         {
             let _ = self.tx.send(Picked::SaveAs {
-                contact,
+                conversation,
                 id,
                 path: PathBuf::from(file_name),
             });
@@ -119,12 +142,12 @@ impl FileDialogs {
     pub fn take_dropped(
         &self,
         _ctx: &egui::Context,
-        contact: UserKey,
+        conversation: ConversationId,
         file: std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
         picked: &mut Vec<Picked>,
     ) {
         picked.push(Picked::Attachment {
-            contact,
+            conversation,
             path: file.path().to_path_buf(),
         });
     }
@@ -133,7 +156,7 @@ impl FileDialogs {
     pub fn take_dropped(
         &self,
         ctx: &egui::Context,
-        contact: UserKey,
+        conversation: ConversationId,
         file: std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
         _picked: &mut Vec<Picked>,
     ) {
@@ -142,7 +165,7 @@ impl FileDialogs {
             let name = file.path().to_string_lossy().into_owned();
             let picked = match file.bytes_async().await {
                 Ok(data) => Picked::Dropped {
-                    contact,
+                    conversation,
                     name,
                     data,
                 },

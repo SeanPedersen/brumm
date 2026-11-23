@@ -1,7 +1,7 @@
 //! Message composer: attach button, a one-line pill that grows with its content (Shift+Enter adds
 //! a line), an emoji picker and a round send button. Enter sends too, except on touch devices.
 
-use brumm_core::{api::Command, identity::UserKey};
+use brumm_core::api::{Command, ConversationId};
 use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::{
@@ -19,7 +19,7 @@ const SEND_ICON_SIZE: f32 = 20.0;
 const EMOJI_BUTTON_SIZE: f32 = 32.0;
 
 pub struct Composer<'a> {
-    pub contact: UserKey,
+    pub conversation: ConversationId,
     pub draft: &'a mut String,
     pub dialogs: &'a FileDialogs,
     /// Set after switching chats until the input actually holds focus, so typing can start
@@ -30,12 +30,12 @@ pub struct Composer<'a> {
 /// Returns whether the input already held keyboard focus when the frame began.
 pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) -> bool {
     let Composer {
-        contact,
+        conversation,
         draft,
         dialogs,
         grab_focus,
     } = composer;
-    let input_id = ui.make_persistent_id(("composer", contact));
+    let input_id = ui.make_persistent_id(("composer", conversation));
     let had_focus = ui.memory(|memory| memory.has_focus(input_id));
     // On touch devices Enter belongs to the text field (newline); the send button sends.
     let enter_sends = !touch::is_touch_device();
@@ -52,7 +52,7 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = ATTACH_GAP;
         if attach_button(ui) {
-            dialogs.pick_attachment(ui.ctx(), contact);
+            dialogs.pick_attachment(ui.ctx(), conversation);
         }
         // Right-to-left: the send button takes its space first, the pill fills the rest. A
         // hand-computed width would overflow and fight the sidebar resize.
@@ -64,7 +64,7 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
 
     if (enter_pressed || send_clicked) && !draft.trim().is_empty() {
         commands.push(Command::SendText {
-            contact,
+            conversation,
             text: draft.trim().to_owned(),
         });
         draft.clear();
@@ -224,7 +224,7 @@ mod tests {
                     let mut commands = Vec::new();
                     egui::Panel::bottom("composer").show(ui, |ui| {
                         let composer = Composer {
-                            contact: [1; 32],
+                            conversation: ConversationId::Direct([1; 32]),
                             draft: &mut draft,
                             dialogs: &dialogs,
                             grab_focus: false,

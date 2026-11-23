@@ -9,17 +9,17 @@
 use std::collections::{HashMap, HashSet};
 
 use brumm_core::{
-    api::{Command, ContactView, Direction, MessageView},
-    identity::UserKey,
+    api::{Command, ConversationId, Direction, GroupId, GroupStatus, MessageView},
     wire::MessageId,
 };
 use egui::{Color32, FontId, Rect, Sense, Vec2};
 
 use crate::{
-    state::AppState,
+    state::{AppState, ChatTitle},
     touch,
     ui::{
         avatar,
+        group_rows,
         bubble::{self, Action},
         chat_search::{self, Pending},
         composer::{self, Composer},
@@ -98,10 +98,10 @@ pub struct ChatView {
     selection: Vec<MessageId>,
     /// Messages awaiting delete confirmation, and whether to also delete them for the contact.
     delete_dialog: Option<DeleteDialog>,
-    requested_attachments: HashSet<(UserKey, MessageId)>,
+    requested_attachments: HashSet<(ConversationId, MessageId)>,
     /// Chat whose composer still has to receive focus after it was opened.
-    pending_focus: Option<UserKey>,
-    focused_contact: Option<UserKey>,
+    pending_focus: Option<ConversationId>,
+    focused_chat: Option<ConversationId>,
     /// Pointer gesture in progress on the message list (click, shift/ctrl-click or drag-select).
     press: Option<Press>,
     /// Anchor for shift+click range selection. Index into the message list, not the visible window.
@@ -109,7 +109,7 @@ pub struct ChatView {
     /// Heights for the open conversation, including the gap or day pill above each bubble.
     /// Off-screen rows keep an estimate and are measured only when they scroll into view.
     rows: Vec<CachedRow>,
-    rows_contact: Option<UserKey>,
+    rows_chat: Option<ConversationId>,
     /// Column width the cached heights were estimated for, in whole pixels.
     rows_width: i32,
     /// Scroll offset and bottom state of the last frame, to keep the view still when messages
@@ -142,6 +142,8 @@ pub struct ChatView {
     #[cfg(test)]
     link_rects: Vec<Rect>,
     pub dialogs: FileDialogs,
+    /// The group whose info window the header asked to open.
+    pub open_group_info: Option<GroupId>,
 }
 
 /// One message's vertical space in the windowed list.
@@ -211,25 +213,25 @@ pub fn show(
     ui: &mut egui::Ui,
     state: &AppState,
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     draft: &mut String,
     commands: &mut Vec<Command>,
     show_back: bool,
 ) -> bool {
-    let Some(view) = state.contact(&contact) else {
+    let Some(view) = state.chat_title(&conversation) else {
         return false;
     };
     let messages = state
         .conversations
-        .get(&contact)
+        .get(&conversation)
         .map(Vec::as_slice)
         .unwrap_or_default();
     // Selection never outlives its conversation or deleted messages.
     chat.selection
         .retain(|id| messages.iter().any(|message| message.id == *id));
     chat.requested_attachments
-        .retain(|(key, _)| *key == contact);
-    chat.search.note_open_chat(Some(contact));
+        .retain(|(key, _)| *key == conversation);
+    chat.search.note_open_chat(Some(conversation));
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         if chat.is_selecting() {
             chat.clear_selection();
@@ -241,23 +243,23 @@ pub fn show(
         input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::F)
     });
     if find_key && !chat.is_selecting() && chat.delete_dialog.is_none() {
-        chat.search.open_or_focus(contact);
+        chat.search.open_or_focus(conversation);
     }
 
     let mut back_clicked = false;
     if chat.is_selecting() {
         selection_bar(ui, chat, messages);
     } else {
-        back_clicked = header(ui, state, chat, view, show_back);
+        back_clicked = header(ui, state, chat, &view, show_back);
     }
-    if chat.focused_contact != Some(contact) {
-        chat.pending_focus = Some(contact);
+    if chat.focused_chat != Some(conversation) {
+        chat.pending_focus = Some(conversation);
     }
-    chat.focused_contact = Some(contact);
+    chat.focused_chat = Some(conversation);
     // The sidebar search field owns the keyboard while a room search is open.
     // Touch devices never auto-focus: it would pop up the on-screen keyboard (even later, in the
     // middle of a scroll) when the user only wants to read.
-    let grab_focus = chat.pending_focus == Some(contact)
+    let grab_focus = chat.pending_focus == Some(conversation)
         && !chat.search.is_active()
         && !touch::is_touch_device();
     egui::Panel::bottom("composer")
@@ -267,8 +269,14 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(12, 8)),
         )
         .show(ui, |ui| {
+            if let Some(notice) = composer_notice(state, &conversation) {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(notice).color(theme::MUTED_TEXT));
+                });
+                return;
+            }
             let composer = Composer {
-                contact,
+                conversation,
                 draft,
                 dialogs: &chat.dialogs,
                 grab_focus,
@@ -290,11 +298,11 @@ pub fn show(
             if chat.search.pending() != Pending::None {
                 chat.wheel.coast = 0.0;
             }
-            if chat.rows_contact != Some(contact) {
+            if chat.rows_chat != Some(conversation) {
                 // A chat opens at its newest message.
                 chat.was_at_bottom = true;
             }
-            let anchor_shift = anchor_shift(chat, contact, messages);
+            let anchor_shift = anchor_shift(chat, conversation, messages);
             let mut scroll_area = egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .animated(false)
@@ -317,7 +325,7 @@ pub fn show(
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let column_width =
                     (ui.available_width() - COLUMN_PADDING_LEFT - COLUMN_PADDING_RIGHT).max(1.0);
-                sync_row_heights(chat, contact, messages, column_width);
+                sync_row_heights(chat, conversation, messages, column_width);
                 let rows_height: f32 = chat.rows.iter().map(|row| row.height).sum();
                 let total_height = LIST_PADDING_TOP + rows_height + LIST_PADDING_BOTTOM;
                 ui.set_height(total_height);
@@ -331,7 +339,7 @@ pub fn show(
                 let near_top = viewport.min.y < LOAD_OLDER_MARGIN && !chat.was_at_bottom;
                 let fits = total_height <= viewport.height();
                 if near_top || fits || chat.search.is_active() {
-                    request_older(state, chat, contact, commands);
+                    request_older(state, chat, conversation, commands);
                 }
 
                 let (start, end, prefix) = visible_span(&chat.rows, viewport.min.y, viewport.max.y);
@@ -349,7 +357,15 @@ pub fn show(
                     .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.set_width(rect.width());
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        paint_rows(ui, state, chat, contact, messages, start..end, commands)
+                        paint_rows(
+                            ui,
+                            state,
+                            chat,
+                            conversation,
+                            messages,
+                            start..end,
+                            commands,
+                        )
                     })
                     .inner;
                 let middle = ui.clip_rect().center().y;
@@ -360,10 +376,10 @@ pub fn show(
                     .map(|slot| messages[slot.index].id);
                 handle_pointer(ui, chat, messages, &slots);
             });
-            if let Some(&(received, expected)) = state.history_sync.get(&contact) {
+            if let Some(&(received, expected)) = state.history_sync.get(&conversation) {
                 let progress = sync_hint::SyncProgress { received, expected };
                 // Once one message exists, only the small pill shows (no switching back).
-                let chat_is_empty = !state.has_messages(&contact);
+                let chat_is_empty = !state.has_messages(&conversation);
                 sync_hint::show(ui, output.inner_rect, &progress, chat_is_empty);
             }
             if chat.measured_shift != 0.0 {
@@ -405,8 +421,24 @@ pub fn show(
                 }
             }
         });
-    delete_dialog(ui, chat, contact, &view.display_name, commands);
+    let everyone = if state.group(&conversation).is_some() {
+        "everyone"
+    } else {
+        view.name
+    };
+    delete_dialog(ui, chat, conversation, everyone, commands);
     back_clicked
+}
+
+/// Why the composer is replaced by a line of text in this chat, if it is.
+fn composer_notice(state: &AppState, conversation: &ConversationId) -> Option<&'static str> {
+    let group = state.group(conversation)?;
+    match group.status {
+        GroupStatus::Left => Some("You left this group"),
+        GroupStatus::Removed => Some("You were removed from this group"),
+        GroupStatus::Active if !group.may_post() => Some("Only admins can post in this group"),
+        GroupStatus::Active => None,
+    }
 }
 
 /// Returns true when the back arrow (narrow layout only) was clicked.
@@ -414,10 +446,13 @@ fn header(
     ui: &mut egui::Ui,
     state: &AppState,
     chat: &mut ChatView,
-    view: &ContactView,
+    view: &ChatTitle,
     show_back: bool,
 ) -> bool {
     let mut back_clicked = false;
+    let chat_id = view.conversation;
+    let group = state.group(&chat_id);
+    let contact = state.chat_contact(&chat_id);
     egui::Panel::top("chat_header")
         .frame(
             egui::Frame::new()
@@ -430,43 +465,53 @@ fn header(
                 if show_back {
                     back_clicked = back_button(ui);
                 }
-                let is_notes = state.is_notes(&view.user_key);
+                let is_notes = state.is_notes(&chat_id);
                 let photo = if is_notes {
                     None
                 } else {
-                    state.avatars.get(&view.user_key)
+                    state.avatars.get(&view.key)
                 };
-                avatar::show(
-                    ui,
-                    theme::HEADER_AVATAR_SIZE,
-                    &view.user_key,
-                    &view.display_name,
-                    photo,
-                );
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(egui::RichText::new(&view.display_name).size(16.0).strong());
-                    let subtitle = if is_notes {
-                        "visible on all your devices"
-                    } else {
-                        "end-to-end encrypted"
-                    };
-                    ui.label(
-                        egui::RichText::new(subtitle)
-                            .small()
-                            .color(theme::MUTED_TEXT),
-                    );
-                });
+                let title = ui
+                    .scope(|ui| {
+                        avatar::show(ui, theme::HEADER_AVATAR_SIZE, &view.key, view.name, photo);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(egui::RichText::new(view.name).size(16.0).strong());
+                            let subtitle = match group {
+                                Some(group) => match group.member_count {
+                                    1 => "1 member".to_owned(),
+                                    count => format!("{count} members"),
+                                },
+                                None if is_notes => "visible on all your devices".to_owned(),
+                                None => "end-to-end encrypted".to_owned(),
+                            };
+                            ui.label(
+                                egui::RichText::new(subtitle)
+                                    .small()
+                                    .color(theme::MUTED_TEXT),
+                            );
+                        });
+                    })
+                    .response;
+                if let Some(group) = group {
+                    let title = title.interact(Sense::click()).on_hover_text("Group info");
+                    if title.hovered() {
+                        ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if title.clicked() {
+                        chat.open_group_info = Some(group.id);
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if search_button(ui, chat.search.is_active()) {
-                        chat.search.toggle(view.user_key);
+                        chat.search.toggle(chat_id);
                     }
                     // The narrow header has no room for the key details.
-                    if is_notes || show_back {
+                    let Some(contact) = contact.filter(|_| !is_notes && !show_back) else {
                         return;
-                    }
+                    };
                     ui.label(
-                        egui::RichText::new(&view.fingerprint)
+                        egui::RichText::new(&contact.fingerprint)
                             .monospace()
                             .small()
                             .color(theme::MUTED_TEXT),
@@ -553,12 +598,12 @@ fn jump_offset(row_top: f32, row_height: f32, viewport: f32, total: f32) -> f32 
 fn request_older(
     state: &AppState,
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     commands: &mut Vec<Command>,
 ) {
     let Some(oldest) = state
         .conversations
-        .get(&contact)
+        .get(&conversation)
         .and_then(|messages| messages.first())
     else {
         return;
@@ -566,7 +611,7 @@ fn request_older(
     if chat.older_requested == Some(oldest.id) {
         return;
     }
-    if let Some(command) = state.older_command(contact, chat.search.is_active()) {
+    if let Some(command) = state.older_command(conversation, chat.search.is_active()) {
         chat.older_requested = Some(oldest.id);
         commands.push(command);
     }
@@ -575,8 +620,12 @@ fn request_older(
 /// How far the content above the first still-present message moved since the last frame
 /// (older messages prepended, or rows above it removed). Rebuilds the row cache with the last
 /// frame's width so the shift is known before the list is laid out.
-fn anchor_shift(chat: &mut ChatView, contact: UserKey, messages: &[MessageView]) -> f32 {
-    if chat.rows_contact != Some(contact) || chat.rows.is_empty() || rows_match(chat, messages) {
+fn anchor_shift(
+    chat: &mut ChatView,
+    conversation: ConversationId,
+    messages: &[MessageView],
+) -> f32 {
+    if chat.rows_chat != Some(conversation) || chat.rows.is_empty() || rows_match(chat, messages) {
         return 0.0;
     }
     let new_index: HashMap<MessageId, usize> = messages
@@ -597,7 +646,7 @@ fn anchor_shift(chat: &mut ChatView, contact: UserKey, messages: &[MessageView])
         rows[..index].iter().map(|row| row.height).sum::<f32>() + rows[index].separator
     };
     let old_top = bubble_top(&chat.rows, old_position);
-    sync_row_heights(chat, contact, messages, chat.rows_width as f32);
+    sync_row_heights(chat, conversation, messages, chat.rows_width as f32);
     bubble_top(&chat.rows, new_index[&anchor]) - old_top
 }
 
@@ -806,7 +855,7 @@ fn open_delete_dialog(chat: &mut ChatView, messages: &[MessageView], ids: Vec<Me
 fn delete_dialog(
     ui: &mut egui::Ui,
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     name: &str,
     commands: &mut Vec<Command>,
 ) {
@@ -842,7 +891,7 @@ fn delete_dialog(
     });
     if confirmed {
         commands.push(Command::DeleteMessages {
-            contact,
+            conversation,
             ids: dialog.ids.clone(),
             for_everyone: dialog.for_everyone,
         });
@@ -1071,6 +1120,9 @@ fn row_stamp(message: &MessageView) -> u64 {
     if message.reactions.theirs.is_some() {
         stamp |= 1u64 << 63;
     }
+    for (emoji, count) in &message.reactions.others {
+        stamp ^= (emoji.len() as u64 + u64::from(*count)).wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
     if let Some(attachment) = &message.attachment {
         stamp ^= (attachment.size as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         stamp ^= (attachment.name.len() as u64) << 32;
@@ -1083,36 +1135,54 @@ fn estimate_row(
     message: &MessageView,
     column_width: f32,
 ) -> (f32, f32, Vec<u32>) {
-    let (bubble, line_starts) = bubble::estimated_height(message, column_width);
     let separator = estimate_separator(previous, message);
+    if message.system {
+        return (group_rows::SYSTEM_ROW_ESTIMATE + separator, separator, Vec::new());
+    }
+    let (bubble, line_starts) = bubble::estimated_height(message, column_width);
     ((bubble + separator).max(1.0), separator, line_starts)
 }
 
-/// Day pill when the day changes, otherwise the gap between bubbles (none for the first row).
+/// Day pill when the day changes, otherwise the gap between bubbles (none for the first row),
+/// plus a group sender's name above the first bubble of a run.
 fn estimate_separator(previous: Option<&MessageView>, message: &MessageView) -> f32 {
     let day = time_fmt::day_of(message.sent_at_ms);
     let new_day = previous.is_none_or(|prev| time_fmt::day_of(prev.sent_at_ms) != day);
+    let label = if group_rows::sender_label(previous, message, new_day).is_some() {
+        group_rows::SENDER_LABEL_ESTIMATE
+    } else {
+        0.0
+    };
     if new_day && day.is_some() {
-        return DAY_HEADER_ESTIMATE;
+        return DAY_HEADER_ESTIMATE + label;
     }
-    match previous {
-        Some(prev) if prev.direction == message.direction => theme::GROUP_GAP,
-        Some(_) => theme::SENDER_CHANGE_GAP,
-        None => 0.0,
+    label
+        + match previous {
+            Some(prev) => gap_between(prev, message),
+            None => 0.0,
+        }
+}
+
+/// Space between two rows: small within one author's run, larger when the author changes.
+fn gap_between(previous: &MessageView, message: &MessageView) -> f32 {
+    if group_rows::author(previous) == group_rows::author(message) {
+        theme::GROUP_GAP
+    } else {
+        theme::SENDER_CHANGE_GAP
     }
 }
 
 /// Keeps one height per message. Unseen rows get an estimate that does not shape their text.
 fn sync_row_heights(
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     messages: &[MessageView],
     column_width: f32,
 ) {
     let width = column_width.round() as i32;
-    if chat.rows_contact != Some(contact) || chat.rows_width != width {
+    if chat.rows_chat != Some(conversation) || chat.rows_width != width {
         chat.rows.clear();
-        chat.rows_contact = Some(contact);
+        chat.rows_chat = Some(conversation);
         chat.rows_width = width;
     }
     if rows_match(chat, messages) {
@@ -1181,7 +1251,7 @@ fn paint_rows(
     ui: &mut egui::Ui,
     state: &AppState,
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     messages: &[MessageView],
     range: std::ops::Range<usize>,
     commands: &mut Vec<Command>,
@@ -1202,21 +1272,34 @@ fn paint_rows(
         if let (true, Some(day)) = (new_day, day) {
             day_pill(ui, &time_fmt::day_label(day));
         } else if let Some(prev) = previous {
-            let gap = if prev.direction == message.direction {
-                theme::GROUP_GAP
-            } else {
-                theme::SENDER_CHANGE_GAP
-            };
-            ui.add_space(gap);
+            ui.add_space(gap_between(prev, message));
+        }
+        if message.system {
+            let bubble_top = ui.cursor().min.y;
+            let row = group_rows::paint_system(ui, &message.text);
+            finish_row(ui, chat, index, top, bubble_top, anchor_index, &mut heights_changed);
+            slots.push(RowSlot {
+                index,
+                row,
+                hit_area: row,
+            });
+            continue;
+        }
+        if let (Some(name), Some(sender)) = (
+            group_rows::sender_label(previous, message, new_day),
+            message.sender.as_ref(),
+        ) {
+            group_rows::paint_sender(ui, name, &sender.user_key);
         }
         let ends_group = messages.get(index + 1).is_none_or(|next| {
-            next.direction != message.direction || time_fmt::day_of(next.sent_at_ms) != day
+            group_rows::author(next) != group_rows::author(message)
+                || time_fmt::day_of(next.sent_at_ms) != day
         });
 
-        let attachment = state.attachments.get(&(contact, message.id));
+        let attachment = state.attachments.get(&(conversation, message.id));
         request_preview(
             chat,
-            contact,
+            conversation,
             message,
             attachment.is_some(),
             files::preview_max_edge(ui.pixels_per_point()),
@@ -1242,19 +1325,7 @@ fn paint_rows(
             ui.painter()
                 .set(band, egui::Shape::rect_filled(rect, 0.0, SEARCH_HIT_TINT));
         }
-        chat.rows[index].measured = true;
-        chat.rows[index].separator = bubble_top - top;
-        let used = (ui.cursor().min.y - top).max(1.0);
-        if (used - chat.rows[index].height).abs() > HEIGHT_EPSILON
-            && anchor_index.is_some_and(|anchor| index < anchor)
-        {
-            // Above the message being read: its new height would push that message.
-            chat.measured_shift += used - chat.rows[index].height;
-        }
-        if (used - chat.rows[index].height).abs() > HEIGHT_EPSILON {
-            chat.rows[index].height = used;
-            heights_changed = true;
-        }
+        finish_row(ui, chat, index, top, bubble_top, anchor_index, &mut heights_changed);
         slots.push(RowSlot {
             index,
             row: output.row,
@@ -1263,7 +1334,7 @@ fn paint_rows(
         #[cfg(test)]
         chat.link_rects.extend(output.link_rects);
         for action in output.actions {
-            apply_action(ui, chat, contact, messages, message, action, commands);
+            apply_action(ui, chat, conversation, messages, message, action, commands);
         }
     }
     if heights_changed {
@@ -1275,6 +1346,31 @@ fn paint_rows(
         chat.painted = slots.iter().map(|slot| messages[slot.index].id).collect();
     }
     slots
+}
+
+/// Records a painted row's measured height (and the shift it causes above the anchor).
+fn finish_row(
+    ui: &egui::Ui,
+    chat: &mut ChatView,
+    index: usize,
+    top: f32,
+    bubble_top: f32,
+    anchor_index: Option<usize>,
+    heights_changed: &mut bool,
+) {
+    let row = &mut chat.rows[index];
+    row.measured = true;
+    row.separator = bubble_top - top;
+    let used = (ui.cursor().min.y - top).max(1.0);
+    if (used - row.height).abs() <= HEIGHT_EPSILON {
+        return;
+    }
+    if anchor_index.is_some_and(|anchor| index < anchor) {
+        // Above the message being read: its new height would push that message.
+        chat.measured_shift += used - row.height;
+    }
+    row.height = used;
+    *heights_changed = true;
 }
 
 const AREA_RESIZE_EPSILON: f32 = 0.5;
@@ -1437,7 +1533,7 @@ fn autoscroll(ui: &mut egui::Ui, pointer_y: f32) {
 /// Image messages load their bytes once, when first shown.
 fn request_preview(
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     message: &MessageView,
     loaded: bool,
     max_edge: u32,
@@ -1447,9 +1543,14 @@ fn request_preview(
         .attachment
         .as_ref()
         .is_some_and(|attachment| files::is_image_name(&attachment.name));
-    if is_image && !loaded && chat.requested_attachments.insert((contact, message.id)) {
+    if is_image
+        && !loaded
+        && chat
+            .requested_attachments
+            .insert((conversation, message.id))
+    {
         commands.push(Command::LoadAttachment {
-            contact,
+            conversation,
             id: message.id,
             max_edge,
         });
@@ -1459,7 +1560,7 @@ fn request_preview(
 fn apply_action(
     ui: &egui::Ui,
     chat: &mut ChatView,
-    contact: UserKey,
+    conversation: ConversationId,
     messages: &[MessageView],
     message: &MessageView,
     action: Action,
@@ -1474,7 +1575,7 @@ fn apply_action(
                 emoji
             };
             commands.push(Command::React {
-                contact,
+                conversation,
                 id: message.id,
                 emoji,
             });
@@ -1485,8 +1586,12 @@ fn apply_action(
             let Some(attachment) = &message.attachment else {
                 return;
             };
-            chat.dialogs
-                .pick_save_path(ui.ctx(), contact, message.id, attachment.name.clone());
+            chat.dialogs.pick_save_path(
+                ui.ctx(),
+                conversation,
+                message.id,
+                attachment.name.clone(),
+            );
         }
         Action::Delete => {
             let ids = if chat.selection.contains(&message.id) {
@@ -1518,9 +1623,12 @@ fn day_pill(ui: &mut egui::Ui, label: &str) {
 mod tests {
     use brumm_core::api::{ContactView, DeliveryStatus, Event, Trust};
 
+    use brumm_core::identity::UserKey;
+
     use super::*;
 
-    const CONTACT: UserKey = [1; 32];
+    const CONTACT_KEY: UserKey = [1; 32];
+    const CONTACT: ConversationId = ConversationId::Direct(CONTACT_KEY);
 
     fn state() -> AppState {
         let mut state = AppState {
@@ -1529,7 +1637,7 @@ mod tests {
             ..Default::default()
         };
         state.contacts.push(ContactView {
-            user_key: CONTACT,
+            user_key: CONTACT_KEY,
             display_name: "Bob".into(),
             fingerprint: "ab".into(),
             trust: Trust::Verified,
@@ -1538,7 +1646,7 @@ mod tests {
         let messages = (1..=5u8)
             .map(|index| MessageView {
                 id: [index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: if index % 2 == 0 {
                     Direction::Outgoing
                 } else {
@@ -1549,6 +1657,8 @@ mod tests {
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             })
             .collect();
         state.conversations.insert(CONTACT, messages);
@@ -1700,6 +1810,7 @@ mod tests {
             .reactions = brumm_core::api::ReactionsView {
             mine: Some("❤".into()),
             theirs: None,
+            others: Vec::new(),
         };
         for _ in 0..3 {
             harness.frame(vec![], egui::Modifiers::NONE);
@@ -1860,13 +1971,15 @@ mod tests {
         let messages = (0..200u8)
             .map(|index| MessageView {
                 id: [index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: Direction::Outgoing,
                 text: "hello".into(),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             })
             .collect();
         harness.state.conversations.insert(CONTACT, messages);
@@ -1911,13 +2024,15 @@ mod tests {
         let messages = (0..200u8)
             .map(|index| MessageView {
                 id: [index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: Direction::Outgoing,
                 text: "hello".into(),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             })
             .collect();
         harness.state.conversations.insert(CONTACT, messages);
@@ -1942,13 +2057,15 @@ mod tests {
         for index in 0..20u8 {
             messages.push(MessageView {
                 id: [index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: Direction::Outgoing,
                 text: format!("older {index}"),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             });
         }
         let mut long = String::new();
@@ -1958,24 +2075,28 @@ mod tests {
         let long_len = long.len();
         messages.push(MessageView {
             id: [200; 16],
-            contact: CONTACT,
+            conversation: CONTACT,
             direction: Direction::Outgoing,
             text: long,
             attachment: None,
             reactions: Default::default(),
             sent_at_ms: 1_700_000_000_000 + 30 * 60_000,
             status: DeliveryStatus::Delivered,
+            sender: None,
+            system: false,
         });
         for index in 0..4u8 {
             messages.push(MessageView {
                 id: [210 + index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: Direction::Outgoing,
                 text: format!("tail {index}"),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + 40 * 60_000 + u64::from(index) * 60_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             });
         }
         harness.state.conversations.insert(CONTACT, messages);
@@ -2028,13 +2149,15 @@ mod tests {
         (0..count)
             .map(|index| MessageView {
                 id: [index; 16],
-                contact: CONTACT,
+                conversation: CONTACT,
                 direction: Direction::Incoming,
                 text: format!("message {index}"),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000 + u64::from(index) * 1_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             })
             .collect()
     }
@@ -2086,7 +2209,7 @@ mod tests {
         // The page arrives: rows appear above, the message on screen stays where it was.
         harness.state.apply(
             Event::OlderMessages {
-                contact: CONTACT,
+                conversation: CONTACT,
                 messages: all[..60].to_vec(),
                 has_older: false,
             },

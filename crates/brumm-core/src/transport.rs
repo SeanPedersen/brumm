@@ -1,5 +1,6 @@
-//! iroh transport: binds the device endpoint, accepts `brumm/1` connections and sends
-//! request/response frames to peer devices with a per-peer connection cache.
+//! iroh transport: binds the device endpoint, accepts `brumm/3` connections and sends
+//! request/response frames to peer devices with a per-peer connection cache. The same endpoint
+//! runs iroh-gossip for group topics (its own ALPN, SPEC.md §14.4).
 
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
@@ -12,7 +13,13 @@ use iroh::{
 use n0_future::{task, time};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
-use crate::wire::{self, ALPN, Frame, MAX_FRAME_BYTES, Reply};
+use crate::{
+    group::message::MAX_WIRE_BYTES,
+    wire::{self, ALPN, Frame, MAX_FRAME_BYTES, Reply},
+};
+
+/// Gossip frames carry one encoded group unit plus iroh-gossip's own framing.
+const GOSSIP_FRAMING_BYTES: usize = 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,7 +93,22 @@ pub struct Transport {
 
 struct Bound {
     router: Router,
+    gossip: iroh_gossip::Gossip,
     connections: Mutex<HashMap<EndpointId, Connection>>,
+}
+
+/// Gossip neighbours a browser keeps per group topic. Everything there goes through one iroh
+/// relay connection, so a browser keeps fewer neighbours (and forwards to fewer) than a desktop.
+/// 4, not 3: in the 10k-node simulation every message arrived with 4, while 3 lost some (SPEC §14.11).
+const BROWSER_ACTIVE_VIEW: usize = 4;
+
+/// HyParView settings: the protocol defaults on desktop, a smaller active view in the browser.
+fn gossip_membership() -> iroh_gossip::MembershipConfig {
+    let mut config = iroh_gossip::MembershipConfig::default();
+    if cfg!(target_family = "wasm") {
+        config.active_view_capacity = BROWSER_ACTIVE_VIEW;
+    }
+    config
 }
 
 impl Bound {
@@ -97,11 +119,17 @@ impl Bound {
             .bind()
             .await
             .context("bind iroh endpoint")?;
+        let gossip = iroh_gossip::Gossip::builder()
+            .max_message_size(MAX_WIRE_BYTES + GOSSIP_FRAMING_BYTES)
+            .membership_config(gossip_membership())
+            .spawn(endpoint.clone());
         let router = Router::builder(endpoint)
             .accept(ALPN, InboundHandler { inbound })
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
         Ok(Self {
             router,
+            gossip,
             connections: Mutex::default(),
         })
     }
@@ -194,6 +222,11 @@ impl Transport {
             .expect("lock poisoned")
             .insert(peer, connection.clone());
         exchange(&connection, &payload).await
+    }
+
+    /// The gossip instance on our endpoint (waits for the endpoint).
+    pub async fn gossip(&self) -> Result<iroh_gossip::Gossip> {
+        Ok(self.bound().await?.gossip.clone())
     }
 
     /// Closes the endpoint; in-flight requests of background tasks fail promptly.

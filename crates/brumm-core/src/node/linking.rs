@@ -122,6 +122,7 @@ impl Node {
         self.start_mailbox(&target.device_secret, relays);
         self.me = Some(Me {
             user,
+            device_secret: target.device_secret.to_bytes(),
             profile,
             device_id: my_device,
             crypto: target.crypto,
@@ -237,7 +238,8 @@ impl Node {
         for (subject, image) in self.store.avatars()? {
             self.enqueue_to_device(entry, Payload::Avatar(Avatar { subject, image }))?;
         }
-        let notes = self.active_me()?.user_key();
+        self.sync_groups_to_device(entry)?;
+        let notes = self.active_me()?.notes();
         let history = self
             .store
             .history_since(now_ms().saturating_sub(RETENTION_MS), &notes)?;
@@ -302,7 +304,8 @@ impl Node {
                 None,
             )?;
         }
-        self.enqueue_to_own_devices(Payload::DeviceList(devices))
+        self.enqueue_to_own_devices(Payload::DeviceList(devices))?;
+        self.announce_device_list_to_groups()
     }
 
     // ── both ────────────────────────────────────────────────────────────────

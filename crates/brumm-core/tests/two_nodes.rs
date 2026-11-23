@@ -3,7 +3,7 @@
 
 mod common;
 
-use brumm_core::api::Command;
+use brumm_core::api::{Command, ConversationId};
 use common::TestNode;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -42,17 +42,22 @@ async fn last_opened_chat_is_restored_on_startup() {
     let me = node.create_identity("Ada").await;
     // Remember, then load: the actor applies commands in order, so the meta write is committed
     // before Conversation is emitted and the restart begins.
-    node.send(Command::RememberOpenChat { contact: me });
+    node.send(Command::RememberOpenChat {
+        conversation: ConversationId::Direct(me),
+    });
     node.send(Command::LoadConversation {
-        contact: me,
+        conversation: ConversationId::Direct(me),
         limit: None,
     });
     node.expect(|event| {
-        matches!(event, brumm_core::api::Event::Conversation { contact, .. } if *contact == me)
+        matches!(event, brumm_core::api::Event::Conversation { conversation, .. } if *conversation == ConversationId::Direct(me))
             .then_some(())
     })
     .await;
 
     let mut node = node.restart().await;
-    assert_eq!(node.ready_last_opened().await, Some(me));
+    assert_eq!(
+        node.ready_last_opened().await,
+        Some(ConversationId::Direct(me))
+    );
 }

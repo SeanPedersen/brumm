@@ -6,7 +6,9 @@ use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
+    conversation::GroupId,
     crypto::Sealed,
+    group,
     identity::{DeviceList, Profile, UserKey},
 };
 
@@ -44,6 +46,34 @@ pub enum Frame {
     },
     /// Plaintext is an [`Envelope`].
     Sealed(Sealed),
+    /// Group catch-up (SPEC.md §14.4): one step of range-based reconciliation over a group's
+    /// log, or a fetch of log entries by id. Only member devices are answered.
+    GroupLog(GroupLogRequest),
+    /// Part of a stored blob (rekey slots, group files, group photos).
+    BlobGet {
+        hash: [u8; 32],
+        offset: u64,
+        len: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GroupLogRequest {
+    Reconcile {
+        group: GroupId,
+        since_ms: u64,
+        ranges: Vec<group::sync::Range>,
+    },
+    Fetch {
+        group: GroupId,
+        ids: Vec<group::sync::ItemId>,
+    },
+    /// The ops after `checkpoint` (a newcomer building its log), from the `skip`th on.
+    Ops {
+        group: GroupId,
+        checkpoint: Option<group::BlobHash>,
+        skip: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +87,23 @@ pub enum Reply {
         id: EnvelopeId,
     },
     Rejected(RejectReason),
+    /// Answer to [`GroupLogRequest::Reconcile`]: the next ranges (empty: done) and the ids the
+    /// asking device lacks.
+    GroupLogRanges {
+        ranges: Vec<group::sync::Range>,
+        you_lack: Vec<group::sync::ItemId>,
+    },
+    /// Answer to [`GroupLogRequest::Fetch`]: encoded [`group::message::GroupWire`]s.
+    GroupLogItems(Vec<Vec<u8>>),
+    /// `None`: not stored here.
+    Blob(Option<Vec<u8>>),
+    /// Answer to [`GroupLogRequest::Ops`]. `checkpoint` is the responder's: when it is not the
+    /// one asked about, `ops` is empty and the asker starts again from that one.
+    GroupLogOps {
+        checkpoint: Option<group::join::BlobRef>,
+        ops: Vec<group::GroupOp>,
+        more: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +170,14 @@ pub enum Payload {
     SyncHave(SyncHave),
     /// Step 3: messages the other device lacks (no history-sync progress counting).
     SyncMessages(Vec<HistoryItem>),
+    /// From a contact: an invitation to a group (SPEC.md §14.6).
+    GroupInvitation(group::join::GroupInvitation),
+    /// To the inviter: accept (with consent) or decline.
+    GroupInvitationReply(Box<group::join::InvitationReply>),
+    /// From the admin who added us: the op log and our first epoch.
+    GroupWelcome(Box<group::join::GroupWelcome>),
+    /// Own-device sync: a group we created, joined or left, with its keys.
+    GroupSync(Box<group::join::GroupSync>),
 }
 
 /// Messages from `since_ms` on (Notes: all of them), summarized per bucket. Both sides compare

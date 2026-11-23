@@ -4,7 +4,9 @@
 
 pub mod api;
 pub mod clock;
+pub mod conversation;
 pub mod crypto;
+pub mod group;
 mod e2ee;
 pub mod identity;
 pub mod invite;

@@ -12,7 +12,7 @@ use iroh::EndpointId;
 
 use super::{Node, commands::message_view};
 use crate::{
-    api::{DeliveryStatus, Direction, Event, Trust},
+    api::{ConversationId, DeliveryStatus, Direction, Event, Trust},
     clock::now_ms,
     crypto::Sealed,
     identity::{DeviceList, UserKey},
@@ -53,6 +53,8 @@ impl Node {
                 }
                 Ok(processed.reply)
             }
+            Frame::GroupLog(request) => self.serve_group_log(from, request),
+            Frame::BlobGet { hash, offset, len } => self.serve_blob(from, hash, offset, len),
         }
     }
 
@@ -141,6 +143,16 @@ impl Node {
             (Payload::SyncDigest(digest), true) => self.receive_sync_digest(from, digest)?,
             (Payload::SyncHave(have), true) => self.receive_sync_have(from, have)?,
             (Payload::SyncMessages(items), true) => self.receive_sync_messages(from, items)?,
+            (Payload::GroupInvitation(invitation), false) => {
+                self.receive_group_invitation(owner, invitation)?
+            }
+            (Payload::GroupInvitationReply(reply), false) => {
+                self.receive_invitation_reply(owner, *reply)?
+            }
+            (Payload::GroupWelcome(welcome), false) => {
+                self.receive_group_welcome(owner, *welcome)?
+            }
+            (Payload::GroupSync(sync), true) => self.receive_group_sync(*sync)?,
             (payload, _) => {
                 tracing::warn!(
                     ?payload,
@@ -161,18 +173,19 @@ impl Node {
     }
 
     fn receive_chat(&mut self, contact: UserKey, message: ChatMessage) -> Result<bool> {
+        let conversation = ConversationId::Direct(contact);
         if !message.body.is_valid() || self.store.contact(&contact)?.is_none() {
             return Ok(false);
         }
         if self.store.insert_message(
-            &contact,
+            &conversation,
             &message,
             Direction::Incoming,
             DeliveryStatus::Delivered,
             Some(now_ms()),
         )? {
             self.events.emit(Event::MessageAdded(message_view(
-                contact,
+                conversation,
                 &message,
                 Direction::Incoming,
                 DeliveryStatus::Delivered,
@@ -183,18 +196,19 @@ impl Node {
 
     /// Our other device sent `message` to `contact`.
     fn receive_transcript(&mut self, contact: UserKey, message: ChatMessage) -> Result<bool> {
+        let conversation = ConversationId::Direct(contact);
         if !message.body.is_valid() {
             return Ok(false);
         }
         if self.store.insert_message(
-            &contact,
+            &conversation,
             &message,
             Direction::Outgoing,
             DeliveryStatus::Delivered,
             None,
         )? {
             self.events.emit(Event::MessageAdded(message_view(
-                contact,
+                conversation,
                 &message,
                 Direction::Outgoing,
                 DeliveryStatus::Delivered,
@@ -205,33 +219,35 @@ impl Node {
 
     /// A contact deletes messages they sent; they cannot touch ours.
     fn receive_delete(&mut self, contact: UserKey, ids: Vec<wire::MessageId>) -> Result<bool> {
+        let conversation = ConversationId::Direct(contact);
         if ids.len() > wire::MAX_DELETE_IDS {
             return Ok(false);
         }
         let removed = self
             .store
-            .delete_messages(&contact, &ids, Some(Direction::Incoming))?;
+            .delete_messages(&conversation, &ids, Some(Direction::Incoming))?;
         if !removed.is_empty() {
             self.events.emit(Event::MessagesDeleted {
-                contact,
+                conversation,
                 ids: removed,
             });
-            self.emit_preview(&contact)?;
+            self.emit_preview(&conversation)?;
         }
         Ok(true)
     }
 
     fn receive_delete_sync(&mut self, contact: UserKey, ids: Vec<wire::MessageId>) -> Result<bool> {
+        let conversation = ConversationId::Direct(contact);
         if ids.len() > wire::MAX_DELETE_IDS {
             return Ok(false);
         }
-        let removed = self.store.delete_messages(&contact, &ids, None)?;
+        let removed = self.store.delete_messages(&conversation, &ids, None)?;
         if !removed.is_empty() {
             self.events.emit(Event::MessagesDeleted {
-                contact,
+                conversation,
                 ids: removed,
             });
-            self.emit_preview(&contact)?;
+            self.emit_preview(&conversation)?;
         }
         Ok(true)
     }
@@ -244,15 +260,19 @@ impl Node {
         reaction: wire::Reaction,
         mine: bool,
     ) -> Result<bool> {
+        let conversation = ConversationId::Direct(contact);
         if !reaction.is_valid() {
             return Ok(false);
         }
-        if !self.store.message_exists(&contact, &reaction.message_id)? {
+        if !self
+            .store
+            .message_exists(&conversation, &reaction.message_id)?
+        {
             return Ok(true);
         }
-        if let Some(reactions) = self.store.set_reaction(&contact, &reaction, mine)? {
+        if let Some(reactions) = self.store.set_reaction(&conversation, &reaction, mine)? {
             self.events.emit(Event::ReactionsChanged {
-                contact,
+                conversation,
                 id: reaction.message_id,
                 reactions,
             });
@@ -342,24 +362,25 @@ impl Node {
             } else {
                 Direction::Incoming
             };
+            let conversation = ConversationId::Direct(item.contact);
             let inserted = self.store.insert_message(
-                &item.contact,
+                &conversation,
                 &item.message,
                 direction,
                 DeliveryStatus::Delivered,
                 None,
             )?;
             if inserted {
-                if !changed.contains(&item.contact) {
-                    changed.push(item.contact);
+                if !changed.contains(&conversation) {
+                    changed.push(conversation);
                 }
-            } else if !self.store.message_exists(&item.contact, &item.message.id)? {
+            } else if !self.store.message_exists(&conversation, &item.message.id)? {
                 refused.push(item);
             }
         }
         if !changed.is_empty() {
-            for contact in &changed {
-                self.emit_preview(contact)?;
+            for conversation in &changed {
+                self.emit_preview(conversation)?;
             }
             self.events.emit(Event::ConversationsChanged(changed));
         }

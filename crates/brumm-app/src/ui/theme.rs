@@ -18,6 +18,8 @@ pub const MUTED_TEXT: Color32 = Color32::from_rgb(0x6D, 0x7F, 0x8F);
 pub const MUTED_TEXT_ON_SELECTED: Color32 = Color32::from_rgb(0xB5, 0xCC, 0xE0);
 pub const OUTGOING_META: Color32 = Color32::from_rgb(0x7D, 0xA8, 0xD4);
 pub const SERVICE_PILL: Color32 = Color32::from_rgba_premultiplied(0x10, 0x18, 0x22, 0xB0);
+/// Corner radius of a system line ("Bob joined"); it may wrap, so not fully round.
+pub const SYSTEM_PILL_RADIUS: f32 = 11.0;
 pub const DANGER: Color32 = Color32::from_rgb(0xEC, 0x66, 0x6D);
 pub const ERROR_FILL: Color32 = Color32::from_rgb(0x6B, 0x1E, 0x1E);
 
@@ -116,4 +118,25 @@ pub fn danger_button(label: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong())
         .fill(DANGER)
         .corner_radius(CornerRadius::same(8))
+}
+
+/// Gap between a dialog and the screen edges on a narrow screen.
+const DIALOG_SCREEN_MARGIN: f32 = 8.0;
+
+/// A dialog window that fits the screen: `width` on desktop, the screen width (minus a margin)
+/// on a phone, anchored at the top so the on-screen keyboard does not cover it.
+pub fn dialog(title: &str, ctx: &egui::Context, width: f32) -> egui::Window<'static> {
+    let screen = ctx.content_rect();
+    let fitted = width.min(screen.width() - DIALOG_SCREEN_MARGIN * 2.0).max(1.0);
+    let window = egui::Window::new(title.to_owned())
+        .collapsible(false)
+        .resizable(false)
+        .default_width(fitted)
+        .max_width(fitted)
+        .max_height(screen.height() - DIALOG_SCREEN_MARGIN * 2.0)
+        .constrain(true);
+    if fitted < width {
+        return window.anchor(egui::Align2::CENTER_TOP, [0.0, DIALOG_SCREEN_MARGIN]);
+    }
+    window
 }

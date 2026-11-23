@@ -2,15 +2,14 @@
 //! While a room search is active, the same field and list show that room's messages instead.
 
 use brumm_core::{
-    api::{Command, ContactView, Direction, MessageView},
-    identity::UserKey,
+    api::{Command, ConversationId, Direction, GroupInvitationView, InvitationStage, MessageView},
     wire::MessageId,
 };
 use egui::{Align2, FontId, Rect, Sense, Vec2};
 
 use crate::{
-    state::AppState,
-    ui::{ViewState, avatar, chat_search, theme, time_fmt},
+    state::{AppState, ChatTitle},
+    ui::{ViewState, avatar, chat_search, icons, theme, time_fmt},
 };
 
 const ROW_PADDING: f32 = 12.0;
@@ -34,6 +33,9 @@ const BADGE_PADDING: f32 = 12.0;
 const MAX_BADGE_COUNT: usize = 99;
 const OWN_MESSAGE_PREFIX: &str = "You: ";
 const SEARCH_SENDER_YOU: &str = "You";
+const INVITATION_PAD_Y: i8 = 8;
+/// Clock / spinner in front of an accepted invitation's status line.
+const INVITATION_STATUS_ICON: f32 = 14.0;
 
 #[cfg(test)]
 thread_local! {
@@ -55,19 +57,19 @@ pub fn show(
         view.chat.search.note_open_chat(state.selected);
         top_bar(ui, state, view);
         if view.chat.search.is_active() {
-            if let Some(contact) = state.selected {
-                let jumped = message_results(ui, state, view, contact);
+            if let Some(conversation) = state.selected {
+                let jumped = message_results(ui, state, view, conversation);
                 if let Some(id) = jumped {
                     view.chat.search.reveal(id);
                     view.narrow.show_chat_after_search();
                 }
             }
         } else {
-            let clicked = chat_list(ui, state, &view.search);
-            if let Some(contact) = clicked {
-                state.select(contact, ui.ctx());
+            let clicked = chat_list(ui, state, &view.search, commands);
+            if let Some(conversation) = clicked {
+                state.select(conversation, ui.ctx());
                 view.narrow.open_chat();
-                commands.push(state.load_command(contact));
+                commands.push(state.load_command(conversation));
             }
         }
     };
@@ -180,15 +182,15 @@ fn message_results(
     ui: &mut egui::Ui,
     state: &AppState,
     view: &mut ViewState,
-    contact: UserKey,
+    conversation: ConversationId,
 ) -> Option<MessageId> {
     let name = state
-        .contact(&contact)
-        .map(|contact| contact.display_name.clone())
+        .chat_title(&conversation)
+        .map(|chat| chat.name.to_owned())
         .unwrap_or_default();
     let messages = state
         .conversations
-        .get(&contact)
+        .get(&conversation)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let highlighted = view.chat.search.highlighted();
@@ -266,9 +268,10 @@ fn result_row(
     let text_right = rect.right() - ROW_PADDING;
     let top_line_y = rect.top() + rect.height() * 0.32;
     let bottom_line_y = rect.top() + rect.height() * 0.70;
-    let sender = match hit.direction {
-        Direction::Outgoing => SEARCH_SENDER_YOU,
-        Direction::Incoming => contact_name,
+    let sender = match (hit.direction, &hit.sender) {
+        (Direction::Outgoing, _) => SEARCH_SENDER_YOU,
+        (Direction::Incoming, Some(sender)) => sender,
+        (Direction::Incoming, None) => contact_name,
     };
     let stamp_width = paint_right(
         ui,
@@ -360,7 +363,9 @@ fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
                 ui.separator();
             }
             if ui.button("Set profile photo…").clicked() {
-                view.chat.dialogs.pick_avatar(ui.ctx());
+                view.chat
+                    .dialogs
+                    .pick_avatar(ui.ctx(), crate::ui::files::AvatarTarget::Profile);
                 ui.close();
             }
             if state
@@ -375,6 +380,10 @@ fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
             ui.separator();
             if ui.button("Add contact").clicked() {
                 view.add_contact.open = true;
+                ui.close();
+            }
+            if ui.button("New group").clicked() {
+                view.new_group.open();
                 ui.close();
             }
             let devices = format!("Devices ({})", state.devices.len());
@@ -394,15 +403,17 @@ fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
     );
 }
 
-/// Returns the contact the user clicked, if any.
+/// Returns the chat the user clicked, if any.
 fn chat_list(
     ui: &mut egui::Ui,
     state: &AppState,
     search: &str,
-) -> Option<brumm_core::identity::UserKey> {
-    let contacts = visible_contacts(state, search);
-    if contacts.is_empty() {
-        let hint = if state.contacts.is_empty() {
+    commands: &mut Vec<Command>,
+) -> Option<ConversationId> {
+    invitation_rows(ui, state, commands);
+    let chats = visible_chats(state, search);
+    if chats.is_empty() {
+        let hint = if state.contacts.is_empty() && state.groups.is_empty() {
             "No chats yet"
         } else {
             "Nothing found"
@@ -416,44 +427,106 @@ fn chat_list(
         .auto_shrink(false)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for contact in contacts {
-                if contact_row(ui, state, contact) {
-                    clicked = Some(contact.user_key);
+            for chat in chats {
+                if chat_row(ui, state, &chat) {
+                    clicked = Some(chat.conversation);
                 }
             }
         });
     clicked
 }
 
+/// What an answered invitation is waiting for; `None` while it is still open.
+fn invitation_status(invitation: &GroupInvitationView) -> Option<String> {
+    match invitation.stage {
+        InvitationStage::Open => None,
+        InvitationStage::Accepted => Some(format!("Waiting for {} to add you…", invitation.inviter_name)),
+        InvitationStage::Loading => Some("Loading members and recent messages…".to_owned()),
+    }
+}
+
+/// An accepted invitation: a clock while the inviter has not added us (that can take days, so
+/// nothing animates), a spinner while the group loads. Only the wait can be cancelled.
+fn invitation_progress(ui: &mut egui::Ui, invitation: &GroupInvitationView, status: String, commands: &mut Vec<Command>) {
+    ui.horizontal(|ui| {
+        let icon = egui::vec2(INVITATION_STATUS_ICON, INVITATION_STATUS_ICON);
+        if invitation.stage == InvitationStage::Loading {
+            ui.add(egui::Spinner::new().size(INVITATION_STATUS_ICON));
+        } else {
+            let (rect, _) = ui.allocate_exact_size(icon, Sense::hover());
+            icons::clock(ui.painter(), rect, theme::MUTED_TEXT);
+        }
+        ui.label(egui::RichText::new(status).small().color(theme::MUTED_TEXT));
+        if invitation.stage == InvitationStage::Accepted && ui.small_button("Cancel").clicked() {
+            commands.push(Command::DeclineGroupInvitation { group: invitation.group });
+        }
+    });
+}
+
+/// Group invitations above the chat list: open ones with Join / Decline, answered ones with
+/// their progress until the group appears in the list.
+fn invitation_rows(ui: &mut egui::Ui, state: &AppState, commands: &mut Vec<Command>) {
+    for invitation in &state.invitations {
+        egui::Frame::new()
+            .fill(theme::ROW_HOVER)
+            .inner_margin(egui::Margin::symmetric(ROW_PADDING as i8, INVITATION_PAD_Y))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(&invitation.name).strong());
+                let members = match invitation.member_count {
+                    1 => "1 member".to_owned(),
+                    count => format!("{count} members"),
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} invited you · {members}",
+                        invitation.inviter_name
+                    ))
+                    .small()
+                    .color(theme::MUTED_TEXT),
+                );
+                if let Some(status) = invitation_status(invitation) {
+                    invitation_progress(ui, invitation, status, commands);
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    let group = invitation.group;
+                    if ui.button("Join").clicked() {
+                        commands.push(Command::AcceptGroupInvitation { group });
+                    }
+                    if ui.button("Decline").clicked() {
+                        commands.push(Command::DeclineGroupInvitation { group });
+                    }
+                });
+            });
+    }
+}
+
 /// Filtered by the search text and ordered by most recent activity first.
-fn visible_contacts<'a>(state: &'a AppState, search: &str) -> Vec<&'a ContactView> {
+fn visible_chats<'a>(state: &'a AppState, search: &str) -> Vec<ChatTitle<'a>> {
     let needle = search.trim().to_lowercase();
-    let mut contacts: Vec<&ContactView> = state
-        .contacts
-        .iter()
-        .filter(|contact| {
-            needle.is_empty() || contact.display_name.to_lowercase().contains(&needle)
-        })
+    let mut chats: Vec<ChatTitle> = state
+        .chat_titles()
+        .filter(|chat| needle.is_empty() || chat.name.to_lowercase().contains(&needle))
         .collect();
-    contacts.sort_by_key(|contact| std::cmp::Reverse(last_activity_ms(state, contact)));
-    contacts
+    chats.sort_by_key(|chat| std::cmp::Reverse(last_activity_ms(state, chat)));
+    chats
 }
 
-fn last_message<'a>(state: &'a AppState, contact: &ContactView) -> Option<&'a MessageView> {
-    state.previews.get(&contact.user_key)
-}
-
-fn last_activity_ms(state: &AppState, contact: &ContactView) -> u64 {
-    last_message(state, contact).map_or(contact.added_at_ms, |message| message.sent_at_ms)
+fn last_activity_ms(state: &AppState, chat: &ChatTitle) -> u64 {
+    state
+        .previews
+        .get(&chat.conversation)
+        .map_or(chat.since_ms, |message| message.sent_at_ms)
 }
 
 /// Paints one chat-list row; returns whether it was clicked.
-fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bool {
+fn chat_row(ui: &mut egui::Ui, state: &AppState, chat: &ChatTitle) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), theme::CONTACT_ROW_HEIGHT),
         Sense::click(),
     );
-    let selected = state.selected == Some(contact.user_key);
+    let selected = state.selected == Some(chat.conversation);
     let background = if selected {
         theme::ROW_SELECTED
     } else if response.hovered() {
@@ -474,9 +547,9 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
         ui,
         avatar_center,
         theme::CONTACT_AVATAR_SIZE,
-        &contact.user_key,
-        &contact.display_name,
-        notes_aware_avatar(state, &contact.user_key),
+        &chat.key,
+        chat.name,
+        chat_photo(state, chat),
     );
 
     let secondary = if selected {
@@ -489,7 +562,7 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
     let top_line_y = rect.top() + rect.height() * 0.3;
     let bottom_line_y = rect.top() + rect.height() * 0.7;
 
-    let last = last_message(state, contact);
+    let last = state.previews.get(&chat.conversation);
     let stamp_width = match last {
         Some(message) => paint_right(
             ui,
@@ -506,12 +579,12 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
         text_left,
         name_right,
         top_line_y,
-        &contact.display_name,
+        chat.name,
         FontId::proportional(NAME_FONT_SIZE),
         theme::TEXT,
     );
 
-    let unread = state.unread.get(&contact.user_key).copied().unwrap_or(0);
+    let unread = state.unread.get(&chat.conversation).copied().unwrap_or(0);
     let badge_width = if unread > 0 {
         paint_badge(ui, text_right, bottom_line_y, unread)
     } else {
@@ -534,14 +607,11 @@ fn contact_row(ui: &mut egui::Ui, state: &AppState, contact: &ContactView) -> bo
 }
 
 /// Notes show an initial, not our own profile photo.
-fn notes_aware_avatar<'a>(
-    state: &'a AppState,
-    key: &brumm_core::identity::UserKey,
-) -> Option<&'a crate::state::AvatarImage> {
-    if state.is_notes(key) {
+fn chat_photo<'a>(state: &'a AppState, chat: &ChatTitle) -> Option<&'a crate::state::AvatarImage> {
+    if state.is_notes(&chat.conversation) {
         None
     } else {
-        state.avatars.get(key)
+        state.avatars.get(&chat.key)
     }
 }
 
@@ -550,9 +620,13 @@ fn preview_text(last: Option<&MessageView>) -> String {
         return String::new();
     };
     let first_line = message.text.lines().next().unwrap_or_default();
-    match message.direction {
-        Direction::Outgoing => format!("{OWN_MESSAGE_PREFIX}{first_line}"),
-        Direction::Incoming => first_line.to_owned(),
+    if message.system {
+        return first_line.to_owned();
+    }
+    match (message.direction, &message.sender) {
+        (Direction::Outgoing, _) => format!("{OWN_MESSAGE_PREFIX}{first_line}"),
+        (Direction::Incoming, Some(sender)) => format!("{}: {first_line}", sender.display_name),
+        (Direction::Incoming, None) => first_line.to_owned(),
     }
 }
 
@@ -622,7 +696,30 @@ fn paint_badge(ui: &egui::Ui, right: f32, center_y: f32, unread: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use brumm_core::api::ContactView;
+
     use super::*;
+
+    fn invitation(stage: InvitationStage) -> GroupInvitationView {
+        GroupInvitationView {
+            group: [1; 32],
+            name: "Chess club".into(),
+            inviter: [2; 32],
+            inviter_name: "Alice".into(),
+            member_count: 3,
+            stage,
+        }
+    }
+
+    #[test]
+    fn an_answered_invitation_says_what_it_waits_for() {
+        assert_eq!(invitation_status(&invitation(InvitationStage::Open)), None);
+        assert_eq!(
+            invitation_status(&invitation(InvitationStage::Accepted)).as_deref(),
+            Some("Waiting for Alice to add you…")
+        );
+        assert!(invitation_status(&invitation(InvitationStage::Loading)).is_some());
+    }
 
     fn frame(
         ctx: &egui::Context,
@@ -719,7 +816,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         crate::ui::theme::apply(&ctx);
-        let contact = [1; 32];
+        let contact_key = [1; 32];
+        let contact = ConversationId::Direct(contact_key);
         let other = [2; 32];
         let mut state = AppState {
             ready: true,
@@ -727,7 +825,7 @@ mod tests {
             ..Default::default()
         };
         state.contacts.push(ContactView {
-            user_key: contact,
+            user_key: contact_key,
             display_name: "Bob".into(),
             fingerprint: "ab".into(),
             trust: Trust::Verified,
@@ -744,13 +842,15 @@ mod tests {
             contact,
             vec![MessageView {
                 id: [9; 16],
-                contact,
+                conversation: contact,
                 direction: Direction::Incoming,
                 text: "hello from the room".into(),
                 attachment: None,
                 reactions: Default::default(),
                 sent_at_ms: 1_700_000_000_000,
                 status: DeliveryStatus::Delivered,
+                sender: None,
+                system: false,
             }],
         );
         let mut view = ViewState {

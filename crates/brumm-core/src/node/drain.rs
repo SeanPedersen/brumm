@@ -23,6 +23,11 @@ impl Node {
         }
         let mut deadline = pin!(time::sleep(SHUTDOWN_DRAIN_MAX));
         let mut attempted = HashSet::new();
+        if self.me.as_ref().is_some_and(|me| me.mailbox.is_some())
+            && let Err(err) = self.drain_groups()
+        {
+            tracing::warn!(?err, "could not drain group posts on shutdown");
+        }
         loop {
             match self.post_unattempted(&mut attempted) {
                 Ok(false) => return,
@@ -73,6 +78,6 @@ impl Node {
             attempted.insert(key);
             self.post_to_mailbox(device, envelope_id)?;
         }
-        Ok(waiting_for_mailbox || !self.mailboxing.is_empty())
+        Ok(waiting_for_mailbox || !self.mailboxing.is_empty() || self.group_posting > 0)
     }
 }

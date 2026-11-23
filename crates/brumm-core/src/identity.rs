@@ -78,6 +78,11 @@ impl UserIdentity {
         cert
     }
 
+    /// Signs `message` with the user key. Callers prefix a domain string of their own.
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.signing_key.sign(message)
+    }
+
     pub fn sign_device_list(&self, seq: u64, entries: Vec<DeviceEntry>) -> DeviceList {
         let mut list = DeviceList {
             user_key: self.public(),
@@ -120,6 +125,12 @@ impl DeviceCert {
         key.verify_strict(&self.signed_bytes(), &self.signature)
             .is_ok()
     }
+}
+
+/// Checks an Ed25519 signature by a user (or device) key. Strict: rejects malleable signatures.
+pub fn verify_signature(key: &[u8; 32], message: &[u8], signature: &Signature) -> bool {
+    VerifyingKey::from_bytes(key)
+        .is_ok_and(|key| key.verify_strict(message, signature).is_ok())
 }
 
 /// One device in a [`DeviceList`]: its cert, the Olm fallback key others use to open a
@@ -229,7 +240,7 @@ pub fn normalize_display_name(raw: &str) -> Option<String> {
     is_valid_display_name(&name).then_some(name)
 }
 
-fn is_valid_display_name(name: &str) -> bool {
+pub fn is_valid_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= MAX_DISPLAY_NAME_CHARS
         && !name.chars().any(char::is_control)

@@ -3,7 +3,7 @@
 
 mod common;
 
-use brumm_core::api::{Command, Direction, Event};
+use brumm_core::api::{Command, ConversationId, Direction, Event};
 use common::TestNode;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -32,7 +32,7 @@ async fn link_sync_fanout_and_revoke() {
             _ => None,
         })
         .await;
-    assert_eq!(synced, vec![bob_key]);
+    assert_eq!(synced, vec![ConversationId::Direct(bob_key)]);
     // The manifest lets the phone tell when the initial history is complete.
     phone
         .expect(|event| match event {
@@ -41,7 +41,7 @@ async fn link_sync_fanout_and_revoke() {
         })
         .await;
     phone.send(Command::LoadConversation {
-        contact: bob_key,
+        conversation: ConversationId::Direct(bob_key),
         limit: None,
     });
     let history = phone
@@ -94,7 +94,7 @@ async fn notes_chat_syncs_between_own_devices_only() {
     assert_eq!(phone.message_added(Direction::Outgoing).await, "buy milk");
 
     phone.send(Command::DeleteMessages {
-        contact: alice_key,
+        conversation: ConversationId::Direct(alice_key),
         ids: vec![id],
         for_everyone: false,
     });

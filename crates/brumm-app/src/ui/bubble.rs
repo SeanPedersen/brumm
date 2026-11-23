@@ -1002,28 +1002,35 @@ struct Chip {
     includes_mine: bool,
 }
 
-/// One chip per distinct emoji; when both users picked the same emoji it shows a count of two.
+/// One chip per distinct emoji with how many picked it; ours is marked (a group counts every
+/// member, a 1:1 chat has at most the contact's and ours).
 fn chips(reactions: &ReactionsView) -> Vec<Chip> {
-    match (&reactions.mine, &reactions.theirs) {
-        (Some(mine), Some(theirs)) if mine == theirs => vec![Chip {
+    let mut chips: Vec<Chip> = reactions
+        .theirs
+        .iter()
+        .map(|emoji| (emoji.clone(), 1))
+        .chain(reactions.others.iter().map(|(emoji, count)| (emoji.clone(), *count as usize)))
+        .map(|(emoji, count)| Chip {
+            emoji,
+            count,
+            includes_mine: false,
+        })
+        .collect();
+    let Some(mine) = &reactions.mine else {
+        return chips;
+    };
+    match chips.iter_mut().find(|chip| chip.emoji == *mine) {
+        Some(chip) => {
+            chip.count += 1;
+            chip.includes_mine = true;
+        }
+        None => chips.push(Chip {
             emoji: mine.clone(),
-            count: 2,
+            count: 1,
             includes_mine: true,
-        }],
-        (mine, theirs) => theirs
-            .iter()
-            .map(|emoji| Chip {
-                emoji: emoji.clone(),
-                count: 1,
-                includes_mine: false,
-            })
-            .chain(mine.iter().map(|emoji| Chip {
-                emoji: emoji.clone(),
-                count: 1,
-                includes_mine: true,
-            }))
-            .collect(),
+        }),
     }
+    chips
 }
 
 struct ChipItem {
@@ -1175,4 +1182,48 @@ fn paint_tail(ui: &egui::Ui, bubble: Rect, color: Color32) {
         outline[..=TAIL_CURVE_STEPS].to_vec(),
         Stroke::new(1.0, color),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(reactions: &ReactionsView) -> Vec<(String, usize, bool)> {
+        chips(reactions)
+            .into_iter()
+            .map(|chip| (chip.emoji, chip.count, chip.includes_mine))
+            .collect()
+    }
+
+    #[test]
+    fn group_chips_count_members_and_mark_ours() {
+        let reactions = ReactionsView {
+            mine: Some("👍".into()),
+            theirs: None,
+            others: vec![("❤".into(), 3), ("👍".into(), 2)],
+        };
+        assert_eq!(
+            summary(&reactions),
+            vec![("❤".into(), 3, false), ("👍".into(), 3, true)]
+        );
+    }
+
+    #[test]
+    fn direct_chips_merge_the_same_emoji() {
+        let same = ReactionsView {
+            mine: Some("🔥".into()),
+            theirs: Some("🔥".into()),
+            others: Vec::new(),
+        };
+        assert_eq!(summary(&same), vec![("🔥".into(), 2, true)]);
+        let different = ReactionsView {
+            mine: Some("🔥".into()),
+            theirs: Some("❤".into()),
+            others: Vec::new(),
+        };
+        assert_eq!(
+            summary(&different),
+            vec![("❤".into(), 1, false), ("🔥".into(), 1, true)]
+        );
+    }
 }

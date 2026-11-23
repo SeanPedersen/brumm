@@ -27,10 +27,8 @@ pub fn paint(
         image.paint_at(ui, rect);
         return;
     }
-    let color_index =
-        key.iter().map(|byte| *byte as usize).sum::<usize>() % theme::AVATAR_COLORS.len();
     ui.painter()
-        .circle_filled(center, diameter / 2.0, theme::AVATAR_COLORS[color_index]);
+        .circle_filled(center, diameter / 2.0, color_of(key));
     ui.painter().text(
         center,
         Align2::CENTER_CENTER,
@@ -38,6 +36,12 @@ pub fn paint(
         FontId::proportional(diameter * INITIAL_FONT_FRACTION),
         egui::Color32::WHITE,
     );
+}
+
+/// The color of a key's initials circle (also used for its name in group chats).
+pub fn color_of(key: &UserKey) -> egui::Color32 {
+    let index = key.iter().map(|byte| *byte as usize).sum::<usize>() % theme::AVATAR_COLORS.len();
+    theme::AVATAR_COLORS[index]
 }
 
 /// Allocates space for an avatar in the current layout and paints it.

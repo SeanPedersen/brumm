@@ -5,11 +5,11 @@ use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
 use brumm_core::{
     api::{
-        Command, ContactView, DeliveryStatus, DeviceId, DeviceView, Direction, Event, EventSink,
-        MessageView,
+        Command, ContactView, ConversationId, DeliveryStatus, DeviceId, DeviceView, Direction,
+        Event, EventSink, GroupId, GroupStatus, GroupView, InvitationStage, MessageView,
     },
     identity::UserKey,
-    node::{self, NodeConfig},
+    node::{self, GroupTiming, NodeConfig},
     wire::MessageId,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -19,6 +19,17 @@ const TEST_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// Own devices compare their messages this often in tests (minutes in production).
 pub const TEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const CONVERSATION_POLL: Duration = Duration::from_millis(300);
+/// Group timers in tests: rekeys, catch-up and key requests within seconds.
+pub const TEST_GROUP_TIMING: GroupTiming = GroupTiming {
+    rekey_delay: Duration::from_secs(1),
+    catch_up_interval: Duration::from_secs(2),
+    key_request_delay: Duration::from_secs(2),
+    inline_rekey_bytes: brumm_core::group::keys::INLINE_REKEY_BYTES,
+    checkpoint_ops: brumm_core::group::checkpoint::CHECKPOINT_OPS,
+    blob_chunk_bytes: 4 * 1024 * 1024,
+    inline_log_bytes: brumm_core::group::join::INLINE_LOG_BYTES,
+    nostr_log_bytes: brumm_core::group::join::MAX_NOSTR_LOG_BYTES,
+};
 const DATABASE_FILE: &str = "brumm.db";
 /// Nothing listens here: tests without a mailbox relay get no offline delivery.
 const NO_RELAY: &str = "ws://127.0.0.1:9";
@@ -26,6 +37,7 @@ const NO_RELAY: &str = "ws://127.0.0.1:9";
 pub struct TestNode {
     pub data_dir: PathBuf,
     relays: Vec<String>,
+    group_timing: GroupTiming,
     pub commands: mpsc::UnboundedSender<Command>,
     pub events: mpsc::UnboundedReceiver<Event>,
     /// Events received but not yet matched by an `expect` (peers deliver in any order).
@@ -50,7 +62,26 @@ impl TestNode {
         )
     }
 
+    /// Node with its own group settings (e.g. rekeys as blobs at any size).
+    pub fn spawn_tuned(name: &str, group_timing: GroupTiming) -> Self {
+        Self::spawn_tuned_with(name, vec![NO_RELAY.to_owned()], group_timing)
+    }
+
+    /// Own group settings and a mailbox on `relays`.
+    pub fn spawn_tuned_with(name: &str, relays: Vec<String>, group_timing: GroupTiming) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{unique}"));
+        Self::launch(data_dir, relays, group_timing)
+    }
+
     pub fn spawn_in(data_dir: PathBuf, relays: Vec<String>) -> Self {
+        Self::launch(data_dir, relays, TEST_GROUP_TIMING)
+    }
+
+    fn launch(data_dir: PathBuf, relays: Vec<String>, group_timing: GroupTiming) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -61,6 +92,7 @@ impl TestNode {
             retry_interval: TEST_RETRY_INTERVAL,
             mailbox_relays: relays.clone(),
             reconcile_interval: TEST_RECONCILE_INTERVAL,
+            group_timing,
             ..NodeConfig::new(data_dir.clone())
         };
         let task = tokio::spawn(node::run(
@@ -71,6 +103,7 @@ impl TestNode {
         Self {
             data_dir,
             relays,
+            group_timing,
             commands: command_tx,
             events: event_rx,
             buffered: VecDeque::new(),
@@ -88,13 +121,18 @@ impl TestNode {
         let Self {
             data_dir,
             relays,
+            group_timing,
             commands,
             task,
             ..
         } = self;
         drop(commands);
         task.await.expect("node task panicked");
-        Stopped { data_dir, relays }
+        Stopped {
+            data_dir,
+            relays,
+            group_timing,
+        }
     }
 
     pub fn send(&self, command: Command) {
@@ -138,7 +176,7 @@ impl TestNode {
     /// Sends a text and returns its message id.
     pub async fn send_text(&mut self, contact: UserKey, text: &str) -> MessageId {
         self.send(Command::SendText {
-            contact,
+            conversation: ConversationId::Direct(contact),
             text: text.into(),
         });
         let text = text.to_owned();
@@ -171,16 +209,17 @@ impl TestNode {
 
     /// The whole stored conversation, oldest first.
     pub async fn conversation(&mut self, contact: UserKey) -> Vec<MessageView> {
+        let conversation = ConversationId::Direct(contact);
         self.send(Command::LoadConversation {
-            contact,
+            conversation,
             limit: None,
         });
         self.expect(|event| match event {
             Event::Conversation {
-                contact: loaded,
+                conversation: loaded,
                 messages,
                 ..
-            } if *loaded == contact => Some(messages.clone()),
+            } if *loaded == conversation => Some(messages.clone()),
             _ => None,
         })
         .await
@@ -208,7 +247,7 @@ impl TestNode {
     }
 
     /// The chat recorded on [`Event::Ready`] after a restart.
-    pub async fn ready_last_opened(&mut self) -> Option<UserKey> {
+    pub async fn ready_last_opened(&mut self) -> Option<ConversationId> {
         self.expect(|event| match event {
             Event::Ready { last_opened, .. } => Some(*last_opened),
             _ => None,
@@ -223,6 +262,22 @@ impl TestNode {
         });
         self.expect(|event| match event {
             Event::IdentityCreated { profile, .. } => Some(profile.user_key),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Like [`Self::create_identity`], also returning the seed phrase (to sign as this user).
+    pub async fn create_identity_with_phrase(&mut self, name: &str) -> (UserKey, String) {
+        self.ready().await;
+        self.send(Command::CreateIdentity {
+            display_name: name.into(),
+        });
+        self.expect(|event| match event {
+            Event::IdentityCreated {
+                profile,
+                seed_phrase: Some(phrase),
+            } => Some((profile.user_key, phrase.clone())),
             _ => None,
         })
         .await
@@ -299,15 +354,146 @@ impl TestNode {
     }
 }
 
+// ── groups ──────────────────────────────────────────────────────────────────
+
+impl TestNode {
+    /// Makes `self` and `other` contacts through an invite link.
+    pub async fn befriend(&mut self, other: &mut TestNode) {
+        let link = self.create_invite().await;
+        other.send(Command::AcceptInvite { link });
+        other.contact_added().await;
+        self.contact_added().await;
+    }
+
+    pub async fn group_changed(&mut self, mut pick: impl FnMut(&GroupView) -> bool) -> GroupView {
+        self.expect(|event| match event {
+            Event::GroupChanged(view) if pick(view) => Some(view.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Creates a group with us as owner, inviting `members`.
+    pub async fn create_group(&mut self, name: &str, announcement: bool, members: Vec<UserKey>) -> GroupId {
+        self.send(Command::CreateGroup {
+            name: name.into(),
+            announcement,
+            members,
+        });
+        let name = name.to_owned();
+        self.group_changed(|view| view.name == name).await.id
+    }
+
+    /// Waits for an invitation to `group` and accepts it; returns once we are a member.
+    pub async fn join_group(&mut self, group: GroupId) {
+        self.expect(|event| match event {
+            Event::GroupInvitations(invitations) => {
+                invitations.iter().any(|invitation| invitation.group == group).then_some(())
+            }
+            _ => None,
+        })
+        .await;
+        self.send(Command::AcceptGroupInvitation { group });
+        self.group_changed(|view| view.id == group && view.status == GroupStatus::Active && view.my_role.is_some())
+            .await;
+    }
+
+    /// Waits until the invitation to `group` reached `stage`.
+    pub async fn invitation_stage(&mut self, group: GroupId, stage: InvitationStage) {
+        self.expect(|event| match event {
+            Event::GroupInvitations(invitations) => invitations
+                .iter()
+                .any(|invitation| invitation.group == group && invitation.stage == stage)
+                .then_some(()),
+            _ => None,
+        })
+        .await;
+    }
+
+    /// Waits until the group has `count` members as seen here.
+    pub async fn group_members(&mut self, group: GroupId, count: u32) -> GroupView {
+        self.group_changed(|view| view.id == group && view.member_count == count).await
+    }
+
+    pub async fn send_group_text(&mut self, group: GroupId, text: &str) -> MessageId {
+        self.send(Command::SendText {
+            conversation: ConversationId::Group(group),
+            text: text.into(),
+        });
+        let text = text.to_owned();
+        self.expect(|event| match event {
+            Event::MessageAdded(message)
+                if message.direction == Direction::Outgoing && message.text == text =>
+            {
+                Some(message.id)
+            }
+            _ => None,
+        })
+        .await
+    }
+
+    /// The group's chat messages (no system lines), oldest first.
+    pub async fn group_messages(&mut self, group: GroupId) -> Vec<MessageView> {
+        let conversation = ConversationId::Group(group);
+        self.send(Command::LoadConversation {
+            conversation,
+            limit: None,
+        });
+        self.expect(|event| match event {
+            Event::Conversation {
+                conversation: loaded,
+                messages,
+                ..
+            } if *loaded == conversation => {
+                Some(messages.iter().filter(|message| !message.system).cloned().collect())
+            }
+            _ => None,
+        })
+        .await
+    }
+
+    /// Polls until the group's chat texts equal `expected`.
+    pub async fn wait_group_texts(&mut self, group: GroupId, expected: &[&str]) -> Vec<MessageView> {
+        let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+        loop {
+            let messages = self.group_messages(group).await;
+            if texts(&messages) == expected {
+                return messages;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "group chat stayed at {:?}, expected {expected:?}",
+                texts(&messages)
+            );
+            tokio::time::sleep(CONVERSATION_POLL).await;
+        }
+    }
+
+    /// Polls a number from the database until it reaches `at_least`.
+    pub async fn wait_sql(&self, query: &str, at_least: i64) {
+        let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+        while self.sql_number(query) < at_least {
+            assert!(tokio::time::Instant::now() < deadline, "{query} stayed below {at_least}");
+            tokio::time::sleep(CONVERSATION_POLL).await;
+        }
+    }
+}
+
 /// A stopped node's data; `start` brings the same device back online.
 pub struct Stopped {
     data_dir: PathBuf,
     relays: Vec<String>,
+    group_timing: GroupTiming,
 }
 
 impl Stopped {
     pub fn start(self) -> TestNode {
-        TestNode::spawn_in(self.data_dir, self.relays)
+        TestNode::launch(self.data_dir, self.relays, self.group_timing)
+    }
+
+    /// The stopped node's database, for edits beyond one statement.
+    pub fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.data_dir.join(DATABASE_FILE)).expect("open db")
     }
 
     /// Edits the stopped node's database, e.g. to drop envelopes as if they were lost.

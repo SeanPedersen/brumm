@@ -84,7 +84,7 @@ impl Node {
         }
         self.reconcile.last_round.insert(device, Instant::now());
         let since_ms = now_ms().saturating_sub(super::RETENTION_MS - RETENTION_EDGE_MS);
-        let index = self.store.message_index(since_ms, &self.me()?.user_key())?;
+        let index = self.store.message_index(since_ms, &self.me()?.notes())?;
         self.send_direct(
             entry,
             Payload::SyncDigest(reconcile::digest(since_ms, &index)),
@@ -106,7 +106,7 @@ impl Node {
         }
         let index = self
             .store
-            .message_index(digest.since_ms, &self.me()?.user_key())?;
+            .message_index(digest.since_ms, &self.me()?.notes())?;
         if let Some(have) = reconcile::answer(&digest, &index) {
             self.send_direct(&entry, Payload::SyncHave(have))?;
         }
@@ -120,18 +120,23 @@ impl Node {
         };
         let index = self
             .store
-            .message_index(have.since_ms, &self.me()?.user_key())?;
+            .message_index(have.since_ms, &self.me()?.notes())?;
         let repair = reconcile::repair(&have, &index);
         let mut items = Vec::new();
-        for (contact, ids) in &repair.send {
-            items.extend(self.store.history_items(contact, ids)?);
+        for (conversation, ids) in &repair.send {
+            if let Some(contact) = conversation.direct() {
+                items.extend(self.store.history_items(&contact, ids)?);
+            }
         }
         for chunk in chunk_history(items) {
             self.enqueue_to_device(&entry, Payload::SyncMessages(chunk))?;
         }
-        for (contact, ids) in &repair.they_have {
-            let deleted = self.store.deleted_among(contact, ids)?;
-            self.send_delete_sync(&entry, *contact, deleted)?;
+        for (conversation, ids) in &repair.they_have {
+            let Some(contact) = conversation.direct() else {
+                continue;
+            };
+            let deleted = self.store.deleted_among(conversation, ids)?;
+            self.send_delete_sync(&entry, contact, deleted)?;
         }
         self.flush_outbox()?;
         Ok(true)

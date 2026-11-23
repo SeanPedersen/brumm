@@ -35,7 +35,7 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 - **Notes chat done:** the conversation keyed by our own `UserKey` (no contacts row; the UI lists a pseudo-contact "Notes").
   Messages are stored as Outgoing and tick like any chat (🕓 drawn as `icons::clock` → ✓ on the relay → ✓✓ when another own device
   has it; Delivered at once while this is the only device). The `SentTranscript` is enqueued under the message id with the Notes chat as
-  `chat_contact` (`enqueue_to_own_devices_as`), so acks and relay posts update the status. Contact messages' transcripts stay untracked. Synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
+  `chat` (`enqueue_to_own_devices_as`), so acks and relay posts update the status. Contact messages' transcripts stay untracked. Synced only via `SentTranscript` / `DeleteSync` / `ReactionSync` to own
   devices (`enqueue_to_user` skips our own key). Exempt from 60-day pruning, and history sync to a new device sends it in full (other chats: last 60 days).
   Linking sends a `HistoryManifest` first; history chunks go one chat at a time, most recent chat first, newest messages
   first. The outbox keeps queue order (≤ 2 in flight per device, next on ack). The new device shows a per-chat
@@ -74,6 +74,52 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   diverge the Olm ratchets. A browser tab cannot drain, so on wasm `enqueue_to_own_devices` also posts to the mailbox
   at enqueue time (not on native: no extra relay traffic). Tests: `tests/mailbox.rs` (quit right after send, Notes via relay).
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
+- **Groups (#24): G1–G6 done** (only the manual browser run is open). SPEC.md §14 (design) and §14.11 (what was
+  built, how it differs, scale numbers). Plan with checkboxes: **PLAN-GROUPS.md**; review brief: **REVIEW-GROUPS.md**. Up to 10k members, owner/admin/member, signed op
+  log, HPKE rekeys (not MLS, see §14.9). Every chat is keyed by `ConversationId { Direct(UserKey), Group(GroupId) }`
+  (`conversation.rs`, stored as `tag byte ‖ 32 bytes` since schema v9; schema v10 adds the group tables in
+  `store/groups.rs`). Core split: pure protocol in `group/` (no I/O, unit tested), node glue in `node/groups/`.
+  - **Op log** (`group/oplog.rs`): DAG of signed `GroupOp`s, deterministic fold (rank, then hash), each op checked
+    against the state at its fold position; owner succession on leave; checkpoints every 1000 ops (`checkpoint.rs`), sent as blobs
+    (`GroupPayload::CheckpointBlob`: 13.8 MiB at 10k members, far over a 64 KiB unit).
+    Ops travel as `GroupPayload::Op` inside epoch messages and inside the welcome / `GroupSync`.
+  - **Epochs** (`group/epochs.rs`, `group/keys.rs`): a `Rekey` roots an epoch; an `Add` posted in epoch E derives a
+    child (`ratchet_add`), so newcomers never read the past. Sending epoch = the complete epoch (its heads cover every
+    membership op) with the lowest id; none complete → rekey due. Rekeys wait `rekey_delay` (author) or
+    `2×delay + rand(delay)` (others), batching removals. Slots are inline when small (≤ 16 KiB), else a blob fetched
+    by byte range. Missed epochs: `KeyRequest` → a member grants after an op-log check (`KeyGrant`, jittered,
+    cancelled when someone else answered). Epoch secrets and sender chains are sealed at rest with a key derived from
+    the device secret.
+  - **Distribution** (`node/groups/net.rs`): iroh-gossip topic per group (verify signature + member device + rate limit
+    before storing; gossip has no pre-forward hook), a member-served log (`group_log`, 14 days, 256 MiB cap) with
+    range-based reconciliation (`group/sync.rs`, `Frame::GroupLog`) from ≤ 3 members, blobs (`blobs` table,
+    `Frame::BlobGet`, own SQLite store instead of iroh-blobs: wasm; desktops replicate whole rekey blobs and serve
+    slots, `BlobPurpose::Replica`), and Nostr letters (`mailbox.rs post_group`, `p` tag
+    from the epoch secret, the parent epoch for rekeys, the group id for control units) when no neighbour was reached.
+    Unpublished units are retried when a neighbour appears and drained to the relays on quit. Peers (gossip bootstrap,
+    catch-up, blob and log sources) are picked by when each device was last seen online (`GroupRuntime::seen`,
+    `choose_peers`), with a share left for unseen devices: random picks miss the few online devices of a big group. Browsers do not serve
+    and keep 4 gossip neighbours (`transport::gossip_membership`). iroh-gossip forwards before we validate.
+  - **Joining** (`node/groups/join.rs`): invitation, reply and welcome go over 1:1 Olm to contacts only; the welcome
+    carries the post-add epoch, ≤ 7 days / 200 messages / 12 KiB of history (one Nostr letter) and the op log: inline
+    up to 12 KiB, else a `LogPointer` (`node/groups/pending.rs`): checkpoint hash + member devices to fetch from
+    (`GroupLogRequest::Ops`, blobs in pieces), plus Nostr chunk letters for logs ≤ 1 MiB. The newcomer waits in
+    `group_pending_logs` (schema v11) and takes whichever arrives first. An accepted invitation stays listed
+    (`InvitationStage`: Accepted → Loading) until the group is installed. Own devices get `GroupSync` (log + epochs,
+    same pointer), also when linked. Non-contact members have no Olm session: their device lists live in
+    `group_peers`, their HPKE records in `device_group_keys`.
+  - **UI:** groups and invitations in the chat list, "New group" (☰ menu, `ui/new_group.rs`), header click → "Group
+    info" (`ui/group_info.rs`: paged member search via `LoadMembers`, roles, settings, invites, key refresh, leave),
+    sender names and system lines (`ui/group_rows.rs`; a system line is a message row with an empty `sender`), reaction
+    counts (`ReactionsView.others`), composer replaced by a notice in announcement mode / after leaving, group photo
+    (`files::AvatarTarget`). Dialogs use `theme::dialog` (fits a phone screen); the member list lays out visible rows
+    only and pages from the core. Groups tick ✓ only.
+  - Tests: `tests/groups.rs` (kick, succession, catch-up from members, Nostr only, own device, announcement + files +
+    reactions, photo for a later joiner, 20 members + no admin online, blob rekey replication, checkpoints as blobs
+    fetched in pieces, joining from a member / from relay chunks while the inviter is offline); `tests/large_group.rs`:
+    1 000 generated members (signed Adds written into the stopped owner's DB) + 4 real nodes; timings and size limits
+    via `NodeConfig::group_timing` (`TestNode::spawn_tuned`, `spawn_tuned_with`). Scale bench: `group/bench.rs` (ignored,
+    run in release). Real network: `tests/network.rs group_over_relays_and_public_nostr` (ignored).
 - **Emoji:** the system color emoji font (Noto Color Emoji, via `fc-match emoji` if it is not
   in a well-known path) is installed after the text fonts and before discovered fallbacks.
   Sans fonts that also contain emoji outlines (DejaVu Sans, Noto Sans Symbols 2) would otherwise
@@ -106,6 +152,7 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
 ```
 crates/brumm-core/        no UI; everything async/network/storage
   src/api.rs              Command / Event / *View types, EventSink (the UI boundary)
+  src/conversation.rs     ConversationId { Direct(UserKey), Group(GroupId) } + its stored form (tag ‖ key)
   src/node/mod.rs         actor loop: sole owner of Store + DeviceCrypto + Transport; spawns network
                           tasks, results come back as Outcome messages (no shared mutable state)
   src/node/commands.rs    identity creation, invites, send_text
@@ -115,6 +162,11 @@ crates/brumm-core/        no UI; everything async/network/storage
   src/node/inbound.rs     decrypt + dedupe + apply Envelope payloads
   src/node/drain.rs       shutdown: post the whole outbox to the Nostr relays, capped wait
   src/node/reconcile.rs   own-device consistency rounds: when to run, apply digest / have / missing messages
+  src/node/groups/        group glue: mod (runtime, tick), ops, keys (epochs, rekeys, grants), messages, pending (op
+                          logs by pointer: member fetch + Nostr chunks),
+                          net (gossip, publish, catch-up, blobs), join (invitations, welcome, GroupSync)
+  src/group/              pure group protocol: oplog, checkpoint, epochs, keys (HPKE slots, chains), message
+                          (GroupWire units), join (invitation/welcome types), sync (range reconciliation)
   src/reconcile.rs        pure bucket digest + compare (no I/O)
   src/identity.rs         UserIdentity (BIP-39 → Ed25519 via blake3 derive_key), DeviceCert,
                           DeviceEntry, signed DeviceList, Profile {display_name, devices}
@@ -126,11 +178,14 @@ crates/brumm-core/        no UI; everything async/network/storage
   src/invite.rs           Invite ticket <-> brumm://invite/<base32(postcard)>
   src/wire.rs             ALPN brumm/3, Frame / Envelope / Payload / Reply, URI + history chunking
   src/transport.rs        iroh Endpoint + Router (presets::N0), conn cache, InboundHandler
-  src/store.rs            rusqlite schema + queries (user_version = schema version)
+  src/store/mod.rs        rusqlite schema + queries (user_version = schema version)
+  src/store/groups.rs     group tables: ops, members, epochs, chains, log, blobs, invitations, pending logs, peers
   tests/common/mod.rs     TestNode harness (buffers unmatched events; peers deliver in any order)
   tests/two_nodes.rs      e2e: invite + chat + invite reuse rejection
   tests/multi_device.rs   e2e: link, contact/history sync, fan-out, transcripts, revocation
   tests/mailbox.rs        e2e via in-memory Nostr relay: never online together, receipts
+  tests/groups.rs         e2e: groups (kick, succession, catch-up, Nostr only, own devices, announcement)
+  tests/large_group.rs    e2e: 1 000 generated members + 4 real nodes (pointer joins, blobs at size, peer ranking)
   tests/consistency.rs    e2e: lost envelopes/deletes/sessions repaired, mailbox notes once + in order
                           (simulates losses by editing a stopped node's DB, `Stopped::sql`)
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
@@ -191,7 +246,7 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
   No visual shift: when rows appear above the view (older page) or rows above the message being
   read get measured, `chat.rs` moves the scroll offset by the same height in the same frame (with
   rubber-banding off for that frame, since egui's physics still has the old bounds). Bulk changes emit `Event::PreviewChanged` instead of a full reload.
-- **Last opened chat** is one `meta` row (`last_opened`, the user key). `Ready` carries that key
+- **Last opened chat** is one `meta` row (`last_opened`, the stored `ConversationId`). `Ready` carries that key
   from a single primary-key read and does not load the history. The UI selects the chat if it
   still exists (including Notes) and then sends `LoadConversation`. Opening a different chat
   sends `RememberOpenChat`, which writes the same row. Restoring does not write it again.
@@ -246,6 +301,5 @@ without them it rejects the bulk-memory ops that current rustc emits.
 Data dir: `~/.local/share/brumm/profiles/<profile>/` (Linux): `brumm.db`, `window-size`.
 
 ## Stack
-Rust 2024 · iroh 1.4 · eframe/egui 0.37 · tokio · rusqlite (bundled) · postcard · ed25519-dalek 3 ·
-bip39 · blake3 · qrcode · jiff. vodozemac 0.11 · nostr-sdk / nostr 0.45 (NIP-44; `local-relay` for tests). Planned: iroh-blobs (M4),
-keyring + SQLCipher (M5).
+Rust 2024 · iroh 1.5 · iroh-gossip · hpke · chacha20poly1305 · eframe/egui 0.37 · tokio · rusqlite (bundled) · postcard · ed25519-dalek 3 ·
+bip39 · blake3 · qrcode · jiff. vodozemac 0.11 · nostr-sdk / nostr 0.45 (NIP-44; `local-relay` for tests). Planned: keyring + SQLCipher (M5).

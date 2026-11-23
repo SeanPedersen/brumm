@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use super::Node;
 use crate::{
-    api::{Event, HistorySyncView},
+    api::{ConversationId, Event, HistorySyncView},
     identity::UserKey,
     store::HistorySyncState,
     wire::{HistoryCount, HistoryItem, chunk_history},
@@ -91,7 +91,7 @@ fn pending(state: &HistorySyncState) -> Option<Vec<HistorySyncView>> {
                     .find(|count| count.contact == total.contact)
                     .map_or(0, |count| count.messages);
                 (received < total.messages).then_some(HistorySyncView {
-                    contact: total.contact,
+                    conversation: ConversationId::Direct(total.contact),
                     received,
                     expected: total.messages,
                 })
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(
             pending(&state),
             Some(vec![HistorySyncView {
-                contact: [2; 32],
+                conversation: ConversationId::Direct([2; 32]),
                 received: 0,
                 expected: 5,
             }])

@@ -3,6 +3,8 @@
 //! the per-device delivery outbox. Olm pickles are encrypted with the device's pickle key; the
 //! database itself relies on OS disk encryption for now (SPEC.md §10).
 
+mod groups;
+
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -12,8 +14,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::{
     api::{
         AttachmentView, ContactView, ConversationPreview, DeliveryStatus, Direction, MessageView,
-        ReactionsView, Trust,
+        ReactionsView, SenderView, Trust,
     },
+    conversation::{self, ConversationId},
     crypto::Sealed,
     identity::{DeviceEntry, DeviceList, Profile, UserKey, fingerprint},
     invite::INVITE_TTL_MS,
@@ -23,9 +26,14 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 8;
+pub use groups::EpochRow;
+
+const SCHEMA_VERSION: i64 = 11;
 /// Oldest schema that [`SCHEMA`] upgrades in place (v5–v8 added tables; v8 also
-/// [`OUTBOX_ENVELOPE_COLUMN`]).
+/// [`OUTBOX_ENVELOPE_COLUMN`]; v9 keys conversations by [`ConversationId`], see
+/// [`upgrade_conversation_keys`], and adds [`MESSAGE_SENDER_COLUMN`]; v10 adds the group
+/// tables, [`groups::GROUP_SCHEMA`]; v11 adds `group_pending_logs` and
+/// [`groups::INVITATION_ACCEPTED_COLUMN`]).
 const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -53,16 +61,17 @@ CREATE TABLE IF NOT EXISTS olm_sessions (
     PRIMARY KEY (device_id, session_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
-    contact        BLOB NOT NULL,
+    conversation   BLOB NOT NULL,
     id             BLOB NOT NULL,
     direction      INTEGER NOT NULL,
     body           BLOB NOT NULL,
     sent_at_ms     INTEGER NOT NULL,
     received_at_ms INTEGER,
     status         INTEGER NOT NULL,
-    PRIMARY KEY (contact, id)
+    sender         BLOB,
+    PRIMARY KEY (conversation, id)
 );
-CREATE INDEX IF NOT EXISTS messages_by_time ON messages (contact, sent_at_ms);
+CREATE INDEX IF NOT EXISTS messages_by_time ON messages (conversation, sent_at_ms);
 CREATE TABLE IF NOT EXISTS invites (
     secret        BLOB PRIMARY KEY,
     created_at_ms INTEGER NOT NULL
@@ -71,7 +80,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     device_id     BLOB NOT NULL,
     envelope_id   BLOB NOT NULL,
     sealed        BLOB NOT NULL,
-    chat_contact  BLOB,
+    chat          BLOB,
     is_receipt    INTEGER NOT NULL,
     mailboxed     INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
@@ -83,21 +92,21 @@ CREATE TABLE IF NOT EXISTS avatars (
     image    BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reactions (
-    contact    BLOB NOT NULL,
-    message_id BLOB NOT NULL,
-    mine       INTEGER NOT NULL,
-    emoji      TEXT NOT NULL,
-    at_ms      INTEGER NOT NULL,
-    PRIMARY KEY (contact, message_id, mine)
+    conversation BLOB NOT NULL,
+    message_id   BLOB NOT NULL,
+    mine         INTEGER NOT NULL,
+    emoji        TEXT NOT NULL,
+    at_ms        INTEGER NOT NULL,
+    PRIMARY KEY (conversation, message_id, mine)
 );
 CREATE TABLE IF NOT EXISTS image_previews (
-    contact  BLOB NOT NULL,
+    conversation BLOB NOT NULL,
     id       BLOB NOT NULL,
     width    INTEGER NOT NULL,
     height   INTEGER NOT NULL,
     max_edge INTEGER NOT NULL,
     bytes    BLOB NOT NULL,
-    PRIMARY KEY (contact, id)
+    PRIMARY KEY (conversation, id)
 );
 CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     hash        BLOB PRIMARY KEY,
@@ -105,14 +114,27 @@ CREATE TABLE IF NOT EXISTS seen_ciphertexts (
     seen_at_ms  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS deleted_messages (
-    contact       BLOB NOT NULL,
+    conversation  BLOB NOT NULL,
     id            BLOB NOT NULL,
     deleted_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (contact, id)
+    PRIMARY KEY (conversation, id)
 );
 ";
 /// Plaintext envelope of an outbox entry, kept until its one re-encryption (v8).
 const OUTBOX_ENVELOPE_COLUMN: &str = "envelope";
+/// Author of a group message (v9). NULL in 1:1 chats, where the direction says who wrote it;
+/// empty for a system line ("Bob joined").
+const MESSAGE_SENDER_COLUMN: &str = "sender";
+/// Columns that held a bare 32-byte user key before v9: `(table, old name, new name)`.
+const CONVERSATION_COLUMNS_V9: [(&str, &str, &str); 5] = [
+    ("messages", "contact", "conversation"),
+    ("reactions", "contact", "conversation"),
+    ("image_previews", "contact", "conversation"),
+    ("deleted_messages", "contact", "conversation"),
+    ("outbox", "chat_contact", "chat"),
+];
+/// SQL filter for rows of 1:1 conversations (Notes included), whose wire types carry a user key.
+const DIRECT_ONLY: &str = "substr(conversation, 1, 1) = x'00'";
 
 const META_SEED_PHRASE: &str = "seed_phrase";
 const META_DEVICE_SECRET: &str = "device_secret";
@@ -152,7 +174,7 @@ pub struct Store {
 /// A message's identity and bucket time, without its body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedMessage {
-    pub contact: UserKey,
+    pub conversation: ConversationId,
     pub id: MessageId,
     pub sent_at_ms: u64,
 }
@@ -177,6 +199,10 @@ fn list_body_column() -> String {
         "CASE WHEN substr(body, 1, 1) = x'{FILE_BODY_TAG:02x}' THEN substr(body, 1, {FILE_HEAD_BYTES}) ELSE body END"
     )
 }
+
+/// The author key and (for groups) the name of the member, columns 6 and 7 of a message row.
+const SENDER_COLUMNS: &str = "sender, (SELECT display_name FROM group_members
+    WHERE group_members.group_id = substr(messages.conversation, 2) AND group_members.user_key = messages.sender)";
 
 /// Initial history sync on a freshly linked device. `expected` comes from the linking device's
 /// manifest; chunks may arrive before it, so `received` is counted regardless.
@@ -214,9 +240,20 @@ impl Store {
             );
         }
         if version != SCHEMA_VERSION {
-            db.execute_batch(SCHEMA)?;
-            add_column_if_missing(&db, "outbox", OUTBOX_ENVELOPE_COLUMN, "BLOB")?;
-            db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            let tx = db.unchecked_transaction()?;
+            upgrade_conversation_keys(&tx)?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(groups::GROUP_SCHEMA)?;
+            add_column_if_missing(&tx, "outbox", OUTBOX_ENVELOPE_COLUMN, "BLOB")?;
+            add_column_if_missing(&tx, "messages", MESSAGE_SENDER_COLUMN, "BLOB")?;
+            add_column_if_missing(
+                &tx,
+                "group_invitations",
+                groups::INVITATION_ACCEPTED_COLUMN,
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
         }
         Ok(Self { db })
     }
@@ -305,13 +342,14 @@ impl Store {
         set_meta(&self.db, META_MAILBOX_SINCE, &posted_at_secs.to_le_bytes())
     }
 
-    /// User key of the chat open on this device, if one was saved. A short or corrupt value is ignored.
-    pub fn last_opened(&self) -> Result<Option<UserKey>> {
-        Ok(get_meta(&self.db, META_LAST_OPENED)?.and_then(|bytes| bytes.try_into().ok()))
+    /// The chat open on this device, if one was saved. A short or corrupt value is ignored.
+    pub fn last_opened(&self) -> Result<Option<ConversationId>> {
+        Ok(get_meta(&self.db, META_LAST_OPENED)?
+            .and_then(|bytes| ConversationId::from_stored(&bytes)))
     }
 
-    pub fn set_last_opened(&self, contact: &UserKey) -> Result<()> {
-        set_meta(&self.db, META_LAST_OPENED, contact.as_slice())
+    pub fn set_last_opened(&self, conversation: &ConversationId) -> Result<()> {
+        set_meta(&self.db, META_LAST_OPENED, &conversation.to_stored())
     }
 
     /// Progress of the initial history sync (only on a freshly linked device, until complete).
@@ -548,19 +586,19 @@ impl Store {
         envelope_id: &EnvelopeId,
         sealed: &Sealed,
         envelope: &[u8],
-        chat_contact: Option<&UserKey>,
+        chat: Option<&ConversationId>,
         is_receipt: bool,
         now_ms: u64,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT OR IGNORE INTO outbox (device_id, envelope_id, sealed, envelope, chat_contact, is_receipt, created_at_ms)
+            "INSERT OR IGNORE INTO outbox (device_id, envelope_id, sealed, envelope, chat, is_receipt, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 device.as_bytes().as_slice(),
                 envelope_id.as_slice(),
                 wire::encode(sealed),
                 envelope,
-                chat_contact.map(|contact| contact.as_slice()),
+                chat.map(ConversationId::to_stored),
                 is_receipt,
                 now_ms as i64
             ],
@@ -647,23 +685,23 @@ impl Store {
         Ok(())
     }
 
-    /// Chat contact of a queued envelope (if it is a chat message).
-    pub fn outbox_chat_contact(
+    /// Conversation of a queued envelope (if it is a chat message).
+    pub fn outbox_chat(
         &self,
         device: &EndpointId,
         envelope_id: &EnvelopeId,
-    ) -> Result<Option<UserKey>> {
-        let contact: Option<Option<Vec<u8>>> = self
+    ) -> Result<Option<ConversationId>> {
+        let chat: Option<Option<Vec<u8>>> = self
             .db
             .query_row(
-                "SELECT chat_contact FROM outbox WHERE device_id = ?1 AND envelope_id = ?2",
+                "SELECT chat FROM outbox WHERE device_id = ?1 AND envelope_id = ?2",
                 params![device.as_bytes().as_slice(), envelope_id.as_slice()],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(contact
+        Ok(chat
             .flatten()
-            .and_then(|contact| contact.try_into().ok()))
+            .and_then(|chat| ConversationId::from_stored(&chat)))
     }
 
     /// Queue order (oldest first) without the ciphertexts; the sender loads one at a time.
@@ -713,21 +751,21 @@ impl Store {
         Ok(items)
     }
 
-    /// Removes an acked envelope. `None` if it was not queued; otherwise its chat contact.
+    /// Removes an acked envelope. `None` if it was not queued; otherwise its conversation.
     pub fn dequeue(
         &self,
         device: &EndpointId,
         envelope_id: &EnvelopeId,
-    ) -> Result<Option<Option<UserKey>>> {
+    ) -> Result<Option<Option<ConversationId>>> {
         let removed: Option<Option<Vec<u8>>> = self
             .db
             .query_row(
-                "DELETE FROM outbox WHERE device_id = ?1 AND envelope_id = ?2 RETURNING chat_contact",
+                "DELETE FROM outbox WHERE device_id = ?1 AND envelope_id = ?2 RETURNING chat",
                 params![device.as_bytes().as_slice(), envelope_id.as_slice()],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(removed.map(|contact| contact.and_then(|contact| contact.try_into().ok())))
+        Ok(removed.map(|chat| chat.and_then(|chat| ConversationId::from_stored(&chat))))
     }
 
     pub fn drop_outbox_for(&self, device: &EndpointId) -> Result<()> {
@@ -772,18 +810,18 @@ impl Store {
     /// deleted here before (a late copy must not bring it back).
     pub fn insert_message(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         message: &ChatMessage,
         direction: Direction,
         status: DeliveryStatus,
         received_at_ms: Option<u64>,
     ) -> Result<bool> {
         let inserted = self.db.execute(
-            "INSERT OR IGNORE INTO messages (contact, id, direction, body, sent_at_ms, received_at_ms, status)
+            "INSERT OR IGNORE INTO messages (conversation, id, direction, body, sent_at_ms, received_at_ms, status)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE contact = ?1 AND id = ?2)",
+             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE conversation = ?1 AND id = ?2)",
             params![
-                contact.as_slice(),
+                conversation.to_stored(),
                 message.id.as_slice(),
                 direction_code(direction),
                 wire::encode(&message.body),
@@ -795,29 +833,90 @@ impl Store {
         Ok(inserted == 1)
     }
 
+    /// A group message by `sender` (an empty `sender` marks a system line).
+    pub fn insert_group_message(
+        &self,
+        conversation: &ConversationId,
+        message: &ChatMessage,
+        direction: Direction,
+        status: DeliveryStatus,
+        sender: &[u8],
+    ) -> Result<bool> {
+        let inserted = self.db.execute(
+            "INSERT OR IGNORE INTO messages (conversation, id, direction, body, sent_at_ms, received_at_ms, status, sender)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE conversation = ?1 AND id = ?2)",
+            params![
+                conversation.to_stored(),
+                message.id.as_slice(),
+                direction_code(direction),
+                wire::encode(&message.body),
+                message.sent_at_ms as i64,
+                crate::clock::now_ms() as i64,
+                status_code(status),
+                sender
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// The author of a group message (`None`: unknown message or not a group message).
+    pub fn message_sender(&self, conversation: &ConversationId, id: &MessageId) -> Result<Option<UserKey>> {
+        let sender: Option<Option<Vec<u8>>> = self
+            .db
+            .query_row(
+                "SELECT sender FROM messages WHERE conversation = ?1 AND id = ?2",
+                params![conversation.to_stored(), id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sender.flatten().and_then(|key| key.try_into().ok()))
+    }
+
+    /// A message view (with sender and reactions) for one stored message.
+    pub fn message_view(&self, conversation: &ConversationId, id: &MessageId) -> Result<Option<MessageView>> {
+        let mut view = self
+            .db
+            .query_row(
+                &format!("SELECT conversation, id, direction, {}, sent_at_ms, status, {SENDER_COLUMNS} FROM messages
+                 WHERE conversation = ?1 AND id = ?2", list_body_column()),
+                params![conversation.to_stored(), id.as_slice()],
+                message_from_row,
+            )
+            .optional()?;
+        if let Some(view) = view.as_mut() {
+            let mut reactions = match conversation {
+                ConversationId::Direct(_) => self.conversation_reactions(conversation)?,
+                ConversationId::Group(_) => self.group_reactions(conversation)?,
+            };
+            view.reactions = reactions.remove(id).unwrap_or_default();
+        }
+        Ok(view)
+    }
+
     pub fn set_status(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         id: &MessageId,
         status: DeliveryStatus,
     ) -> Result<()> {
         self.db.execute(
-            "UPDATE messages SET status = ?3 WHERE contact = ?1 AND id = ?2",
-            params![contact.as_slice(), id.as_slice(), status_code(status)],
+            "UPDATE messages SET status = ?3 WHERE conversation = ?1 AND id = ?2",
+            params![conversation.to_stored(), id.as_slice(), status_code(status)],
         )?;
         Ok(())
     }
 
     pub fn message_status(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         id: &MessageId,
     ) -> Result<Option<DeliveryStatus>> {
         let status: Option<i64> = self
             .db
             .query_row(
-                "SELECT status FROM messages WHERE contact = ?1 AND id = ?2",
-                params![contact.as_slice(), id.as_slice()],
+                "SELECT status FROM messages WHERE conversation = ?1 AND id = ?2",
+                params![conversation.to_stored(), id.as_slice()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -825,22 +924,22 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn conversation(&self, contact: &UserKey) -> Result<Vec<MessageView>> {
-        Ok(self.conversation_page(contact, None, None)?.messages)
+    pub fn conversation(&self, conversation: &ConversationId) -> Result<Vec<MessageView>> {
+        Ok(self.conversation_page(conversation, None, None)?.messages)
     }
 
     /// The newest `limit` messages of a conversation (all if `None`), oldest first, or those
     /// older than `before`. File bodies are read only up to their name and size.
     pub fn conversation_page(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         before: Option<&MessageId>,
         limit: Option<u32>,
     ) -> Result<ConversationPage> {
         let sql = format!(
-            "SELECT contact, id, direction, {}, sent_at_ms, status FROM messages
-             WHERE contact = ?1 AND (?2 IS NULL OR (sent_at_ms, rowid) <
-                 (SELECT sent_at_ms, rowid FROM messages WHERE contact = ?1 AND id = ?2))
+            "SELECT conversation, id, direction, {}, sent_at_ms, status, {SENDER_COLUMNS} FROM messages
+             WHERE conversation = ?1 AND (?2 IS NULL OR (sent_at_ms, rowid) <
+                 (SELECT sent_at_ms, rowid FROM messages WHERE conversation = ?1 AND id = ?2))
              ORDER BY sent_at_ms DESC, rowid DESC LIMIT ?3",
             list_body_column()
         );
@@ -848,7 +947,11 @@ impl Store {
         let fetch = limit.map_or(SQL_NO_LIMIT, |limit| i64::from(limit) + 1);
         let mut stmt = self.db.prepare_cached(&sql)?;
         let rows = stmt.query_map(
-            params![contact.as_slice(), before.map(|id| id.as_slice()), fetch],
+            params![
+                conversation.to_stored(),
+                before.map(|id| id.as_slice()),
+                fetch
+            ],
             message_from_row,
         )?;
         let mut messages: Vec<MessageView> = rows.collect::<Result<_, _>>()?;
@@ -857,7 +960,10 @@ impl Store {
             messages.pop();
         }
         messages.reverse();
-        let mut reactions = self.conversation_reactions(contact)?;
+        let mut reactions = match conversation {
+            ConversationId::Direct(_) => self.conversation_reactions(conversation)?,
+            ConversationId::Group(_) => self.group_reactions(conversation)?,
+        };
         for message in &mut messages {
             message.reactions = reactions.remove(&message.id).unwrap_or_default();
         }
@@ -871,20 +977,20 @@ impl Store {
     /// startup; the sidebar only needs previews and the last activity time.
     pub fn conversation_previews(&self) -> Result<Vec<ConversationPreview>> {
         let mut stmt = self.db.prepare(
-            "SELECT contact, id, direction, body, sent_at_ms, status FROM messages
+            &format!("SELECT conversation, id, direction, body, sent_at_ms, status, {SENDER_COLUMNS} FROM messages
              WHERE rowid IN (
                  SELECT rowid FROM (
                      SELECT rowid, ROW_NUMBER() OVER (
-                         PARTITION BY contact ORDER BY sent_at_ms DESC, rowid DESC
+                         PARTITION BY conversation ORDER BY sent_at_ms DESC, rowid DESC
                      ) AS newest FROM messages
                  ) WHERE newest = 1
-             )",
+             )"),
         )?;
         let rows = stmt.query_map([], message_from_row)?;
         Ok(rows
             .map(|row| {
                 row.map(|last| ConversationPreview {
-                    contact: last.contact,
+                    conversation: last.conversation,
                     last: Some(last),
                 })
             })
@@ -892,13 +998,13 @@ impl Store {
     }
 
     /// The newest message of one conversation, if it has any.
-    pub fn last_message(&self, contact: &UserKey) -> Result<Option<MessageView>> {
+    pub fn last_message(&self, conversation: &ConversationId) -> Result<Option<MessageView>> {
         Ok(self
             .db
             .query_row(
-                "SELECT contact, id, direction, body, sent_at_ms, status FROM messages
-                 WHERE contact = ?1 ORDER BY sent_at_ms DESC, rowid DESC LIMIT 1",
-                params![contact.as_slice()],
+                &format!("SELECT conversation, id, direction, body, sent_at_ms, status, {SENDER_COLUMNS} FROM messages
+                 WHERE conversation = ?1 ORDER BY sent_at_ms DESC, rowid DESC LIMIT 1"),
+                params![conversation.to_stored()],
                 message_from_row,
             )
             .optional()?)
@@ -906,12 +1012,12 @@ impl Store {
 
     fn conversation_reactions(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
     ) -> Result<std::collections::HashMap<MessageId, ReactionsView>> {
         let mut stmt = self.db.prepare(
-            "SELECT message_id, mine, emoji FROM reactions WHERE contact = ?1 AND emoji != ''",
+            "SELECT message_id, mine, emoji FROM reactions WHERE conversation = ?1 AND emoji != ''",
         )?;
-        let rows = stmt.query_map(params![contact.as_slice()], |row| {
+        let rows = stmt.query_map(params![conversation.to_stored()], |row| {
             Ok((
                 blob_array::<16>(row, 0)?,
                 row.get::<_, i64>(1)?,
@@ -931,29 +1037,29 @@ impl Store {
         Ok(by_message)
     }
 
-    pub fn message_exists(&self, contact: &UserKey, id: &MessageId) -> Result<bool> {
-        Ok(self.message_status(contact, id)?.is_some())
+    pub fn message_exists(&self, conversation: &ConversationId, id: &MessageId) -> Result<bool> {
+        Ok(self.message_status(conversation, id)?.is_some())
     }
 
     /// Stores a reaction unless a newer one for the same user and message is already there.
     /// Returns the message's resulting reactions if it changed anything.
     pub fn set_reaction(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         reaction: &wire::Reaction,
         mine: bool,
     ) -> Result<Option<ReactionsView>> {
         let changed = self.db.execute(
-            "INSERT INTO reactions (contact, message_id, mine, emoji, at_ms) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (contact, message_id, mine) DO UPDATE SET emoji = excluded.emoji, at_ms = excluded.at_ms
+            "INSERT INTO reactions (conversation, message_id, mine, emoji, at_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (conversation, message_id, mine) DO UPDATE SET emoji = excluded.emoji, at_ms = excluded.at_ms
              WHERE excluded.at_ms > reactions.at_ms",
-            params![contact.as_slice(), reaction.message_id.as_slice(), mine as i64, reaction.emoji, reaction.at_ms as i64],
+            params![conversation.to_stored(), reaction.message_id.as_slice(), mine as i64, reaction.emoji, reaction.at_ms as i64],
         )?;
         if changed == 0 {
             return Ok(None);
         }
         Ok(Some(
-            self.conversation_reactions(contact)?
+            self.conversation_reactions(conversation)?
                 .remove(&reaction.message_id)
                 .unwrap_or_default(),
         ))
@@ -962,22 +1068,34 @@ impl Store {
     fn purge_orphan_reactions(&self) -> Result<()> {
         self.db.execute(
             "DELETE FROM reactions WHERE NOT EXISTS
-             (SELECT 1 FROM messages WHERE messages.contact = reactions.contact AND messages.id = reactions.message_id)",
+             (SELECT 1 FROM messages WHERE messages.conversation = reactions.conversation AND messages.id = reactions.message_id)",
+            [],
+        )?;
+        self.db.execute(
+            "DELETE FROM group_reactions WHERE NOT EXISTS
+             (SELECT 1 FROM messages WHERE messages.conversation = group_reactions.conversation
+                 AND messages.id = group_reactions.message_id)",
             [],
         )?;
         Ok(())
     }
 
-    /// All messages sent at or after `since_ms`, oldest first (for syncing a linked device).
-    /// Messages from `since_ms` on, plus every message of `keep_all` (the Notes chat, which is
-    /// exempt from retention just like in [`Self::prune_messages_before`]).
-    pub fn history_since(&self, since_ms: u64, keep_all: &UserKey) -> Result<Vec<HistoryItem>> {
-        let mut stmt = self.db.prepare(
-            "SELECT contact, id, direction, body, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 OR contact = ?2 ORDER BY sent_at_ms, rowid",
-        )?;
-        let rows = stmt.query_map(params![since_ms as i64, keep_all], |row| {
+    /// 1:1 messages sent at or after `since_ms`, oldest first (for syncing a linked device),
+    /// plus every message of `keep_all` (the Notes chat, which is exempt from retention just like
+    /// in [`Self::prune_messages_before`]).
+    pub fn history_since(
+        &self,
+        since_ms: u64,
+        keep_all: &ConversationId,
+    ) -> Result<Vec<HistoryItem>> {
+        let sql = format!(
+            "SELECT conversation, id, direction, body, sent_at_ms FROM messages
+             WHERE {DIRECT_ONLY} AND (sent_at_ms >= ?1 OR conversation = ?2) ORDER BY sent_at_ms, rowid"
+        );
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(params![since_ms as i64, keep_all.to_stored()], |row| {
             Ok(HistoryItem {
-                contact: blob_array(row, 0)?,
+                contact: direct_from_row(row, 0)?,
                 outgoing: direction_from_code(row.get(2)?) == Direction::Outgoing,
                 message: ChatMessage {
                     id: blob_array(row, 1)?,
@@ -989,15 +1107,19 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// `(contact, id, sent_at_ms)` of every message from `since_ms` on, plus all of `keep_all`
-    /// (Notes). The ids-only input of the own-device consistency check ([`crate::reconcile`]).
-    pub fn message_index(&self, since_ms: u64, keep_all: &UserKey) -> Result<Vec<IndexedMessage>> {
+    /// `(conversation, id, sent_at_ms)` of every message from `since_ms` on, plus all of
+    /// `keep_all` (Notes). The ids-only input of the own-device consistency check ([`crate::reconcile`]).
+    pub fn message_index(
+        &self,
+        since_ms: u64,
+        keep_all: &ConversationId,
+    ) -> Result<Vec<IndexedMessage>> {
         let mut stmt = self.db.prepare_cached(
-            "SELECT contact, id, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 OR contact = ?2",
+            "SELECT conversation, id, sent_at_ms FROM messages WHERE sent_at_ms >= ?1 OR conversation = ?2",
         )?;
-        let rows = stmt.query_map(params![since_ms as i64, keep_all], |row| {
+        let rows = stmt.query_map(params![since_ms as i64, keep_all.to_stored()], |row| {
             Ok(IndexedMessage {
-                contact: blob_array(row, 0)?,
+                conversation: conversation_from_row(row, 0)?,
                 id: blob_array(row, 1)?,
                 sent_at_ms: row.get::<_, i64>(2)? as u64,
             })
@@ -1005,15 +1127,16 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Stored messages of one conversation among `ids`, as history items (with their bodies).
+    /// Stored messages of one 1:1 conversation among `ids`, as history items (with their bodies).
     pub fn history_items(&self, contact: &UserKey, ids: &[MessageId]) -> Result<Vec<HistoryItem>> {
+        let conversation = ConversationId::Direct(*contact);
         let mut stmt = self.db.prepare_cached(
-            "SELECT direction, body, sent_at_ms FROM messages WHERE contact = ?1 AND id = ?2",
+            "SELECT direction, body, sent_at_ms FROM messages WHERE conversation = ?1 AND id = ?2",
         )?;
         let mut items = Vec::new();
         for id in ids {
             let item = stmt
-                .query_row(params![contact.as_slice(), id.as_slice()], |row| {
+                .query_row(params![conversation.to_stored(), id.as_slice()], |row| {
                     Ok(HistoryItem {
                         contact: *contact,
                         outgoing: direction_from_code(row.get(0)?) == Direction::Outgoing,
@@ -1031,13 +1154,17 @@ impl Store {
     }
 
     /// The ids among `ids` that were deleted in this conversation.
-    pub fn deleted_among(&self, contact: &UserKey, ids: &[MessageId]) -> Result<Vec<MessageId>> {
+    pub fn deleted_among(
+        &self,
+        conversation: &ConversationId,
+        ids: &[MessageId],
+    ) -> Result<Vec<MessageId>> {
         let mut stmt = self.db.prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM deleted_messages WHERE contact = ?1 AND id = ?2)",
+            "SELECT EXISTS (SELECT 1 FROM deleted_messages WHERE conversation = ?1 AND id = ?2)",
         )?;
         let mut deleted = Vec::new();
         for id in ids {
-            if stmt.query_row(params![contact.as_slice(), id.as_slice()], |row| {
+            if stmt.query_row(params![conversation.to_stored(), id.as_slice()], |row| {
                 row.get::<_, bool>(0)
             })? {
                 deleted.push(*id);
@@ -1052,7 +1179,7 @@ impl Store {
     /// remembered as deleted so it is never inserted again. A kept message (other direction) is not.
     pub fn delete_messages(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         ids: &[MessageId],
         only: Option<Direction>,
     ) -> Result<Vec<MessageId>> {
@@ -1061,21 +1188,25 @@ impl Store {
         for id in ids {
             let deleted = match only {
                 Some(direction) => self.db.execute(
-                    "DELETE FROM messages WHERE contact = ?1 AND id = ?2 AND direction = ?3",
-                    params![contact.as_slice(), id.as_slice(), direction_code(direction)],
+                    "DELETE FROM messages WHERE conversation = ?1 AND id = ?2 AND direction = ?3",
+                    params![
+                        conversation.to_stored(),
+                        id.as_slice(),
+                        direction_code(direction)
+                    ],
                 )?,
                 None => self.db.execute(
-                    "DELETE FROM messages WHERE contact = ?1 AND id = ?2",
-                    params![contact.as_slice(), id.as_slice()],
+                    "DELETE FROM messages WHERE conversation = ?1 AND id = ?2",
+                    params![conversation.to_stored(), id.as_slice()],
                 )?,
             };
             if deleted == 1 {
                 removed.push(*id);
             }
-            if deleted == 1 || !self.message_exists(contact, id)? {
+            if deleted == 1 || !self.message_exists(conversation, id)? {
                 self.db.execute(
-                    "INSERT OR IGNORE INTO deleted_messages (contact, id, deleted_at_ms) VALUES (?1, ?2, ?3)",
-                    params![contact.as_slice(), id.as_slice(), deleted_at_ms as i64],
+                    "INSERT OR IGNORE INTO deleted_messages (conversation, id, deleted_at_ms) VALUES (?1, ?2, ?3)",
+                    params![conversation.to_stored(), id.as_slice(), deleted_at_ms as i64],
                 )?;
             }
         }
@@ -1085,13 +1216,13 @@ impl Store {
     }
 
     /// True iff every id is a stored outgoing message of this conversation.
-    pub fn all_outgoing(&self, contact: &UserKey, ids: &[MessageId]) -> Result<bool> {
+    pub fn all_outgoing(&self, conversation: &ConversationId, ids: &[MessageId]) -> Result<bool> {
         for id in ids {
             let direction: Option<i64> = self
                 .db
                 .query_row(
-                    "SELECT direction FROM messages WHERE contact = ?1 AND id = ?2",
-                    params![contact.as_slice(), id.as_slice()],
+                    "SELECT direction FROM messages WHERE conversation = ?1 AND id = ?2",
+                    params![conversation.to_stored(), id.as_slice()],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1113,12 +1244,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn message_body(&self, contact: &UserKey, id: &MessageId) -> Result<Option<Body>> {
+    pub fn message_body(
+        &self,
+        conversation: &ConversationId,
+        id: &MessageId,
+    ) -> Result<Option<Body>> {
         let blob: Option<Vec<u8>> = self
             .db
             .query_row(
-                "SELECT body FROM messages WHERE contact = ?1 AND id = ?2",
-                params![contact.as_slice(), id.as_slice()],
+                "SELECT body FROM messages WHERE conversation = ?1 AND id = ?2",
+                params![conversation.to_stored(), id.as_slice()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1143,6 +1278,17 @@ impl Store {
         Ok(())
     }
 
+    pub fn avatar(&self, user: &UserKey) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT image FROM avatars WHERE user_key = ?1",
+                params![user.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn avatars(&self) -> Result<Vec<(UserKey, Vec<u8>)>> {
         let mut stmt = self.db.prepare("SELECT user_key, image FROM avatars")?;
         let rows = stmt.query_map([], |row| Ok((blob_array(row, 0)?, row.get(1)?)))?;
@@ -1151,19 +1297,19 @@ impl Store {
 
     /// Deletes messages (and dedupe records) older than `cutoff_ms`, except the `keep` conversation
     /// (the Notes chat). Returns messages removed.
-    pub fn prune_messages_before(&self, cutoff_ms: u64, keep: &UserKey) -> Result<usize> {
+    pub fn prune_messages_before(&self, cutoff_ms: u64, keep: &ConversationId) -> Result<usize> {
         self.db.execute(
             "DELETE FROM seen_ciphertexts WHERE seen_at_ms < ?1",
             params![cutoff_ms as i64],
         )?;
         let removed = self.db.execute(
-            "DELETE FROM messages WHERE sent_at_ms < ?1 AND contact != ?2",
-            params![cutoff_ms as i64, keep],
+            "DELETE FROM messages WHERE sent_at_ms < ?1 AND conversation != ?2",
+            params![cutoff_ms as i64, keep.to_stored()],
         )?;
         // Notes keep their messages forever, so they keep their deletions too.
         self.db.execute(
-            "DELETE FROM deleted_messages WHERE deleted_at_ms < ?1 AND contact != ?2",
-            params![cutoff_ms as i64, keep],
+            "DELETE FROM deleted_messages WHERE deleted_at_ms < ?1 AND conversation != ?2",
+            params![cutoff_ms as i64, keep.to_stored()],
         )?;
         self.purge_orphan_reactions()?;
         self.purge_orphan_previews()?;
@@ -1174,7 +1320,7 @@ impl Store {
     /// pixels (or the source itself is no larger than the stored edge).
     pub fn image_preview(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         id: &MessageId,
         min_edge: u32,
     ) -> Result<Option<ImagePreview>> {
@@ -1182,9 +1328,9 @@ impl Store {
             .db
             .query_row(
                 "SELECT width, height, max_edge, bytes FROM image_previews
-                 WHERE contact = ?1 AND id = ?2
+                 WHERE conversation = ?1 AND id = ?2
                    AND (max_edge >= ?3 OR (width <= max_edge AND height <= max_edge))",
-                params![contact.as_slice(), id.as_slice(), i64::from(min_edge)],
+                params![conversation.to_stored(), id.as_slice(), i64::from(min_edge)],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
@@ -1206,7 +1352,7 @@ impl Store {
 
     pub fn set_image_preview(
         &self,
-        contact: &UserKey,
+        conversation: &ConversationId,
         id: &MessageId,
         width: u32,
         height: u32,
@@ -1214,10 +1360,10 @@ impl Store {
         bytes: &[u8],
     ) -> Result<()> {
         self.db.execute(
-            "INSERT OR REPLACE INTO image_previews (contact, id, width, height, max_edge, bytes)
+            "INSERT OR REPLACE INTO image_previews (conversation, id, width, height, max_edge, bytes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                contact.as_slice(),
+                conversation.to_stored(),
                 id.as_slice(),
                 i64::from(width),
                 i64::from(height),
@@ -1232,7 +1378,7 @@ impl Store {
         self.db.execute(
             "DELETE FROM image_previews WHERE NOT EXISTS (
                  SELECT 1 FROM messages
-                 WHERE messages.contact = image_previews.contact AND messages.id = image_previews.id
+                 WHERE messages.conversation = image_previews.conversation AND messages.id = image_previews.id
              )",
             [],
         )?;
@@ -1282,14 +1428,55 @@ fn replace_devices(
     Ok(removed)
 }
 
-/// In-place upgrade step: `CREATE TABLE IF NOT EXISTS` leaves an older table without new columns.
-fn add_column_if_missing(db: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let exists: bool = db.query_row(
+/// v9 upgrade, run before [`SCHEMA`]: renames the columns that held a contact's user key and
+/// prefixes their values (and the `last_opened` meta row) with the `Direct` tag. Tables an older
+/// schema lacks are skipped ([`SCHEMA`] creates them). Only 32-byte values are touched, so a
+/// partly upgraded database is safe to run it on again.
+fn upgrade_conversation_keys(db: &Connection) -> Result<()> {
+    let direct_tag = format!("x'{:02x}'", conversation::STORED_DIRECT_TAG);
+    let prefix = |table: &str, column: &str| -> Result<()> {
+        db.execute_batch(&format!(
+            "UPDATE {table} SET {column} = CAST({direct_tag} || {column} AS BLOB)
+             WHERE length({column}) = {KEY_BYTES}"
+        ))?;
+        Ok(())
+    };
+    for (table, old, new) in CONVERSATION_COLUMNS_V9 {
+        if has_column(db, table, old)? {
+            db.execute_batch(&format!(
+                "ALTER TABLE {table} RENAME COLUMN {old} TO {new};"
+            ))?;
+        }
+        if has_column(db, table, new)? {
+            prefix(table, new)?;
+        }
+    }
+    if has_column(db, "meta", "value")? {
+        db.execute(
+            &format!(
+                "UPDATE meta SET value = CAST({direct_tag} || value AS BLOB)
+                 WHERE key = ?1 AND length(value) = {KEY_BYTES}"
+            ),
+            params![META_LAST_OPENED],
+        )?;
+    }
+    Ok(())
+}
+
+/// Length of a user key, the pre-v9 form of a conversation column.
+const KEY_BYTES: usize = 32;
+
+fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(db.query_row(
         &format!("SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
         params![column],
         |row| row.get(0),
-    )?;
-    if !exists {
+    )?)
+}
+
+/// In-place upgrade step: `CREATE TABLE IF NOT EXISTS` leaves an older table without new columns.
+fn add_column_if_missing(db: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    if !has_column(db, table, column)? {
         db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
     }
     Ok(())
@@ -1339,8 +1526,19 @@ fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
             ),
         },
     };
+    let sender: Option<Vec<u8>> = row.get(6)?;
+    let system = sender.as_ref().is_some_and(Vec::is_empty);
+    let sender = sender
+        .and_then(|key| UserKey::try_from(key.as_slice()).ok())
+        .map(|user_key| -> rusqlite::Result<SenderView> {
+            Ok(SenderView {
+                user_key,
+                display_name: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            })
+        })
+        .transpose()?;
     Ok(MessageView {
-        contact: blob_array(row, 0)?,
+        conversation: conversation_from_row(row, 0)?,
         id: blob_array(row, 1)?,
         direction: direction_from_code(row.get(2)?),
         text,
@@ -1348,6 +1546,30 @@ fn message_from_row(row: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         reactions: ReactionsView::default(),
         sent_at_ms: row.get::<_, i64>(4)? as u64,
         status: status_from_code(row.get(5)?),
+        sender,
+        system,
+    })
+}
+
+fn conversation_from_row(row: &rusqlite::Row, index: usize) -> rusqlite::Result<ConversationId> {
+    let blob: &[u8] = row.get_ref(index)?.as_blob()?;
+    ConversationId::from_stored(blob).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Blob,
+            format!("not a conversation id ({} bytes)", blob.len()).into(),
+        )
+    })
+}
+
+/// The contact of a row known to be a 1:1 conversation ([`DIRECT_ONLY`]).
+fn direct_from_row(row: &rusqlite::Row, index: usize) -> rusqlite::Result<UserKey> {
+    conversation_from_row(row, index)?.direct().ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Blob,
+            "group row in a 1:1 query".into(),
+        )
     })
 }
 
@@ -1458,7 +1680,7 @@ mod tests {
     #[test]
     fn conversation_pages_walk_back_without_gaps() {
         let store = Store::open_in_memory().unwrap();
-        let contact = [3; 32];
+        let contact = direct(3);
         for index in 0..5u8 {
             let message = ChatMessage {
                 id: [index; 16],
@@ -1514,8 +1736,8 @@ mod tests {
     #[test]
     fn wipe_erases_every_row() {
         let store = Store::open_in_memory().unwrap();
-        store.set_last_opened(&[7; 32]).unwrap();
-        assert_eq!(store.last_opened().unwrap(), Some([7; 32]));
+        store.set_last_opened(&direct(7)).unwrap();
+        assert_eq!(store.last_opened().unwrap(), Some(direct(7)));
         store.wipe().unwrap();
         assert_eq!(store.last_opened().unwrap(), None);
         assert!(store.load_identity().unwrap().is_none());
@@ -1526,6 +1748,10 @@ mod tests {
         assert_eq!(rows, 0);
     }
     use crate::identity::{UserIdentity, tests::entry};
+
+    fn direct(byte: u8) -> ConversationId {
+        ConversationId::Direct([byte; 32])
+    }
 
     fn profile(identity: &UserIdentity, devices: &[EndpointId]) -> Profile {
         let entries = devices
@@ -1602,10 +1828,10 @@ mod tests {
         };
         let id = [7; 16];
         store
-            .enqueue(&device, &id, &sealed, b"plain", Some(&[9; 32]), false, 0)
+            .enqueue(&device, &id, &sealed, b"plain", Some(&direct(9)), false, 0)
             .unwrap();
         store
-            .enqueue(&device, &id, &sealed, b"plain", Some(&[9; 32]), false, 0)
+            .enqueue(&device, &id, &sealed, b"plain", Some(&direct(9)), false, 0)
             .unwrap();
         let outbox = store.outbox().unwrap();
         assert_eq!(outbox.len(), 1);
@@ -1613,34 +1839,31 @@ mod tests {
         assert!(!outbox[0].mailboxed);
         store.mark_mailboxed(&device, &id).unwrap();
         assert!(store.outbox_item(&device, &id).unwrap().unwrap().mailboxed);
-        assert_eq!(
-            store.outbox_chat_contact(&device, &id).unwrap(),
-            Some([9; 32])
-        );
+        assert_eq!(store.outbox_chat(&device, &id).unwrap(), Some(direct(9)));
 
         assert_eq!(store.mailbox_since().unwrap(), None);
         store.advance_mailbox_since(50).unwrap();
         store.advance_mailbox_since(40).unwrap();
         assert_eq!(store.mailbox_since().unwrap(), Some(50));
-        assert_eq!(store.dequeue(&device, &id).unwrap(), Some(Some([9; 32])));
+        assert_eq!(store.dequeue(&device, &id).unwrap(), Some(Some(direct(9))));
         assert_eq!(store.dequeue(&device, &id).unwrap(), None);
 
         assert_eq!(store.last_opened().unwrap(), None);
-        store.set_last_opened(&[4; 32]).unwrap();
-        assert_eq!(store.last_opened().unwrap(), Some([4; 32]));
+        store.set_last_opened(&direct(4)).unwrap();
+        assert_eq!(store.last_opened().unwrap(), Some(direct(4)));
         set_meta(&store.db, META_LAST_OPENED, &[1, 2, 3]).unwrap();
         assert_eq!(store.last_opened().unwrap(), None);
 
         store.remember_ciphertext(&[1; 32], &id, 5).unwrap();
         assert_eq!(store.seen_ciphertext(&[1; 32]).unwrap(), Some(id));
-        store.prune_messages_before(6, &[0; 32]).unwrap();
+        store.prune_messages_before(6, &direct(0)).unwrap();
         assert_eq!(store.seen_ciphertext(&[1; 32]).unwrap(), None);
     }
 
     #[test]
     fn messages_dedupe_history_and_prune() {
         let store = Store::open_in_memory().unwrap();
-        let contact = [5; 32];
+        let contact = direct(5);
         let message = ChatMessage {
             id: [3; 16],
             sent_at_ms: 100,
@@ -1691,17 +1914,17 @@ mod tests {
             Some(DeliveryStatus::Delivered)
         );
 
-        assert_eq!(store.history_since(150, &[0; 32]).unwrap().len(), 1);
+        assert_eq!(store.history_since(150, &direct(0)).unwrap().len(), 1);
         assert_eq!(store.history_since(150, &contact).unwrap().len(), 2);
         assert_eq!(store.conversation(&contact).unwrap().len(), 2);
-        assert_eq!(store.prune_messages_before(150, &[0; 32]).unwrap(), 1);
+        assert_eq!(store.prune_messages_before(150, &direct(0)).unwrap(), 1);
         assert_eq!(store.prune_messages_before(1000, &contact).unwrap(), 0);
     }
 
     #[test]
     fn image_preview_is_reused_until_the_message_is_gone() {
         let store = Store::open_in_memory().unwrap();
-        let contact = [5; 32];
+        let contact = direct(5);
         let id = [3; 16];
         store
             .insert_message(
@@ -1744,7 +1967,7 @@ mod tests {
 
     fn insert(
         store: &Store,
-        contact: &UserKey,
+        contact: &ConversationId,
         message: &ChatMessage,
         direction: Direction,
     ) -> bool {
@@ -1787,7 +2010,7 @@ mod tests {
     #[test]
     fn deleted_messages_never_come_back() {
         let store = Store::open_in_memory().unwrap();
-        let contact = [2; 32];
+        let contact = direct(2);
         assert!(insert(&store, &contact, &text(1, 10), Direction::Outgoing));
         assert_eq!(
             store.delete_messages(&contact, &[[1; 16]], None).unwrap(),
@@ -1810,13 +2033,18 @@ mod tests {
             vec![[1; 16], [2; 16]]
         );
         // The same id in another chat is unaffected.
-        assert!(insert(&store, &[3; 32], &text(1, 10), Direction::Outgoing));
+        assert!(insert(
+            &store,
+            &direct(3),
+            &text(1, 10),
+            Direction::Outgoing
+        ));
     }
 
     #[test]
     fn a_contact_delete_cannot_mark_our_own_messages() {
         let store = Store::open_in_memory().unwrap();
-        let contact = [2; 32];
+        let contact = direct(2);
         assert!(insert(&store, &contact, &text(1, 10), Direction::Outgoing));
         let removed = store
             .delete_messages(&contact, &[[1; 16]], Some(Direction::Incoming))
@@ -1834,7 +2062,7 @@ mod tests {
     #[test]
     fn pruning_drops_old_deletions_except_in_notes() {
         let store = Store::open_in_memory().unwrap();
-        let (notes, bob) = ([1; 32], [2; 32]);
+        let (notes, bob) = (direct(1), direct(2));
         store.delete_messages(&notes, &[[1; 16]], None).unwrap();
         store.delete_messages(&bob, &[[1; 16]], None).unwrap();
         store.prune_messages_before(u64::MAX / 2, &notes).unwrap();
@@ -1845,7 +2073,7 @@ mod tests {
     #[test]
     fn message_index_covers_the_window_and_all_notes() {
         let store = Store::open_in_memory().unwrap();
-        let (notes, bob) = ([1; 32], [2; 32]);
+        let (notes, bob) = (direct(1), direct(2));
         insert(&store, &notes, &text(1, 5), Direction::Outgoing);
         insert(&store, &bob, &text(2, 5), Direction::Incoming);
         insert(&store, &bob, &text(3, 50), Direction::Outgoing);
@@ -1855,21 +2083,100 @@ mod tests {
             index,
             vec![
                 IndexedMessage {
-                    contact: notes,
+                    conversation: notes,
                     id: [1; 16],
                     sent_at_ms: 5
                 },
                 IndexedMessage {
-                    contact: bob,
+                    conversation: bob,
                     id: [3; 16],
                     sent_at_ms: 50
                 },
             ]
         );
-        let items = store.history_items(&bob, &[[3; 16], [9; 16]]).unwrap();
+        let items = store.history_items(&[2; 32], &[[3; 16], [9; 16]]).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].outgoing);
         assert_eq!(items[0].message, text(3, 50));
+    }
+
+    /// v8 keyed conversations by the bare user key (`contact`, `outbox.chat_contact`).
+    fn v8_schema() -> String {
+        let v8 = SCHEMA
+            .replace("conversation", "contact")
+            .replace("    chat          BLOB,", "    chat_contact  BLOB,")
+            .replace("    sender         BLOB,\n", "");
+        assert!(!v8.contains("sender") && v8.contains("chat_contact"));
+        v8
+    }
+
+    #[test]
+    fn a_v8_database_upgrades_to_conversation_ids() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&v8_schema()).unwrap();
+        let (bob, device) = ([2u8; 32], SecretKey::generate().public());
+        let body = wire::encode(&Body::Text("hi".into()));
+        db.execute(
+            "INSERT INTO messages (contact, id, direction, body, sent_at_ms, status) VALUES (?1, ?2, 0, ?3, 5, 1)",
+            params![bob.as_slice(), [1u8; 16].as_slice(), body],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO reactions (contact, message_id, mine, emoji, at_ms) VALUES (?1, ?2, 1, '👍', 6)",
+            params![bob.as_slice(), [1u8; 16].as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO image_previews (contact, id, width, height, max_edge, bytes) VALUES (?1, ?2, 1, 1, 1, x'01')",
+            params![bob.as_slice(), [1u8; 16].as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO deleted_messages (contact, id, deleted_at_ms) VALUES (?1, ?2, 7)",
+            params![bob.as_slice(), [9u8; 16].as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO outbox (device_id, envelope_id, sealed, chat_contact, is_receipt, created_at_ms) VALUES (?1, ?2, x'00', ?3, 0, 1)",
+            params![device.as_bytes().as_slice(), [1u8; 16].as_slice(), bob.as_slice()],
+        )
+        .unwrap();
+        set_meta(&db, META_LAST_OPENED, &bob).unwrap();
+        db.pragma_update(None, "user_version", 8).unwrap();
+
+        let store = Store::init(db).unwrap();
+        let chat = ConversationId::Direct(bob);
+        let page = store.conversation_page(&chat, None, None).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].conversation, chat);
+        assert_eq!(page.messages[0].reactions.mine.as_deref(), Some("👍"));
+        assert!(store.image_preview(&chat, &[1; 16], 1).unwrap().is_some());
+        assert_eq!(
+            store.deleted_among(&chat, &[[9; 16]]).unwrap(),
+            vec![[9; 16]]
+        );
+        assert_eq!(store.outbox_chat(&device, &[1; 16]).unwrap(), Some(chat));
+        assert_eq!(store.last_opened().unwrap(), Some(chat));
+        assert_eq!(store.conversation_previews().unwrap()[0].conversation, chat);
+        assert!(has_column(&store.db, "messages", MESSAGE_SENDER_COLUMN).unwrap());
+
+        // Running the upgrade again (e.g. after an interrupted start) changes nothing.
+        upgrade_conversation_keys(&store.db).unwrap();
+        assert_eq!(store.last_opened().unwrap(), Some(chat));
+        assert_eq!(store.conversation(&chat).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn group_messages_stay_out_of_one_to_one_history() {
+        let store = Store::open_in_memory().unwrap();
+        let group = ConversationId::Group([2; 32]);
+        insert(&store, &direct(2), &text(1, 10), Direction::Incoming);
+        insert(&store, &group, &text(2, 10), Direction::Incoming);
+        let history = store.history_since(0, &direct(1)).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].contact, [2; 32]);
+        assert_eq!(store.conversation(&group).unwrap().len(), 1);
+        assert_eq!(store.conversation_previews().unwrap().len(), 2);
     }
 
     #[test]
@@ -1892,7 +2199,10 @@ mod tests {
         // Entries from before v8 have no plaintext, so they are never re-encrypted.
         assert_eq!(store.outbox_envelope(&device, &[6; 16]).unwrap(), None);
         assert!(store.has_outbox_for(&device).unwrap());
-        store.delete_messages(&[1; 32], &[[1; 16]], None).unwrap();
-        assert_eq!(store.deleted_among(&[1; 32], &[[1; 16]]).unwrap().len(), 1);
+        store.delete_messages(&direct(1), &[[1; 16]], None).unwrap();
+        assert_eq!(
+            store.deleted_among(&direct(1), &[[1; 16]]).unwrap().len(),
+            1
+        );
     }
 }

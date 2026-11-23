@@ -8,7 +8,7 @@ mod common;
 
 use std::time::Duration;
 
-use brumm_core::api::{Command, Direction, Event};
+use brumm_core::api::{Command, ConversationId, Direction, Event};
 use common::{TEST_RECONCILE_INTERVAL, TestNode, local_relay, texts};
 
 /// Enough consistency rounds for a wrongly re-inserted message to show up.
@@ -64,7 +64,7 @@ async fn a_lost_delete_is_repaired_and_never_undone() {
 
     let phone_offline = phone.stop().await;
     laptop.send(Command::DeleteMessages {
-        contact: notes,
+        conversation: ConversationId::Direct(notes),
         ids: vec![gone],
         for_everyone: false,
     });

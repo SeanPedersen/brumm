@@ -17,7 +17,12 @@ anyhow = "1.0.104"
 thiserror = "2.0.21"
 # Only features that build on wasm32; native crates add `rt-multi-thread` themselves.
 tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time"] }
-iroh = "1.4.1"
+iroh = "1.5.0"
+# Group distribution (SPEC.md §14.4): one gossip topic per group. Phones/browsers join with a small active view.
+iroh-gossip = { version = "0.103.0", default-features = false, features = ["net"] }
+# Group keys (SPEC.md §14.3): HPKE (X25519-HKDF-SHA256, ChaCha20-Poly1305) for rekey slots, AEAD for messages.
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
+chacha20poly1305 = "0.11.0"
 url = "2"
 # Spawn + timers that run on tokio natively and on setTimeout/spawn_local in the browser.
 n0-future = "0.3.2"

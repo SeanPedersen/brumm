@@ -112,3 +112,51 @@ async fn offline_delivery_via_public_nostr_relays() {
     bob.ready().await;
     assert_eq!(bob.received_text().await, "stored on public relays");
 }
+
+/// Groups over the real network: gossip and catch-up through n0's iroh relays and discovery,
+/// then a group letter on the public Nostr relays for a member nobody could reach.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs internet"]
+async fn group_over_relays_and_public_nostr() {
+    let mut alice = TestNode::spawn_with("public-group-alice", default_relays());
+    let mut bob = TestNode::spawn_with("public-group-bob", default_relays());
+    let mut carol = TestNode::spawn_with("public-group-carol", default_relays());
+    alice.create_identity("Alice").await;
+    let bob_key = bob.create_identity("Bob").await;
+    let carol_key = carol.create_identity("Carol").await;
+    alice.befriend(&mut bob).await;
+    alice.befriend(&mut carol).await;
+    let group = alice
+        .create_group("Out there", false, vec![bob_key, carol_key])
+        .await;
+    bob.join_group(group).await;
+    carol.join_group(group).await;
+    alice.group_members(group, 3).await;
+
+    alice.send_group_text(group, "live").await;
+    bob.wait_group_texts(group, &["live"]).await;
+    carol.wait_group_texts(group, &["live"]).await;
+
+    // Carol away: Bob's message reaches her later from Alice's log (catch-up via relays).
+    let carol_offline = carol.stop().await;
+    bob.send_group_text(group, "while you were out").await;
+    alice.wait_group_texts(group, &["live", "while you were out"]).await;
+    let mut carol = carol_offline.start();
+    carol.ready().await;
+    carol
+        .wait_group_texts(group, &["live", "while you were out"])
+        .await;
+
+    // Everyone else gone: Carol's next message only exists as a Nostr letter.
+    let _alice_offline = alice.stop().await;
+    let bob_offline = bob.stop().await;
+    let sent = carol.send_group_text(group, "on nostr").await;
+    carol
+        .status(sent, brumm_core::api::DeliveryStatus::Sent)
+        .await;
+    let _carol_offline = carol.stop().await;
+    let mut bob = bob_offline.start();
+    bob.ready().await;
+    bob.wait_group_texts(group, &["live", "while you were out", "on nostr"])
+        .await;
+}

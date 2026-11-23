@@ -1,13 +1,13 @@
 //! Main layout: contact sidebar on the left, the selected chat in the center, dialogs on top.
 //! Also turns finished file dialogs and dropped files into core commands.
 
-use brumm_core::{api::Command, identity::UserKey};
+use brumm_core::api::{Command, ConversationId};
 
 use crate::{
     state::AppState,
     ui::{
-        ViewState, add_contact, chat, composer, devices, files, logout, narrow::Mode, seed_phrase,
-        sidebar, theme,
+        ViewState, add_contact, chat, composer, devices, files, group_info, logout, narrow::Mode,
+        new_group, seed_phrase, sidebar, theme,
     },
 };
 
@@ -33,6 +33,11 @@ pub fn show(
     }
     add_contact::show(ui, state, &mut view.add_contact, commands);
     devices::show(ui, state, &mut view.devices, commands);
+    if let Some(group) = view.chat.open_group_info.take().and_then(|id| state.groups.get(&id)) {
+        view.group_info.open(group);
+    }
+    new_group::show(ui, state, &mut view.new_group, commands);
+    group_info::show(ui, state, &mut view.group_info, &view.chat.dialogs, commands);
     seed_phrase::show(ui, state);
     logout::show(ui, state, &mut view.logout, commands);
 }
@@ -47,9 +52,17 @@ fn chat_pane(
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show(ui, |ui| match state.selected {
-            Some(contact) => {
-                let draft = view.drafts.entry(contact).or_default();
-                let back = chat::show(ui, state, &mut view.chat, contact, draft, commands, narrow);
+            Some(conversation) => {
+                let draft = view.drafts.entry(conversation).or_default();
+                let back = chat::show(
+                    ui,
+                    state,
+                    &mut view.chat,
+                    conversation,
+                    draft,
+                    commands,
+                    narrow,
+                );
                 drop_overlay(ui);
                 if back {
                     view.chat.search.close();
@@ -70,12 +83,12 @@ fn handle_file_events(
         commands.push(Command::SetAvatar { image: Vec::new() });
     }
     let mut picked = view.chat.dialogs.poll();
-    if let Some(contact) = state.selected {
+    if let Some(conversation) = state.selected {
         let dropped = ui.input(|input| input.raw.dropped_files.clone());
         for file in dropped {
             view.chat
                 .dialogs
-                .take_dropped(ui.ctx(), contact, file, &mut picked);
+                .take_dropped(ui.ctx(), conversation, file, &mut picked);
         }
         let menu_paste = ui
             .data_mut(|data| data.remove_temp::<bool>(composer::paste_menu_requested_id()))
@@ -95,11 +108,11 @@ fn handle_file_events(
         for item in items {
             match item {
                 files::ClipboardItem::File(path) => {
-                    picked.push(files::Picked::Attachment { contact, path })
+                    picked.push(files::Picked::Attachment { conversation, path })
                 }
                 files::ClipboardItem::Image(bytes) => match files::attachment_from_encoded(bytes) {
                     Ok((name, data)) => commands.push(Command::SendFile {
-                        contact,
+                        conversation,
                         name,
                         data,
                     }),
@@ -110,7 +123,7 @@ fn handle_file_events(
         for image in pasted_images(ui) {
             match files::attachment_from_pixels(&image) {
                 Ok((name, data)) => commands.push(Command::SendFile {
-                    contact,
+                    conversation,
                     name,
                     data,
                 }),
@@ -120,27 +133,33 @@ fn handle_file_events(
     }
     for item in picked {
         match item {
-            files::Picked::Attachment { contact, path } => {
-                send_file(state, contact, &path, commands)
+            files::Picked::Attachment { conversation, path } => {
+                send_file(state, conversation, &path, commands)
             }
-            files::Picked::Avatar(path) => match files::avatar_from_file(&path) {
-                Ok(image) => commands.push(Command::SetAvatar { image }),
+            files::Picked::Avatar(target, path) => match files::avatar_from_file(&path) {
+                Ok(image) => commands.push(target.command(image)),
                 Err(message) => state.errors.push(message),
             },
-            files::Picked::AvatarData(bytes) => match files::avatar_from_bytes(&bytes) {
-                Ok(image) => commands.push(Command::SetAvatar { image }),
+            files::Picked::AvatarData(target, bytes) => match files::avatar_from_bytes(&bytes) {
+                Ok(image) => commands.push(target.command(image)),
                 Err(message) => state.errors.push(message),
             },
-            files::Picked::SaveAs { contact, id, path } => {
-                commands.push(Command::SaveAttachment { contact, id, path })
-            }
+            files::Picked::SaveAs {
+                conversation,
+                id,
+                path,
+            } => commands.push(Command::SaveAttachment {
+                conversation,
+                id,
+                path,
+            }),
             files::Picked::Dropped {
-                contact,
+                conversation,
                 name,
                 data,
             } => match files::attachment_from_dropped(name, &data) {
                 Ok((name, data)) => commands.push(Command::SendFile {
-                    contact,
+                    conversation,
                     name,
                     data,
                 }),
@@ -172,13 +191,13 @@ fn paste_key_pressed(ui: &egui::Ui) -> bool {
 
 fn send_file(
     state: &mut AppState,
-    contact: UserKey,
+    conversation: ConversationId,
     path: &std::path::Path,
     commands: &mut Vec<Command>,
 ) {
     match files::read_attachment(path) {
         Ok((name, data)) => commands.push(Command::SendFile {
-            contact,
+            conversation,
             name,
             data,
         }),
@@ -243,13 +262,15 @@ mod tests {
     ) -> MessageView {
         MessageView {
             id: [index; 16],
-            contact: [1; 32],
+            conversation: ConversationId::Direct([1; 32]),
             direction,
             text: text.to_owned(),
             attachment,
             reactions: Default::default(),
             sent_at_ms: 1_700_000_000_000 + u64::from(index) * 3_600_000,
             status: DeliveryStatus::Delivered,
+            sender: None,
+            system: false,
         }
     }
 
@@ -283,7 +304,8 @@ mod tests {
             trust: Trust::Verified,
             added_at_ms: 0,
         });
-        state.selected = Some(contact_key);
+        let chat = ConversationId::Direct(contact_key);
+        state.selected = Some(chat);
         let image = AttachmentView {
             name: "pic.png".into(),
             size: 100,
@@ -293,7 +315,7 @@ mod tests {
             size: 3_000_000,
         };
         state.conversations.insert(
-            contact_key,
+            chat,
             vec![
                 message(1, Direction::Incoming, "hello there, this is a fairly long line of text that should wrap around the bubble", None),
                 message(2, Direction::Outgoing, "short", None),
@@ -303,7 +325,7 @@ mod tests {
         );
         let bytes = png_bytes();
         state.attachments.insert(
-            (contact_key, [4; 16]),
+            (chat, [4; 16]),
             LoadedAttachment {
                 bytes: bytes.into(),
                 image_size: Some((64, 48)),

@@ -19,6 +19,9 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
 - **Offline delivery** through public Nostr relays (no own server). Letters are signed by throwaway keys and
   encrypted with NIP-44, so relays learn neither who is talking nor what is said.
   Statuses: 🕓 pending → ✔ sent (in the mailbox) → ✔✔ delivered.
+- **Groups** of up to 10 000 members without a server: owner, admins and members, announcement mode, invitations,
+  kicking with a fresh group key, optional shared history for newcomers. Messages spread peer-to-peer (iroh-gossip),
+  members serve the group's log to each other, and Nostr relays carry what nobody online received.
 
 ## Clients
 - **Desktop app** (Linux, macOS, Windows) built with [egui](https://github.com/emilk/egui).
@@ -27,7 +30,7 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
   browser's private storage (OPFS); it connects through iroh relays only.
   Build with `(cd crates/brumm-app && trunk serve)`.
 
-Planned: offline invites and contact introductions, groups (MLS), stickers, native mobile apps,
+Planned: offline invites and contact introductions, stickers, native mobile apps,
 Bluetooth/Wi‑Fi mesh. See [SPEC.md](SPEC.md) for the full design and milestones.
 
 ## Run

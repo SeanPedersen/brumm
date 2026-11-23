@@ -62,13 +62,18 @@ impl eframe::App for BrummApp {
             self.state.apply(event, ctx);
         }
         while let Some(job) = self.state.take_pending_preview() {
-            self.previews
-                .submit(job.contact, job.id, job.bytes, job.max_edge, ctx.clone());
+            self.previews.submit(
+                job.conversation,
+                job.id,
+                job.bytes,
+                job.max_edge,
+                ctx.clone(),
+            );
         }
         for ready in self.previews.poll() {
             if let (Some(bytes), Some((width, height))) = (ready.persist, ready.source_size) {
                 self.core.send(brumm_core::api::Command::StoreImagePreview {
-                    contact: ready.contact,
+                    conversation: ready.conversation,
                     id: ready.id,
                     width,
                     height,
@@ -77,7 +82,7 @@ impl eframe::App for BrummApp {
                 });
             }
             self.state
-                .install_attachment((ready.contact, ready.id), ready.loaded, ctx);
+                .install_attachment((ready.conversation, ready.id), ready.loaded, ctx);
         }
     }
 
@@ -100,11 +105,11 @@ impl eframe::App for BrummApp {
         }
         crate::touch::end_frame();
         let stale = std::mem::take(&mut self.state.stale_conversations);
-        for contact in stale {
-            commands.push(self.state.load_command(contact));
+        for conversation in stale {
+            commands.push(self.state.load_command(conversation));
         }
-        if let Some(contact) = self.state.remember_open.take() {
-            commands.push(Command::RememberOpenChat { contact });
+        if let Some(conversation) = self.state.remember_open.take() {
+            commands.push(Command::RememberOpenChat { conversation });
         }
         for command in commands {
             self.core.send(command);

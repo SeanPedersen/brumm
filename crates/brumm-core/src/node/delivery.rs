@@ -19,7 +19,7 @@ use iroh::EndpointId;
 
 use super::{Node, Outcome};
 use crate::{
-    api::{DeliveryStatus, Event},
+    api::{ConversationId, DeliveryStatus, Event},
     clock::now_ms,
     identity::{DeviceEntry, UserKey},
     wire::{self, Envelope, EnvelopeId, Frame, Payload, RejectReason, Reply},
@@ -37,7 +37,7 @@ impl Node {
         user: &UserKey,
         envelope_id: EnvelopeId,
         payload: Payload,
-        chat_contact: Option<&UserKey>,
+        chat: Option<&ConversationId>,
     ) -> Result<()> {
         if *user == self.me()?.user_key() {
             return Ok(());
@@ -47,7 +47,7 @@ impl Node {
             payload,
         };
         for entry in self.store.devices_of(user)? {
-            self.enqueue_sealed(&entry, &envelope, chat_contact, false)?;
+            self.enqueue_sealed(&entry, &envelope, chat, false)?;
         }
         Ok(())
     }
@@ -57,21 +57,21 @@ impl Node {
         self.enqueue_to_own_devices_as(rand::random(), payload, None)
     }
 
-    /// Like [`Self::enqueue_to_own_devices`] under a given envelope id. With `chat_contact` the
+    /// Like [`Self::enqueue_to_own_devices`] under a given envelope id. With `chat` the
     /// message of that id in that chat shows the delivery state of this envelope (Notes: there
     /// is no other recipient, so our other devices are the delivery).
     pub(super) fn enqueue_to_own_devices_as(
         &mut self,
         envelope_id: EnvelopeId,
         payload: Payload,
-        chat_contact: Option<&UserKey>,
+        chat: Option<&ConversationId>,
     ) -> Result<()> {
         let envelope = Envelope {
             id: envelope_id,
             payload,
         };
         for entry in &self.own_other_devices() {
-            self.enqueue_sealed(entry, &envelope, chat_contact, false)?;
+            self.enqueue_sealed(entry, &envelope, chat, false)?;
             // A browser tab can end at any moment and gets no time for the shutdown drain
             // (`drain.rs`), so it puts the letter on the relays now instead of after a failed
             // direct attempt. Native builds drain on exit and avoid the extra relay traffic.
@@ -118,7 +118,7 @@ impl Node {
         &mut self,
         entry: &DeviceEntry,
         envelope: &Envelope,
-        chat_contact: Option<&UserKey>,
+        chat: Option<&ConversationId>,
         is_receipt: bool,
     ) -> Result<()> {
         let Self { store, me, .. } = self;
@@ -130,7 +130,7 @@ impl Node {
             &envelope.id,
             &sealed,
             &plaintext,
-            chat_contact,
+            chat,
             is_receipt,
             now_ms(),
         )
@@ -306,7 +306,11 @@ impl Node {
     }
 
     /// Posts a queued envelope once to the device's mailbox (no-op without mailbox / if done).
-    pub(super) fn post_to_mailbox(&mut self, device: EndpointId, envelope_id: EnvelopeId) -> Result<()> {
+    pub(super) fn post_to_mailbox(
+        &mut self,
+        device: EndpointId,
+        envelope_id: EnvelopeId,
+    ) -> Result<()> {
         let Some(me) = self.me.as_ref() else {
             return Ok(());
         };
@@ -358,14 +362,15 @@ impl Node {
             return Ok(());
         }
         self.store.mark_mailboxed(&device, &envelope_id)?;
-        let Some(contact) = self.store.outbox_chat_contact(&device, &envelope_id)? else {
+        let Some(conversation) = self.store.outbox_chat(&device, &envelope_id)? else {
             return Ok(());
         };
-        if self.store.message_status(&contact, &envelope_id)? == Some(DeliveryStatus::Pending) {
+        if self.store.message_status(&conversation, &envelope_id)? == Some(DeliveryStatus::Pending)
+        {
             self.store
-                .set_status(&contact, &envelope_id, DeliveryStatus::Sent)?;
+                .set_status(&conversation, &envelope_id, DeliveryStatus::Sent)?;
             self.events.emit(Event::MessageStatusChanged {
-                contact,
+                conversation,
                 id: envelope_id,
                 status: DeliveryStatus::Sent,
             });
@@ -381,16 +386,18 @@ impl Node {
         status: DeliveryStatus,
     ) -> Result<()> {
         let (device, envelope_id) = (*device, *envelope_id);
-        let Some(Some(contact)) = self.store.dequeue(&device, &envelope_id)? else {
+        let Some(Some(conversation)) = self.store.dequeue(&device, &envelope_id)? else {
             return Ok(());
         };
         // Delivered to any device of the contact wins over a failure on another device.
-        if self.store.message_status(&contact, &envelope_id)? == Some(DeliveryStatus::Delivered) {
+        if self.store.message_status(&conversation, &envelope_id)?
+            == Some(DeliveryStatus::Delivered)
+        {
             return Ok(());
         }
-        self.store.set_status(&contact, &envelope_id, status)?;
+        self.store.set_status(&conversation, &envelope_id, status)?;
         self.events.emit(Event::MessageStatusChanged {
-            contact,
+            conversation,
             id: envelope_id,
             status,
         });

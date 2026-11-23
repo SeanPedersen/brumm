@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use brumm_core::{identity::UserKey, wire::MessageId};
+use brumm_core::{api::ConversationId, wire::MessageId};
 
 use crate::{
     state::LoadedAttachment,
@@ -20,7 +20,7 @@ use crate::{
 const HEAP_TRIM_BYTES: usize = 64 * 1024;
 
 struct Job {
-    contact: UserKey,
+    conversation: ConversationId,
     id: MessageId,
     bytes: Arc<Vec<u8>>,
     max_edge: u32,
@@ -31,7 +31,7 @@ struct Job {
 
 /// A preview finished off the UI thread.
 pub struct ReadyPreview {
-    pub contact: UserKey,
+    pub conversation: ConversationId,
     pub id: MessageId,
     pub loaded: LoadedAttachment,
     /// Encoded preview to persist. Absent when the original is already bubble-sized, or not an image.
@@ -85,14 +85,14 @@ impl PreviewLoader {
 
     pub fn submit(
         &self,
-        contact: UserKey,
+        conversation: ConversationId,
         id: MessageId,
         bytes: Arc<Vec<u8>>,
         max_edge: u32,
         ctx: egui::Context,
     ) {
         let job = Job {
-            contact,
+            conversation,
             id,
             bytes,
             max_edge,
@@ -165,7 +165,7 @@ fn decode(job: Job) -> ReadyPreview {
         "chat preview ready"
     );
     ReadyPreview {
-        contact: job.contact,
+        conversation: job.conversation,
         id: job.id,
         loaded,
         persist,

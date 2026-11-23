@@ -13,7 +13,10 @@ use std::{
 };
 
 use brumm_core::{
-    api::{Command, ContactView, DeviceView, Event, MessageView, ProfileView, Trust},
+    api::{
+        Command, ContactView, ConversationId, DeviceView, Event, GroupId, GroupInvitationView,
+        GroupView, MemberView, MessageView, ProfileView, Trust,
+    },
     identity::UserKey,
     wire::MessageId,
 };
@@ -57,25 +60,48 @@ pub fn attachment_uri(id: &MessageId) -> String {
     format!("bytes://attachment/{}", hex(id))
 }
 
+/// One entry of the chat list (a contact, Notes or a group) and what the chat header shows.
+#[derive(Clone, Copy)]
+pub struct ChatTitle<'a> {
+    pub conversation: ConversationId,
+    /// Avatar key: the contact's user key or the group id.
+    pub key: [u8; 32],
+    pub name: &'a str,
+    /// Orders chats without messages (contact added / group joined).
+    pub since_ms: u64,
+}
+
+/// The member list page the group info panel asked for last.
+pub struct MembersPage {
+    pub group: GroupId,
+    pub query: String,
+    pub members: Vec<MemberView>,
+    pub total: u32,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub avatars: HashMap<UserKey, AvatarImage>,
-    pub attachments: HashMap<(UserKey, MessageId), LoadedAttachment>,
-    pub(crate) attachment_order: VecDeque<(UserKey, MessageId)>,
+    pub attachments: HashMap<(ConversationId, MessageId), LoadedAttachment>,
+    pub(crate) attachment_order: VecDeque<(ConversationId, MessageId)>,
     pub(crate) attachment_bytes: usize,
     pub ready: bool,
     pub profile: Option<ProfileView>,
     pub contacts: Vec<ContactView>,
-    pub selected: Option<UserKey>,
+    pub groups: HashMap<GroupId, GroupView>,
+    /// Open group invitations, newest last.
+    pub invitations: Vec<GroupInvitationView>,
+    pub members: Option<MembersPage>,
+    pub selected: Option<ConversationId>,
     /// Chat the user just opened. The app sends [`brumm_core::api::Command::RememberOpenChat`] once.
-    pub remember_open: Option<UserKey>,
+    pub remember_open: Option<ConversationId>,
     /// Messages of opened chats only: the newest page, plus older pages loaded on scroll-up.
-    pub conversations: HashMap<UserKey, Vec<MessageView>>,
+    pub conversations: HashMap<ConversationId, Vec<MessageView>>,
     /// Chats with more stored messages above the loaded ones.
-    pub has_older: HashSet<UserKey>,
+    pub has_older: HashSet<ConversationId>,
     /// Newest message per chat, for the sidebar's preview and ordering.
-    pub previews: HashMap<UserKey, MessageView>,
-    pub unread: HashMap<UserKey, usize>,
+    pub previews: HashMap<ConversationId, MessageView>,
+    pub unread: HashMap<ConversationId, usize>,
     /// Shown once right after identity creation so the user can write it down.
     pub seed_phrase_to_show: Option<String>,
     pub invite_link: Option<String>,
@@ -84,11 +110,11 @@ pub struct AppState {
     pub devices: Vec<DeviceView>,
     pub revoked: bool,
     /// Chats whose initial history is still arriving (freshly linked device): received, expected.
-    pub history_sync: HashMap<UserKey, (u32, u32)>,
+    pub history_sync: HashMap<ConversationId, (u32, u32)>,
     /// `Command::LogOut` was sent; the UI blocks until `Event::LoggedOut`.
     pub logging_out: bool,
     /// Opened conversations changed in bulk; the app reloads them from the core.
-    pub stale_conversations: Vec<UserKey>,
+    pub stale_conversations: Vec<ConversationId>,
     pub connecting: bool,
     pub errors: Vec<String>,
     /// Originals waiting for the background preview thread. The UI thread does not decode them.
@@ -97,7 +123,7 @@ pub struct AppState {
 
 /// One photo whose bytes arrived and still need a bubble-sized preview.
 pub(crate) struct PendingPreview {
-    pub contact: UserKey,
+    pub conversation: ConversationId,
     pub id: MessageId,
     pub bytes: Arc<Vec<u8>>,
     pub max_edge: u32,
@@ -106,42 +132,42 @@ pub(crate) struct PendingPreview {
 impl AppState {
     /// Loads the newest page of a chat, or as many messages as are already shown (a reload
     /// after a bulk change keeps the pages the user scrolled through).
-    pub fn load_command(&self, contact: UserKey) -> Command {
-        let loaded = self.conversations.get(&contact).map_or(0, Vec::len);
+    pub fn load_command(&self, conversation: ConversationId) -> Command {
+        let loaded = self.conversations.get(&conversation).map_or(0, Vec::len);
         let limit = (loaded as u32).max(CONVERSATION_PAGE);
         Command::LoadConversation {
-            contact,
+            conversation,
             limit: Some(limit),
         }
     }
 
     /// The next older page (or everything older for `all`), if any is left.
-    pub fn older_command(&self, contact: UserKey, all: bool) -> Option<Command> {
-        if !self.has_older.contains(&contact) {
+    pub fn older_command(&self, conversation: ConversationId, all: bool) -> Option<Command> {
+        if !self.has_older.contains(&conversation) {
             return None;
         }
-        let oldest = self.conversations.get(&contact)?.first()?;
+        let oldest = self.conversations.get(&conversation)?.first()?;
         Some(Command::LoadOlder {
-            contact,
+            conversation,
             before: oldest.id,
             limit: (!all).then_some(CONVERSATION_PAGE),
         })
     }
 
-    fn set_has_older(&mut self, contact: UserKey, has_older: bool) {
+    fn set_has_older(&mut self, conversation: ConversationId, has_older: bool) {
         if has_older {
-            self.has_older.insert(contact);
+            self.has_older.insert(conversation);
         } else {
-            self.has_older.remove(&contact);
+            self.has_older.remove(&conversation);
         }
     }
 
     /// Any message of this chat is known (loaded, or as the sidebar preview).
-    pub fn has_messages(&self, contact: &UserKey) -> bool {
-        self.previews.contains_key(contact)
+    pub fn has_messages(&self, conversation: &ConversationId) -> bool {
+        self.previews.contains_key(conversation)
             || self
                 .conversations
-                .get(contact)
+                .get(conversation)
                 .is_some_and(|messages| !messages.is_empty())
     }
 
@@ -155,10 +181,10 @@ impl AppState {
     }
 
     /// The "Notes" chat is the conversation with our own user key.
-    pub fn is_notes(&self, key: &UserKey) -> bool {
+    pub fn is_notes(&self, conversation: &ConversationId) -> bool {
         self.profile
             .as_ref()
-            .is_some_and(|profile| &profile.user_key == key)
+            .is_some_and(|profile| conversation.direct() == Some(profile.user_key))
     }
 
     /// Lists the Notes chat as a pseudo-contact so it appears in the chat list from the start.
@@ -183,29 +209,77 @@ impl AppState {
             .find(|contact| &contact.user_key == key)
     }
 
+    /// The contact (or the Notes pseudo-contact) a 1:1 chat is with; `None` for groups.
+    pub fn chat_contact(&self, conversation: &ConversationId) -> Option<&ContactView> {
+        self.contact(&conversation.direct()?)
+    }
+
+    pub fn group(&self, conversation: &ConversationId) -> Option<&GroupView> {
+        match conversation {
+            ConversationId::Group(group) => self.groups.get(group),
+            ConversationId::Direct(_) => None,
+        }
+    }
+
+    /// Name and avatar key of a chat in the list.
+    pub fn chat_title(&self, conversation: &ConversationId) -> Option<ChatTitle<'_>> {
+        if let Some(group) = self.group(conversation) {
+            return Some(ChatTitle {
+                conversation: *conversation,
+                key: group.id,
+                name: &group.name,
+                since_ms: 0,
+            });
+        }
+        let contact = self.chat_contact(conversation)?;
+        Some(ChatTitle {
+            conversation: *conversation,
+            key: contact.user_key,
+            name: &contact.display_name,
+            since_ms: contact.added_at_ms,
+        })
+    }
+
+    /// Every chat the list shows: contacts, Notes and groups.
+    pub fn chat_titles(&self) -> impl Iterator<Item = ChatTitle<'_>> {
+        let direct = self
+            .contacts
+            .iter()
+            .map(|contact| ConversationId::Direct(contact.user_key));
+        let groups = self.groups.keys().map(|group| ConversationId::Group(*group));
+        direct
+            .chain(groups)
+            .filter_map(|conversation| self.chat_title(&conversation))
+    }
+
+    /// Whether the chat list has this conversation (it may be opened).
+    pub fn knows_chat(&self, conversation: &ConversationId) -> bool {
+        self.chat_title(conversation).is_some()
+    }
+
     /// Selects a chat and drops cached data of the previous one; only one chat is shown at a time.
     /// A changed selection is remembered on this device.
-    pub fn select(&mut self, key: UserKey, ctx: &egui::Context) {
+    pub fn select(&mut self, key: ConversationId, ctx: &egui::Context) {
         self.open(key, ctx, true);
     }
 
     /// Shows `key` without writing it back. Used when restoring the chat saved at the last run.
-    fn restore(&mut self, key: UserKey, ctx: &egui::Context) {
+    fn restore(&mut self, key: ConversationId, ctx: &egui::Context) {
         self.open(key, ctx, false);
         self.stale_conversations.push(key);
     }
 
-    fn open(&mut self, key: UserKey, ctx: &egui::Context, remember: bool) {
+    fn open(&mut self, key: ConversationId, ctx: &egui::Context, remember: bool) {
         if remember && self.selected != Some(key) {
             self.remember_open = Some(key);
         }
         self.selected = Some(key);
         self.unread.remove(&key);
         self.conversations.retain(|cached, _| *cached == key);
-        let stale: Vec<(UserKey, MessageId)> = self
+        let stale: Vec<(ConversationId, MessageId)> = self
             .attachments
             .keys()
-            .filter(|(contact, _)| *contact != key)
+            .filter(|(conversation, _)| *conversation != key)
             .copied()
             .collect();
         for id in stale {
@@ -223,7 +297,7 @@ impl AppState {
         self.contacts
             .sort_by_key(|contact| contact.display_name.to_lowercase());
         if std::mem::take(&mut self.connecting) {
-            self.select(key, ctx);
+            self.select(ConversationId::Direct(key), ctx);
         }
     }
 
@@ -234,18 +308,22 @@ impl AppState {
                 contacts,
                 previews,
                 last_opened,
+                groups,
+                invitations,
             } => {
                 self.ready = true;
                 self.profile = profile;
+                self.groups = groups.into_iter().map(|group| (group.id, group)).collect();
+                self.invitations = invitations;
                 self.previews = previews
                     .into_iter()
-                    .filter_map(|preview| preview.last.map(|last| (preview.contact, last)))
+                    .filter_map(|preview| preview.last.map(|last| (preview.conversation, last)))
                     .collect();
                 self.contacts = contacts;
                 self.ensure_notes_contact();
                 // History loads on the next frame via LoadConversation, so Ready stays a few keyed reads.
-                if let Some(contact) = last_opened.filter(|key| self.contact(key).is_some()) {
-                    self.restore(contact, ctx);
+                if let Some(chat) = last_opened.filter(|chat| self.knows_chat(chat)) {
+                    self.restore(chat, ctx);
                 }
             }
             Event::IdentityCreated {
@@ -262,35 +340,35 @@ impl AppState {
             Event::DeviceRevoked => self.revoked = true,
             Event::InviteCreated { link } => self.invite_link = Some(link),
             Event::ContactAdded(contact) => self.upsert_contact(contact, ctx),
-            Event::ConversationsChanged(contacts) => {
-                for contact in contacts {
+            Event::ConversationsChanged(chats) => {
+                for chat in chats {
                     // The open chat keeps showing its messages until the reload replaces them;
                     // dropping them would blank the chat once per synced history chunk.
-                    if self.selected == Some(contact) {
-                        self.stale_conversations.push(contact);
+                    if self.selected == Some(chat) {
+                        self.stale_conversations.push(chat);
                     } else {
-                        self.conversations.remove(&contact);
+                        self.conversations.remove(&chat);
                     }
                 }
             }
             Event::Conversation {
-                contact,
+                conversation,
                 messages,
                 has_older,
             } => {
                 if let Some(last) = messages.last() {
                     self.remember_preview(last.clone());
                 }
-                self.conversations.insert(contact, messages);
-                self.set_has_older(contact, has_older);
+                self.conversations.insert(conversation, messages);
+                self.set_has_older(conversation, has_older);
             }
             Event::OlderMessages {
-                contact,
+                conversation,
                 messages,
                 has_older,
             } => {
                 // A reload may have replaced the list meanwhile; never insert a message twice.
-                let Some(loaded) = self.conversations.get_mut(&contact) else {
+                let Some(loaded) = self.conversations.get_mut(&conversation) else {
                     return;
                 };
                 let known: HashSet<MessageId> = loaded.iter().map(|message| message.id).collect();
@@ -300,56 +378,62 @@ impl AppState {
                     .collect();
                 merged.append(loaded);
                 *loaded = merged;
-                self.set_has_older(contact, has_older);
+                self.set_has_older(conversation, has_older);
             }
-            Event::PreviewChanged { contact, last } => match last {
+            Event::PreviewChanged { conversation, last } => match last {
                 Some(last) => {
-                    self.previews.insert(contact, last);
+                    self.previews.insert(conversation, last);
                 }
                 None => {
-                    self.previews.remove(&contact);
+                    self.previews.remove(&conversation);
                 }
             },
             Event::MessageAdded(message) => {
-                let contact = message.contact;
-                if self.selected != Some(contact) {
-                    *self.unread.entry(contact).or_default() += 1;
+                let conversation = message.conversation;
+                if self.selected != Some(conversation) {
+                    *self.unread.entry(conversation).or_default() += 1;
                 }
-                if self.selected == Some(contact) {
-                    let has_older = self.has_older.contains(&contact);
-                    let loaded = self.conversations.entry(contact).or_default();
+                if self.selected == Some(conversation) {
+                    let has_older = self.has_older.contains(&conversation);
+                    let loaded = self.conversations.entry(conversation).or_default();
                     insert_in_order(loaded, message.clone(), has_older);
                 }
                 self.remember_preview(message);
             }
             Event::MessageStatusChanged {
-                contact,
+                conversation,
                 id,
                 status,
             } => {
-                let message = self.conversations.get_mut(&contact).and_then(|messages| {
-                    messages.iter_mut().rev().find(|message| message.id == id)
-                });
+                let message = self
+                    .conversations
+                    .get_mut(&conversation)
+                    .and_then(|messages| {
+                        messages.iter_mut().rev().find(|message| message.id == id)
+                    });
                 if let Some(message) = message {
                     message.status = status;
                 }
             }
-            Event::MessagesDeleted { contact, ids } => {
-                if let Some(messages) = self.conversations.get_mut(&contact) {
+            Event::MessagesDeleted { conversation, ids } => {
+                if let Some(messages) = self.conversations.get_mut(&conversation) {
                     messages.retain(|message| !ids.contains(&message.id));
                 }
                 for id in &ids {
-                    self.forget_attachment((contact, *id), ctx);
+                    self.forget_attachment((conversation, *id), ctx);
                 }
             }
             Event::ReactionsChanged {
-                contact,
+                conversation,
                 id,
                 reactions,
             } => {
-                let message = self.conversations.get_mut(&contact).and_then(|messages| {
-                    messages.iter_mut().rev().find(|message| message.id == id)
-                });
+                let message = self
+                    .conversations
+                    .get_mut(&conversation)
+                    .and_then(|messages| {
+                        messages.iter_mut().rev().find(|message| message.id == id)
+                    });
                 if let Some(message) = message {
                     message.reactions = reactions;
                 }
@@ -371,23 +455,27 @@ impl AppState {
                     }
                 }
             },
-            Event::Attachment { contact, id, data } => {
+            Event::Attachment {
+                conversation,
+                id,
+                data,
+            } => {
                 self.pending_previews.push_back(PendingPreview {
-                    contact,
+                    conversation,
                     id,
                     bytes: data,
                     max_edge: crate::ui::files::preview_max_edge(ctx.pixels_per_point()),
                 });
             }
             Event::ImagePreview {
-                contact,
+                conversation,
                 id,
                 width,
                 height,
                 bytes,
             } => {
                 self.remember_attachment(
-                    (contact, id),
+                    (conversation, id),
                     LoadedAttachment {
                         bytes: arc_bytes(bytes),
                         image_size: Some((width, height)),
@@ -398,7 +486,7 @@ impl AppState {
             Event::HistorySync(chats) => {
                 self.history_sync = chats
                     .into_iter()
-                    .map(|chat| (chat.contact, (chat.received, chat.expected)))
+                    .map(|chat| (chat.conversation, (chat.received, chat.expected)))
                     .collect();
             }
             Event::LoggedOut => {
@@ -409,6 +497,17 @@ impl AppState {
                 };
             }
             Event::FileExport { name, data } => crate::web_files::download(&name, &data),
+            Event::GroupChanged(group) => {
+                self.groups.insert(group.id, group);
+            }
+            Event::GroupInvitations(invitations) => self.invitations = invitations,
+            Event::Members {
+                group,
+                query,
+                offset,
+                members,
+                total,
+            } => self.apply_members(group, query, offset, members, total),
             Event::Error(error) => {
                 self.connecting = false;
                 self.logging_out = false;
@@ -419,20 +518,48 @@ impl AppState {
         }
     }
 
+    /// A page of members: the first replaces the list, later ones (scrolling) extend it.
+    fn apply_members(
+        &mut self,
+        group: GroupId,
+        query: String,
+        offset: u32,
+        members: Vec<MemberView>,
+        total: u32,
+    ) {
+        let page = self.members.as_mut().filter(|page| {
+            page.group == group && page.query == query && page.members.len() as u32 == offset
+        });
+        match page {
+            Some(page) if offset > 0 => {
+                page.members.extend(members);
+                page.total = total;
+            }
+            _ => {
+                self.members = Some(MembersPage {
+                    group,
+                    query,
+                    members,
+                    total,
+                })
+            }
+        }
+    }
+
     /// Keeps the newest message per chat; older arrivals (history sync) do not move the preview back.
     fn remember_preview(&mut self, message: MessageView) {
         let newer = self
             .previews
-            .get(&message.contact)
+            .get(&message.conversation)
             .is_none_or(|known| (known.sent_at_ms, known.id) <= (message.sent_at_ms, message.id));
         if newer {
-            self.previews.insert(message.contact, message);
+            self.previews.insert(message.conversation, message);
         }
     }
 
     fn remember_attachment(
         &mut self,
-        key: (UserKey, MessageId),
+        key: (ConversationId, MessageId),
         loaded: LoadedAttachment,
         ctx: &egui::Context,
     ) {
@@ -459,14 +586,14 @@ impl AppState {
 
     pub(crate) fn install_attachment(
         &mut self,
-        key: (UserKey, MessageId),
+        key: (ConversationId, MessageId),
         loaded: LoadedAttachment,
         ctx: &egui::Context,
     ) {
         self.remember_attachment(key, loaded, ctx);
     }
 
-    fn forget_attachment(&mut self, key: (UserKey, MessageId), ctx: &egui::Context) {
+    fn forget_attachment(&mut self, key: (ConversationId, MessageId), ctx: &egui::Context) {
         if let Some(dropped) = self.attachments.remove(&key) {
             self.attachment_bytes = self.attachment_bytes.saturating_sub(dropped.bytes.len());
             self.attachment_order.retain(|entry| *entry != key);
@@ -524,9 +651,13 @@ mod tests {
 
     use super::*;
 
-    fn contact(user_key: UserKey, name: &str) -> ContactView {
+    fn chat(byte: u8) -> ConversationId {
+        ConversationId::Direct([byte; 32])
+    }
+
+    fn contact(chat: ConversationId, name: &str) -> ContactView {
         ContactView {
-            user_key,
+            user_key: chat.direct().expect("1:1 chat"),
             display_name: name.to_owned(),
             fingerprint: "ab".into(),
             trust: Trust::Verified,
@@ -534,16 +665,18 @@ mod tests {
         }
     }
 
-    fn message(contact: UserKey, id: u8) -> MessageView {
+    fn message(conversation: ConversationId, id: u8) -> MessageView {
         MessageView {
             id: [id; 16],
-            contact,
+            conversation,
             direction: brumm_core::api::Direction::Incoming,
             text: "hi".into(),
             attachment: None,
             reactions: Default::default(),
             sent_at_ms: u64::from(id),
             status: brumm_core::api::DeliveryStatus::Delivered,
+            sender: None,
+            system: false,
         }
     }
 
@@ -551,7 +684,7 @@ mod tests {
         state: &mut AppState,
         me: UserKey,
         contacts: Vec<ContactView>,
-        last_opened: Option<UserKey>,
+        last_opened: Option<ConversationId>,
     ) {
         state.apply(
             Event::Ready {
@@ -563,6 +696,8 @@ mod tests {
                 contacts,
                 previews: Vec::new(),
                 last_opened,
+                groups: Vec::new(),
+                invitations: Vec::new(),
             },
             &egui::Context::default(),
         );
@@ -572,7 +707,7 @@ mod tests {
     fn ready_reopens_saved_chat_without_writing_it_again() {
         let mut state = AppState::default();
         let me = [1; 32];
-        let bob = [2; 32];
+        let bob = chat(2);
         ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
         assert_eq!(state.selected, Some(bob));
         assert_eq!(state.stale_conversations, vec![bob]);
@@ -582,7 +717,7 @@ mod tests {
     #[test]
     fn bulk_change_keeps_the_open_chat_until_it_is_reloaded() {
         let mut state = AppState::default();
-        let (me, bob, carol) = ([1; 32], [2; 32], [3; 32]);
+        let (me, bob, carol) = ([1; 32], chat(2), chat(3));
         ready(
             &mut state,
             me,
@@ -591,11 +726,11 @@ mod tests {
         );
         state.stale_conversations.clear();
         let ctx = egui::Context::default();
-        for chat in [bob, carol] {
+        for open in [bob, carol] {
             state.apply(
                 Event::Conversation {
-                    contact: chat,
-                    messages: vec![message(chat, 1)],
+                    conversation: open,
+                    messages: vec![message(open, 1)],
                     has_older: false,
                 },
                 &ctx,
@@ -616,12 +751,12 @@ mod tests {
     #[test]
     fn older_pages_prepend_once_and_reloads_keep_the_loaded_extent() {
         let mut state = AppState::default();
-        let (me, bob) = ([1; 32], [2; 32]);
+        let (me, bob) = ([1; 32], chat(2));
         ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
         let ctx = egui::Context::default();
         state.apply(
             Event::Conversation {
-                contact: bob,
+                conversation: bob,
                 messages: vec![message(bob, 3), message(bob, 4)],
                 has_older: true,
             },
@@ -635,7 +770,7 @@ mod tests {
         // A duplicate (id 3) from a racing reload is not inserted twice.
         state.apply(
             Event::OlderMessages {
-                contact: bob,
+                conversation: bob,
                 messages: vec![message(bob, 1), message(bob, 2), message(bob, 3)],
                 has_older: false,
             },
@@ -656,12 +791,12 @@ mod tests {
     #[test]
     fn late_arrivals_take_their_sent_time_position_in_the_open_chat() {
         let mut state = AppState::default();
-        let (me, bob) = ([1; 32], [2; 32]);
+        let (me, bob) = ([1; 32], chat(2));
         ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
         let ctx = egui::Context::default();
         state.apply(
             Event::Conversation {
-                contact: bob,
+                conversation: bob,
                 messages: vec![message(bob, 10), message(bob, 20), message(bob, 30)],
                 has_older: false,
             },
@@ -683,12 +818,12 @@ mod tests {
     #[test]
     fn a_late_arrival_older_than_the_loaded_page_waits_for_load_older() {
         let mut state = AppState::default();
-        let (me, bob) = ([1; 32], [2; 32]);
+        let (me, bob) = ([1; 32], chat(2));
         ready(&mut state, me, vec![contact(bob, "Bob")], Some(bob));
         let ctx = egui::Context::default();
         state.apply(
             Event::Conversation {
-                contact: bob,
+                conversation: bob,
                 messages: vec![message(bob, 10), message(bob, 20)],
                 has_older: true,
             },
@@ -703,12 +838,13 @@ mod tests {
     fn ready_reopens_notes_and_skips_unknown_keys() {
         let mut state = AppState::default();
         let me = [1; 32];
-        ready(&mut state, me, Vec::new(), Some(me));
-        assert_eq!(state.selected, Some(me));
-        assert!(state.is_notes(&me));
+        let notes = ConversationId::Direct(me);
+        ready(&mut state, me, Vec::new(), Some(notes));
+        assert_eq!(state.selected, Some(notes));
+        assert!(state.is_notes(&notes));
 
         let mut state = AppState::default();
-        ready(&mut state, me, Vec::new(), Some([9; 32]));
+        ready(&mut state, me, Vec::new(), Some(chat(9)));
         assert_eq!(state.selected, None);
         assert!(state.stale_conversations.is_empty());
     }
@@ -722,12 +858,12 @@ mod tests {
             .expect("encode png");
         let source_len = png.len();
         let mut state = AppState::default();
-        let contact = [3; 32];
+        let conversation = chat(3);
         let id = [4; 16];
         let ctx = egui::Context::default();
         state.apply(
             Event::Attachment {
-                contact,
+                conversation,
                 id,
                 data: Arc::new(png),
             },
@@ -741,14 +877,14 @@ mod tests {
         let preview = prepared.preview.expect("downscaled");
         assert!(preview.len() < source_len);
         state.install_attachment(
-            (contact, id),
+            (conversation, id),
             LoadedAttachment {
                 bytes: Arc::from(preview),
                 image_size: Some(prepared.size),
             },
             &ctx,
         );
-        let loaded = state.attachments.get(&(contact, id)).expect("cached");
+        let loaded = state.attachments.get(&(conversation, id)).expect("cached");
         assert_eq!(loaded.image_size, Some((2000, 1000)));
         assert!(loaded.bytes.len() < 64 * 1024);
         assert!(loaded.bytes.len() < source_len);

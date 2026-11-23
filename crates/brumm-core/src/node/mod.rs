@@ -9,12 +9,15 @@
 //! - [`delivery`]: per-device outbox, fan-out, acks and the Nostr mailbox fallback
 //! - [`inbound`]: decrypting and applying envelopes from peers (direct or via mailbox)
 //! - [`reconcile`]: periodic consistency check between own devices (repairs any gap)
+//! - [`groups`]: group chats (op log, epochs, gossip, catch-up), SPEC.md §14
 
 mod commands;
 mod contacts;
 mod delivery;
 mod drain;
 pub use drain::SHUTDOWN_DRAIN_MAX;
+mod groups;
+pub use groups::GroupTiming;
 mod history_sync;
 mod inbound;
 mod linking;
@@ -38,12 +41,12 @@ use tokio::sync::mpsc;
 use vodozemac::olm::Session;
 
 use crate::{
-    api::{Command, DeviceView, Event, EventSink, ProfileView},
+    api::{Command, ConversationId, DeviceView, Event, EventSink, GroupId, ProfileView},
     e2ee::DeviceCrypto,
     identity::{DeviceList, Profile, UserIdentity, UserKey, fingerprint},
     invite::Invite,
     link::LinkTicket,
-    mailbox::{self, Mailbox, MailboxDelivery},
+    mailbox::{self, GroupLetter, Mailbox, MailboxDelivery},
     store::Store,
     transport::{InboundRequest, Transport},
     wire::{EnvelopeId, Reply},
@@ -54,6 +57,10 @@ const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const RETENTION_MS: u64 = 60 * 24 * 60 * 60 * 1000;
 const INBOUND_QUEUE: usize = 64;
+/// Gossip events waiting for the actor (a busy group delivers in bursts).
+const GOSSIP_QUEUE: usize = 1024;
+/// How often group timers (rekeys, key requests, catch-up) are checked.
+const GROUP_TICK: Duration = Duration::from_secs(1);
 
 pub struct NodeConfig {
     pub data_dir: PathBuf,
@@ -66,6 +73,7 @@ pub struct NodeConfig {
     /// Called once the shutdown drain is over (everything unsent is on the relays), before the
     /// slower graceful network teardown, so a host can let its process end at that point.
     pub on_drained: Option<Box<dyn FnOnce() + Send>>,
+    pub group_timing: GroupTiming,
 }
 
 impl NodeConfig {
@@ -76,6 +84,7 @@ impl NodeConfig {
             mailbox_relays: mailbox::default_relays(),
             reconcile_interval: reconcile::DEFAULT_RECONCILE_INTERVAL,
             on_drained: None,
+            group_timing: GroupTiming::default(),
         }
     }
 }
@@ -98,6 +107,7 @@ pub async fn run(
     let mut retry = time::interval(config.retry_interval);
     let mut prune = time::interval(PRUNE_INTERVAL);
     let mut reconcile = time::interval(config.reconcile_interval);
+    let mut group_tick = time::interval(GROUP_TICK);
     loop {
         let result = tokio::select! {
             command = commands.recv() => match command {
@@ -110,6 +120,9 @@ pub async fn run(
             }
             Some(outcome) = node.outcomes_rx.recv() => node.handle_outcome(outcome),
             Some(letter) = node.letters_rx.recv() => node.receive_letter(letter),
+            Some(letter) = node.group_letters_rx.recv() => node.receive_group_letter(letter),
+            Some(event) = node.gossip_rx.recv() => node.handle_gossip(event),
+            _ = group_tick.tick() => node.group_tick(),
             _ = retry.tick() => node.flush_outbox(),
             _ = prune.tick() => node.prune(),
             _ = reconcile.tick() => node.reconcile_tick(),
@@ -135,6 +148,8 @@ pub async fn run(
 /// Own identity, keys and network; exists once this device belongs to an identity.
 struct Me {
     user: UserIdentity,
+    /// The device's secret key bytes (group keys and signatures derive from it).
+    device_secret: [u8; 32],
     /// Own display name and current signed device list.
     profile: Profile,
     device_id: EndpointId,
@@ -148,6 +163,11 @@ struct Me {
 impl Me {
     fn user_key(&self) -> UserKey {
         self.user.public()
+    }
+
+    /// The Notes chat: the conversation keyed by our own user key.
+    fn notes(&self) -> ConversationId {
+        ConversationId::Direct(self.user_key())
     }
 
     fn own_cert(&self) -> &crate::identity::DeviceCert {
@@ -202,6 +222,36 @@ enum Outcome {
         reply: Result<Reply>,
     },
     MailboxReady(Arc<Mailbox>),
+    /// A group unit reached a gossip neighbour or a relay (or neither).
+    GroupPublished {
+        group: GroupId,
+        id: [u8; 32],
+        delivered: bool,
+    },
+    /// Units a member device had and we lacked.
+    GroupCaughtUp {
+        group: GroupId,
+        units: Vec<Vec<u8>>,
+    },
+    GroupCatchUpDone {
+        group: GroupId,
+    },
+    GroupBlob {
+        group: GroupId,
+        hash: [u8; 32],
+        offset: u64,
+        data: Option<Vec<u8>>,
+        purpose: groups::BlobPurpose,
+    },
+    /// An op log fetched from a member for a pending welcome or sync (`None`: nobody had it).
+    GroupLogFetched {
+        group: GroupId,
+        log: Option<Box<crate::group::join::OpLog>>,
+        /// The member device that served it.
+        from: Option<[u8; 32]>,
+    },
+    /// A set of log chunk letters went out (counted in `group_posting`, so a quit waits).
+    LogChunksPosted,
     /// The log-out grace period ended; erase now even if some announcements are still pending.
     LogoutDeadline,
 }
@@ -231,6 +281,21 @@ struct Node {
     /// Set by `Command::LogOut`: the node only finishes network work, then erases itself.
     logging_out: bool,
     logout_deadline_passed: bool,
+    /// Groups used since start (loaded on use).
+    groups: HashMap<GroupId, groups::GroupRuntime>,
+    group_timing: GroupTiming,
+    gossip_tx: mpsc::Sender<groups::GossipEvent>,
+    gossip_rx: mpsc::Receiver<groups::GossipEvent>,
+    group_letters_tx: mpsc::Sender<GroupLetter>,
+    group_letters_rx: mpsc::Receiver<GroupLetter>,
+    /// Per own group unit in flight: its letter tag seed and the message it ticks.
+    group_tags: groups::UnitTags,
+    /// Group sends (gossip or relay) still running.
+    group_posting: usize,
+    /// Rekey slots fetched from members, until the rekey is opened.
+    group_slots: HashMap<(GroupId, [u8; 32]), (u64, Vec<u8>)>,
+    /// Op logs being fetched for pending welcomes and syncs.
+    pending_fetches: groups::PendingFetches,
 }
 
 impl Node {
@@ -238,12 +303,14 @@ impl Node {
         #[cfg(not(target_family = "wasm"))]
         std::fs::create_dir_all(&config.data_dir)?;
         let store = Store::open(&config.data_dir.join(DATABASE_FILE))?;
-        Ok(Self::with_store(
+        let mut node = Self::with_store(
             store,
             events,
             config.mailbox_relays.clone(),
             config.reconcile_interval,
-        ))
+        );
+        node.group_timing = config.group_timing;
+        Ok(node)
     }
 
     /// Fresh in-memory state over an opened store. New channels, so results of network tasks
@@ -257,6 +324,8 @@ impl Node {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let (letters_tx, letters_rx) = mpsc::channel(INBOUND_QUEUE);
+        let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
+        let (group_letters_tx, group_letters_rx) = mpsc::channel(INBOUND_QUEUE);
         Self {
             store,
             events,
@@ -278,6 +347,16 @@ impl Node {
             letters_rx,
             logging_out: false,
             logout_deadline_passed: false,
+            groups: HashMap::new(),
+            group_timing: GroupTiming::default(),
+            gossip_tx,
+            gossip_rx,
+            group_letters_tx,
+            group_letters_rx,
+            group_tags: HashMap::new(),
+            group_posting: 0,
+            group_slots: HashMap::new(),
+            pending_fetches: groups::PendingFetches::default(),
         }
     }
 
@@ -287,9 +366,10 @@ impl Node {
         let since = self.store.mailbox_since().ok().flatten();
         let secret = device_secret.to_bytes();
         let letters = self.letters_tx.clone();
+        let group_letters = self.group_letters_tx.clone();
         let outcomes = self.outcomes_tx.clone();
         task::spawn(async move {
-            match Mailbox::start(&secret, &relays, since, letters).await {
+            match Mailbox::start(&secret, &relays, since, letters, group_letters).await {
                 Ok(mailbox) => {
                     let _ = outcomes.send(Outcome::MailboxReady(mailbox));
                 }
@@ -310,11 +390,15 @@ impl Node {
         let profile = self.me.as_ref().map(|me| profile_view(&me.profile));
         // One primary-key read. The conversation itself loads later, after Ready.
         let last_opened = self.store.last_opened().unwrap_or(None);
+        let groups = self.store.group_views().unwrap_or_default();
+        let invitations = self.store.invitations().unwrap_or_default();
         self.events.emit(Event::Ready {
             profile,
             contacts,
             previews,
             last_opened,
+            groups,
+            invitations,
         });
         for (user, image) in self.store.avatars().unwrap_or_default() {
             self.emit_avatar(&user, &image);
@@ -328,6 +412,8 @@ impl Node {
         tracing::info!(elapsed_ms = started.elapsed().as_millis(), "storage ready");
         let flushed = self.flush_outbox();
         self.report(flushed);
+        let groups = self.start_groups();
+        self.report(groups);
     }
 
     async fn load_me(&mut self) -> Result<()> {
@@ -350,6 +436,7 @@ impl Node {
         }
         self.me = Some(Me {
             user,
+            device_secret: stored.device_secret.to_bytes(),
             profile: stored.profile,
             device_id,
             crypto,
@@ -403,11 +490,20 @@ impl Node {
         let Some(me) = &self.me else { return Ok(()) };
         let removed = self.store.prune_messages_before(
             crate::clock::now_ms().saturating_sub(RETENTION_MS),
-            &me.user_key(),
+            &me.notes(),
         )?;
         if removed > 0 {
             tracing::info!(removed, "pruned messages past retention");
         }
+        let now = crate::clock::now_ms();
+        let log_cutoff = now.saturating_sub(groups::LOG_SERVE_WINDOW_MS);
+        self.store.prune_group_log(log_cutoff)?;
+        for group in self.store.active_group_ids()? {
+            self.store.cap_group_log(&group, groups::GROUP_LOG_CAP_BYTES)?;
+        }
+        self.store.prune_blobs(log_cutoff)?;
+        self.store
+            .prune_epochs(now.saturating_sub(crate::group::keys::EPOCH_GRACE_MS))?;
         Ok(())
     }
 
@@ -434,6 +530,30 @@ impl Node {
                 if let Some(me) = self.me.as_mut() {
                     me.mailbox = Some(mailbox);
                 }
+                self.update_group_tags()?;
+                // Group units that found neither a neighbour nor a mailbox go to the relays now.
+                self.drain_groups()
+            }
+            Outcome::GroupPublished {
+                group,
+                id,
+                delivered,
+            } => self.finish_group_publish(group, id, delivered),
+            Outcome::GroupCaughtUp { group, units } => self.finish_catch_up(group, units),
+            Outcome::GroupCatchUpDone { group } => {
+                self.catch_up_done(group);
+                Ok(())
+            }
+            Outcome::GroupBlob {
+                group,
+                hash,
+                offset,
+                data,
+                purpose,
+            } => self.finish_blob(group, hash, offset, data, purpose),
+            Outcome::GroupLogFetched { group, log, from } => self.finish_log_fetch(group, log, from),
+            Outcome::LogChunksPosted => {
+                self.group_posting = self.group_posting.saturating_sub(1);
                 Ok(())
             }
             Outcome::LogoutDeadline => {
