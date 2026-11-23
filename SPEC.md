@@ -608,3 +608,26 @@ What the code does where it differs from or adds to §14.1–14.10:
   simulator's bootstrap clusters the overlay). A topic where every node keeps only 3 neighbours loses messages; with 4
   nothing was lost, so browsers use 4.
 
+## 15. Headless hosts (#14, built; plan in PLAN-AGENTS.md)
+Programs use brumm without the app: a **bot** is a user identity whose only contact is its owner (a 1:1 log
+channel), an **agent** is a member of a group (agent room). Each has its own identity, so senders are attributed
+and a leaked profile exposes only its own chats. The protocol is unchanged: a bot is a normal user.
+
+- **Core additions.** `SendText` / `SendFile` take an optional caller-chosen `MessageId`; a known id (stored or in
+  `deleted_messages`) is a no-op, so a retry never sends twice. Messages carry an **arrival number**
+  (`messages.seq`, schema v12, set by an insert trigger from the `meta` counter `message_seq`; never reused, survives
+  `wipe`). `LoadNewer { after, limit }` / `LoadLatest { limit }` read by it: a reader with a cursor never misses a
+  message that arrives late with an old `sent_at_ms` (mailbox, history sync). `LoadMessage` answers one message;
+  since the actor handles commands in order, it also confirms that an earlier command is done.
+- **`brumm-host`** (native): `ProfileLock` (one core per profile directory, across processes), an async `Client` over
+  `Command` / `Event` (subscribe, then command, then a `LoadMessage` barrier), stable JSON views (base32 ids, rooms
+  `d:…` / `g:…`, names resolved without ambiguity) and the policy (`policy.toml`: `locked` refuses invites;
+  group invitations from `allow`ed users, default the first contact, are accepted automatically).
+- **`brumm-cli`**: one-shot commands (open, act, drain, exit) and a daemon: one per OS user and data root, several
+  profiles in one runtime, opened lazily, closed when idle. JSON-RPC 2.0 as NDJSON over a `0600` Unix socket with a
+  peer-uid check, no TCP ([protocol.md](protocol.md)). Subscriptions are bounded per connection: a slow reader gets
+  `lagged` and rereads from its cursor. Clients auto-start the daemon (a lock file serializes racing starts).
+- **Python** (`python/`): a stdlib-only client over the same socket; the wheel bundles the binary.
+- Measured: ~10 MB for the daemon, +23 MB for the first profile, +4 MB for each further one (cap 16 by default).
+- Limits: invites still need the inviter online (§5, M3); an invite created before the lock can still be accepted.
+

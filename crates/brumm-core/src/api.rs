@@ -48,18 +48,43 @@ pub enum Command {
         before: MessageId,
         limit: Option<u32>,
     },
+    /// Up to `limit` messages (all if `None`) that arrived on this device after the cursor
+    /// `after` (from the first if `None`), in arrival order: a read cursor for programs. A late
+    /// message with an old timestamp still comes after the cursor. Answered with
+    /// [`Event::NewerMessages`].
+    LoadNewer {
+        conversation: ConversationId,
+        after: Option<u64>,
+        limit: Option<u32>,
+    },
+    /// The `limit` messages that arrived last (0: none) and the cursor after them, to follow a
+    /// chat from now on. Answered with [`Event::LatestMessages`].
+    LoadLatest {
+        conversation: ConversationId,
+        limit: u32,
+    },
+    /// One message (e.g. its current status). Answered with [`Event::Message`].
+    LoadMessage {
+        conversation: ConversationId,
+        id: MessageId,
+    },
     /// Remembers which chat was open on this device. A single meta-row write; it does not load history.
     RememberOpenChat {
         conversation: ConversationId,
     },
+    /// `id` lets the caller pick the message id (random if `None`). A send with an id already
+    /// stored or deleted in the conversation does nothing, so a retry never sends twice.
     SendText {
         conversation: ConversationId,
         text: String,
+        id: Option<MessageId>,
     },
+    /// See [`Command::SendText`] for `id`.
     SendFile {
         conversation: ConversationId,
         name: String,
         data: Vec<u8>,
+        id: Option<MessageId>,
     },
     /// `for_everyone` additionally asks the contact's devices to remove our own messages.
     DeleteMessages {
@@ -208,6 +233,31 @@ pub enum Event {
         conversation: ConversationId,
         messages: Vec<MessageView>,
         has_older: bool,
+    },
+    /// Answer to [`Command::LoadNewer`], in arrival order. `cursor` goes into the next
+    /// request's `after`.
+    NewerMessages {
+        conversation: ConversationId,
+        after: Option<u64>,
+        messages: Vec<MessageView>,
+        /// Each message's arrival number (same order), a cursor right after that message.
+        arrivals: Vec<u64>,
+        cursor: u64,
+        has_newer: bool,
+    },
+    /// Answer to [`Command::LoadLatest`], in arrival order.
+    LatestMessages {
+        conversation: ConversationId,
+        limit: u32,
+        messages: Vec<MessageView>,
+        arrivals: Vec<u64>,
+        cursor: u64,
+    },
+    /// Answer to [`Command::LoadMessage`]; `None` if it is not stored.
+    Message {
+        conversation: ConversationId,
+        id: MessageId,
+        message: Option<MessageView>,
     },
     /// The last message of a conversation changed (e.g. after a bulk delete or history sync).
     PreviewChanged {

@@ -1,0 +1,21 @@
+# systemd user unit for a long-running brumm daemon (bots that must stay reachable).
+# Install: cp deploy/systemd/brumm-daemon.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now brumm-daemon
+#          loginctl enable-linger "$USER"     # keep it running without a login session
+[Unit]
+Description=brumm daemon (headless brumm profiles for bots and agents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# No --idle-exit: a systemd daemon stays up so its profiles stay online.
+ExecStart=%h/.local/bin/brumm-cli daemon run
+Restart=on-failure
+RestartSec=5
+# A stop drains the outbox to the relays first (at most ~10 s per profile).
+TimeoutStopSec=60
+Environment=RUST_LOG=warn,brumm_core=info,brumm_host=info,brumm_cli=info
+
+[Install]
+WantedBy=default.target

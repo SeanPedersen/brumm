@@ -73,15 +73,59 @@ impl Node {
                 });
                 Ok(())
             }
-            Command::RememberOpenChat { conversation } => self.store.set_last_opened(&conversation),
-            Command::SendText { conversation, text } => {
-                self.send_any(conversation, Body::Text(text.trim().to_owned()))
+            Command::LoadNewer {
+                conversation,
+                after,
+                limit,
+            } => {
+                let page = self
+                    .store
+                    .conversation_page_after(&conversation, after, limit)?;
+                self.events.emit(Event::NewerMessages {
+                    conversation,
+                    after,
+                    messages: page.messages,
+                    arrivals: page.arrivals,
+                    cursor: page.cursor,
+                    has_newer: page.has_newer,
+                });
+                Ok(())
             }
+            Command::LoadLatest {
+                conversation,
+                limit,
+            } => {
+                let page = self.store.conversation_tail(&conversation, limit)?;
+                self.events.emit(Event::LatestMessages {
+                    conversation,
+                    limit,
+                    messages: page.messages,
+                    arrivals: page.arrivals,
+                    cursor: page.cursor,
+                });
+                Ok(())
+            }
+            Command::LoadMessage { conversation, id } => {
+                let message = self.store.message_view(&conversation, &id)?;
+                self.events.emit(Event::Message {
+                    conversation,
+                    id,
+                    message,
+                });
+                Ok(())
+            }
+            Command::RememberOpenChat { conversation } => self.store.set_last_opened(&conversation),
+            Command::SendText {
+                conversation,
+                text,
+                id,
+            } => self.send_any(conversation, Body::Text(text.trim().to_owned()), id),
             Command::SendFile {
                 conversation,
                 name,
                 data,
-            } => self.send_any(conversation, Body::File { name, data }),
+                id,
+            } => self.send_any(conversation, Body::File { name, data }, id),
             Command::DeleteMessages {
                 conversation: ConversationId::Group(group),
                 ids,
@@ -234,23 +278,35 @@ impl Node {
         Ok(())
     }
 
-    fn send_any(&mut self, conversation: ConversationId, body: Body) -> Result<()> {
+    /// A caller-chosen `id` that is already stored or deleted is a retry: nothing happens.
+    fn send_any(
+        &mut self,
+        conversation: ConversationId,
+        body: Body,
+        id: Option<MessageId>,
+    ) -> Result<()> {
+        if let Some(id) = id
+            && self.store.message_known(&conversation, &id)?
+        {
+            return Ok(());
+        }
+        let id = id.unwrap_or_else(rand::random);
         match conversation {
-            ConversationId::Group(group) => self.send_group_message(group, body),
-            ConversationId::Direct(_) => self.send_text(conversation, body),
+            ConversationId::Group(group) => self.send_group_message(group, id, body),
+            ConversationId::Direct(_) => self.send_text(conversation, id, body),
         }
     }
 
     /// Sends a text or file message to a contact (and a transcript to our other devices).
     /// The conversation keyed by our own user key is the "Notes" chat: it only syncs to our devices.
-    fn send_text(&mut self, conversation: ConversationId, body: Body) -> Result<()> {
+    fn send_text(&mut self, conversation: ConversationId, id: MessageId, body: Body) -> Result<()> {
         let contact = direct_only(conversation)?;
         let is_notes = contact == self.active_me()?.user_key();
         if !is_notes {
             self.store.contact(&contact)?.context("unknown contact")?;
         }
         let message = ChatMessage {
-            id: rand::random(),
+            id,
             sent_at_ms: now_ms(),
             body,
         };

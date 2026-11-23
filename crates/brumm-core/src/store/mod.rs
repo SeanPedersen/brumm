@@ -28,12 +28,12 @@ use crate::{
 
 pub use groups::EpochRow;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 /// Oldest schema that [`SCHEMA`] upgrades in place (v5–v8 added tables; v8 also
 /// [`OUTBOX_ENVELOPE_COLUMN`]; v9 keys conversations by [`ConversationId`], see
 /// [`upgrade_conversation_keys`], and adds [`MESSAGE_SENDER_COLUMN`]; v10 adds the group
 /// tables, [`groups::GROUP_SCHEMA`]; v11 adds `group_pending_logs` and
-/// [`groups::INVITATION_ACCEPTED_COLUMN`]).
+/// [`groups::INVITATION_ACCEPTED_COLUMN`]; v12 adds [`MESSAGE_SEQ_COLUMN`], see [`add_arrival_order`]).
 const MIN_UPGRADABLE_SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -125,6 +125,21 @@ const OUTBOX_ENVELOPE_COLUMN: &str = "envelope";
 /// Author of a group message (v9). NULL in 1:1 chats, where the direction says who wrote it;
 /// empty for a system line ("Bob joined").
 const MESSAGE_SENDER_COLUMN: &str = "sender";
+/// Arrival order of a message on this device (v12), the cursor of [`Store::conversation_page_after`].
+/// Taken from a counter in `meta`, so it is never reused, also not after the newest row was deleted.
+const MESSAGE_SEQ_COLUMN: &str = "seq";
+/// Numbers every inserted message, whichever path inserted it. The first statement recreates
+/// the counter after [`Store::wipe`]. No statement may conflict: a trigger inherits the outer
+/// statement's conflict policy (`INSERT OR IGNORE` would silently skip an `OR REPLACE`).
+const ARRIVAL_ORDER: &str = "
+CREATE INDEX IF NOT EXISTS messages_by_arrival ON messages (conversation, seq);
+CREATE TRIGGER IF NOT EXISTS messages_arrival AFTER INSERT ON messages BEGIN
+    INSERT INTO meta (key, value) SELECT 'message_seq', 0
+        WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'message_seq');
+    UPDATE meta SET value = value + 1 WHERE key = 'message_seq';
+    UPDATE messages SET seq = (SELECT value FROM meta WHERE key = 'message_seq') WHERE rowid = NEW.rowid;
+END;
+";
 /// Columns that held a bare 32-byte user key before v9: `(table, old name, new name)`.
 const CONVERSATION_COLUMNS_V9: [(&str, &str, &str); 5] = [
     ("messages", "contact", "conversation"),
@@ -184,6 +199,17 @@ pub struct ConversationPage {
     pub has_older: bool,
 }
 
+/// Messages that arrived after a cursor, in arrival order.
+#[derive(Debug)]
+pub struct NewerPage {
+    pub messages: Vec<MessageView>,
+    /// Arrival number of each message (same order): a cursor that continues right after it.
+    pub arrivals: Vec<u64>,
+    /// Arrival number of the last message returned (the given cursor if there are none).
+    pub cursor: u64,
+    pub has_newer: bool,
+}
+
 /// `LIMIT -1` is SQLite's "no limit".
 const SQL_NO_LIMIT: i64 = -1;
 /// postcard writes the enum variant index first; `Body::File` is variant 1.
@@ -200,6 +226,8 @@ fn list_body_column() -> String {
     )
 }
 
+/// Column of the arrival number in [`Store::conversation_page_after`], after [`SENDER_COLUMNS`].
+const SEQ_COLUMN_INDEX: usize = 8;
 /// The author key and (for groups) the name of the member, columns 6 and 7 of a message row.
 const SENDER_COLUMNS: &str = "sender, (SELECT display_name FROM group_members
     WHERE group_members.group_id = substr(messages.conversation, 2) AND group_members.user_key = messages.sender)";
@@ -252,6 +280,7 @@ impl Store {
                 groups::INVITATION_ACCEPTED_COLUMN,
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
+            add_arrival_order(&tx)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -960,17 +989,90 @@ impl Store {
             messages.pop();
         }
         messages.reverse();
-        let mut reactions = match conversation {
-            ConversationId::Direct(_) => self.conversation_reactions(conversation)?,
-            ConversationId::Group(_) => self.group_reactions(conversation)?,
-        };
-        for message in &mut messages {
-            message.reactions = reactions.remove(&message.id).unwrap_or_default();
-        }
+        self.attach_reactions(conversation, &mut messages)?;
         Ok(ConversationPage {
             messages,
             has_older,
         })
+    }
+
+    /// Up to `limit` messages (all if `None`) that arrived on this device after the arrival
+    /// number `after` (from the first if `None`), in arrival order. Unlike the `sent_at_ms`
+    /// order of [`Self::conversation_page`], a late message (mailbox, sync) with an old
+    /// timestamp still comes after the cursor, and deleting a message never moves it.
+    pub fn conversation_page_after(
+        &self,
+        conversation: &ConversationId,
+        after: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<NewerPage> {
+        let sql = format!(
+            "SELECT conversation, id, direction, {}, sent_at_ms, status, {SENDER_COLUMNS}, {MESSAGE_SEQ_COLUMN}
+             FROM messages WHERE conversation = ?1 AND {MESSAGE_SEQ_COLUMN} > ?2
+             ORDER BY {MESSAGE_SEQ_COLUMN} LIMIT ?3",
+            list_body_column()
+        );
+        let fetch = limit.map_or(SQL_NO_LIMIT, |limit| i64::from(limit) + 1);
+        let after = after.unwrap_or(0);
+        let mut stmt = self.db.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![conversation.to_stored(), after as i64, fetch],
+            |row| Ok((message_from_row(row)?, row.get::<_, i64>(SEQ_COLUMN_INDEX)? as u64)),
+        )?;
+        let mut numbered: Vec<(MessageView, u64)> = rows.collect::<Result<_, _>>()?;
+        let has_newer = limit.is_some_and(|limit| numbered.len() > limit as usize);
+        if has_newer {
+            numbered.pop();
+        }
+        let cursor = numbered.last().map_or(after, |(_, seq)| *seq);
+        let (mut messages, arrivals): (Vec<MessageView>, Vec<u64>) = numbered.into_iter().unzip();
+        self.attach_reactions(conversation, &mut messages)?;
+        Ok(NewerPage {
+            messages,
+            arrivals,
+            cursor,
+            has_newer,
+        })
+    }
+
+    /// The `limit` messages that arrived last, in arrival order, and the cursor after the newest
+    /// (0 for an empty conversation): reading on from it returns only later arrivals.
+    pub fn conversation_tail(&self, conversation: &ConversationId, limit: u32) -> Result<NewerPage> {
+        let sql = format!(
+            "SELECT conversation, id, direction, {}, sent_at_ms, status, {SENDER_COLUMNS}, {MESSAGE_SEQ_COLUMN}
+             FROM messages WHERE conversation = ?1 ORDER BY {MESSAGE_SEQ_COLUMN} DESC LIMIT ?2",
+            list_body_column()
+        );
+        let mut stmt = self.db.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![conversation.to_stored(), i64::from(limit)], |row| {
+            Ok((message_from_row(row)?, row.get::<_, i64>(SEQ_COLUMN_INDEX)? as u64))
+        })?;
+        let mut numbered: Vec<(MessageView, u64)> = rows.collect::<Result<_, _>>()?;
+        numbered.reverse();
+        let cursor: i64 = self.db.query_row(
+            &format!("SELECT COALESCE(MAX({MESSAGE_SEQ_COLUMN}), 0) FROM messages WHERE conversation = ?1"),
+            params![conversation.to_stored()],
+            |row| row.get(0),
+        )?;
+        let (mut messages, arrivals): (Vec<MessageView>, Vec<u64>) = numbered.into_iter().unzip();
+        self.attach_reactions(conversation, &mut messages)?;
+        Ok(NewerPage {
+            messages,
+            arrivals,
+            cursor: cursor as u64,
+            has_newer: false,
+        })
+    }
+
+    fn attach_reactions(&self, conversation: &ConversationId, messages: &mut [MessageView]) -> Result<()> {
+        let mut reactions = match conversation {
+            ConversationId::Direct(_) => self.conversation_reactions(conversation)?,
+            ConversationId::Group(_) => self.group_reactions(conversation)?,
+        };
+        for message in messages {
+            message.reactions = reactions.remove(&message.id).unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// Latest message per conversation, for the chat list. Avoids loading full histories at
@@ -1039,6 +1141,16 @@ impl Store {
 
     pub fn message_exists(&self, conversation: &ConversationId, id: &MessageId) -> Result<bool> {
         Ok(self.message_status(conversation, id)?.is_some())
+    }
+
+    /// Stored or deleted here: a send with this id would be a repeat.
+    pub fn message_known(&self, conversation: &ConversationId, id: &MessageId) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation = ?1 AND id = ?2)
+                 OR EXISTS (SELECT 1 FROM deleted_messages WHERE conversation = ?1 AND id = ?2)",
+            params![conversation.to_stored(), id.as_slice()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Stores a reaction unless a newer one for the same user and message is already there.
@@ -1475,6 +1587,20 @@ fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
 }
 
 /// In-place upgrade step: `CREATE TABLE IF NOT EXISTS` leaves an older table without new columns.
+/// v12: numbers stored messages in rowid order (their insert order) and continues from there.
+fn add_arrival_order(db: &Connection) -> Result<()> {
+    if !has_column(db, "messages", MESSAGE_SEQ_COLUMN)? {
+        db.execute_batch(&format!(
+            "ALTER TABLE messages ADD COLUMN {MESSAGE_SEQ_COLUMN} INTEGER;
+             UPDATE messages SET {MESSAGE_SEQ_COLUMN} = rowid;
+             INSERT OR REPLACE INTO meta (key, value)
+                 SELECT 'message_seq', COALESCE(MAX(rowid), 0) FROM messages;"
+        ))?;
+    }
+    db.execute_batch(ARRIVAL_ORDER)?;
+    Ok(())
+}
+
 fn add_column_if_missing(db: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
     if !has_column(db, table, column)? {
         db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
@@ -2177,6 +2303,85 @@ mod tests {
         assert_eq!(history[0].contact, [2; 32]);
         assert_eq!(store.conversation(&group).unwrap().len(), 1);
         assert_eq!(store.conversation_previews().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn newer_pages_follow_arrival_order_across_deletes() {
+        let store = Store::open_in_memory().unwrap();
+        let chat = direct(4);
+        let other = direct(5);
+        insert(&store, &chat, &text(1, 100), Direction::Incoming);
+        insert(&store, &other, &text(9, 100), Direction::Incoming);
+        insert(&store, &chat, &text(2, 200), Direction::Incoming);
+        let ids = |page: &NewerPage| page.messages.iter().map(|m| m.id[0]).collect::<Vec<_>>();
+
+        let first = store.conversation_page_after(&chat, None, Some(1)).unwrap();
+        assert_eq!(ids(&first), vec![1]);
+        assert_eq!(first.arrivals, vec![first.cursor]);
+        assert!(first.has_newer);
+        let second = store
+            .conversation_page_after(&chat, Some(first.cursor), Some(1))
+            .unwrap();
+        assert_eq!(ids(&second), vec![2]);
+        assert!(!second.has_newer);
+
+        // The newest row goes away; its number is not handed out again.
+        store.delete_messages(&chat, &[[2; 16]], None).unwrap();
+        // Arrives late with an older timestamp: still after the cursor.
+        insert(&store, &chat, &text(3, 50), Direction::Incoming);
+        let late = store
+            .conversation_page_after(&chat, Some(second.cursor), None)
+            .unwrap();
+        assert_eq!(ids(&late), vec![3]);
+        let empty = store
+            .conversation_page_after(&chat, Some(late.cursor), None)
+            .unwrap();
+        assert!(empty.messages.is_empty());
+        assert_eq!(empty.cursor, late.cursor);
+        let tail = store.conversation_tail(&chat, 1).unwrap();
+        assert_eq!(ids(&tail), vec![3]);
+        assert_eq!(tail.cursor, late.cursor);
+        let just_cursor = store.conversation_tail(&chat, 0).unwrap();
+        assert!(just_cursor.messages.is_empty());
+        assert_eq!(just_cursor.cursor, late.cursor);
+        assert_eq!(store.conversation_tail(&direct(99), 5).unwrap().cursor, 0);
+        assert!(store.message_known(&chat, &[2; 16]).unwrap());
+        assert!(store.message_known(&chat, &[3; 16]).unwrap());
+        assert!(!store.message_known(&chat, &[9; 16]).unwrap());
+    }
+
+    #[test]
+    fn arrival_order_survives_a_wipe() {
+        let store = Store::open_in_memory().unwrap();
+        let chat = direct(4);
+        insert(&store, &chat, &text(1, 100), Direction::Incoming);
+        store.wipe().unwrap();
+        insert(&store, &chat, &text(2, 100), Direction::Incoming);
+        let page = store.conversation_page_after(&chat, None, None).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert!(page.cursor > 0);
+    }
+
+    #[test]
+    fn a_v11_database_numbers_its_messages() {
+        let db = Connection::open_in_memory().unwrap();
+        let store = Store::init(db).unwrap();
+        let chat = direct(4);
+        insert(&store, &chat, &text(1, 300), Direction::Incoming);
+        insert(&store, &chat, &text(2, 100), Direction::Incoming);
+        store
+            .db
+            .execute_batch(
+                "DROP TRIGGER messages_arrival; DROP INDEX messages_by_arrival;
+                 ALTER TABLE messages DROP COLUMN seq; DELETE FROM meta WHERE key = 'message_seq';
+                 PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        let store = Store::init(store.db).unwrap();
+        insert(&store, &chat, &text(3, 200), Direction::Incoming);
+        let page = store.conversation_page_after(&chat, None, None).unwrap();
+        let ids: Vec<u8> = page.messages.iter().map(|m| m.id[0]).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]

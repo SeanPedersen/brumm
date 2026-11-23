@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "brumm"
+version = "0.1.0"
+description = "Talk over brumm (decentralized, end-to-end encrypted messenger) from Python: bots, logs, agent rooms"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Communications :: Chat",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/SeanPedersen/brumm"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.maturin]
+# The wheel carries the `brumm-cli` binary (installed next to the interpreter's scripts) plus
+# the pure-Python package below; the package talks to the binary's daemon over its socket.
+bindings = "bin"
+manifest-path = "../crates/brumm-cli/Cargo.toml"
+python-source = "."
+python-packages = ["brumm"]
+profile = "dist"
+strip = true
+exclude = ["**/__pycache__/**"]
+
+[tool.uv]
+# `uv run pytest` must not compile the Rust binary; tests use BRUMM_BIN (or target/debug).
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

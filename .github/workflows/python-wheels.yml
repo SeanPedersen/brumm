@@ -1,0 +1,60 @@
+# Python wheels with the bundled brumm-cli binary (PLAN-AGENTS.md H4). Built on tags and on
+# demand; each wheel is tested with pytest against its own binary before it is uploaded.
+name: python-wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2_28" }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist
+      - name: Test the wheel (native targets only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        working-directory: python
+        run: |
+          pip install pytest dist/*.whl
+          export BRUMM_BIN="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/brumm-cli"
+          python -m pytest -q -p no:cacheprovider tests --import-mode=importlib --rootdir . -o pythonpath=
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz

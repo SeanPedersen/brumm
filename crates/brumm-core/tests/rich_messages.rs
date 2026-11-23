@@ -28,6 +28,7 @@ async fn file_round_trip_and_size_limit() {
         conversation: ConversationId::Direct(bob_key),
         name: "photo.png".into(),
         data: data.clone(),
+        id: None,
     });
     let id = bob
         .expect(|event| match event {
@@ -59,6 +60,7 @@ async fn file_round_trip_and_size_limit() {
         conversation: ConversationId::Direct(bob_key),
         name: "huge.bin".into(),
         data: vec![1; MAX_FILE_BYTES + 1],
+        id: None,
     });
     alice.expect_error().await;
 }

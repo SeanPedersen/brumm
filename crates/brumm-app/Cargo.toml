@@ -24,6 +24,7 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 web-time = "1.1.0"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+brumm-host.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 directories.workspace = true
 tracing-subscriber.workspace = true

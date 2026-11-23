@@ -115,6 +115,7 @@ fn handle_file_events(
                         conversation,
                         name,
                         data,
+                        id: None,
                     }),
                     Err(message) => state.errors.push(message),
                 },
@@ -126,6 +127,7 @@ fn handle_file_events(
                     conversation,
                     name,
                     data,
+                    id: None,
                 }),
                 Err(message) => state.errors.push(message),
             }
@@ -162,6 +164,7 @@ fn handle_file_events(
                     conversation,
                     name,
                     data,
+                    id: None,
                 }),
                 Err(message) => state.errors.push(message),
             },
@@ -200,6 +203,7 @@ fn send_file(
             conversation,
             name,
             data,
+            id: None,
         }),
         Err(message) => state.errors.push(message),
     }

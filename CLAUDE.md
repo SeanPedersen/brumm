@@ -69,10 +69,28 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   in that window used to leave the message in the outbox until the next launch. On shutdown `node/drain.rs` posts every
   unmailboxed outbox entry to the relays at once (cap `SHUTDOWN_DRAIN_MAX`, 10 s), and `main` waits for it in `bridge::wait_for_drain` after
   the window is gone (`NodeConfig::on_drained` fires after the drain, not after the slow graceful network teardown, so closing
-  the window is instant; the process used to kill the core mid-drain). `bridge/profile_lock.rs` (`brumm.lock`, held for the core's whole life
+  the window is instant; the process used to kill the core mid-drain). `brumm_host::ProfileLock` (`brumm.lock`, held for the core's whole life
   incl. the drain) makes a relaunch wait for it and refuses a second live instance: two processes on one DB would
   diverge the Olm ratchets. A browser tab cannot drain, so on wasm `enqueue_to_own_devices` also posts to the mailbox
   at enqueue time (not on native: no extra relay traffic). Tests: `tests/mailbox.rs` (quit right after send, Notes via relay).
+- **Headless hosts (#14, PLAN-AGENTS.md, SPEC.md §15): H1–H4 done.** Bots/agents are ordinary user identities, one
+  profile each. Core: `SendText`/`SendFile` take an optional caller-chosen `id`; a known id (stored or deleted,
+  `Store::message_known`) is a no-op, so retries never send twice. Reads by **arrival order** (`messages.seq`, schema
+  v12: a trigger numbers every insert from the `meta` counter `message_seq`, never reused, survives `wipe`; the trigger
+  uses only conflict-free statements, since a trigger inherits the outer statement's `OR IGNORE`): `LoadNewer { after,
+  limit }`, `LoadLatest { limit }` (cursor "from now"), each answer with per-message `arrivals`; `LoadMessage` →
+  `Event::Message` (also the barrier that confirms an earlier command). The app ignores these answers.
+  `crates/brumm-host`: `ProfileLock`, async `Client` (subscribe to the event broadcast, then send, then the
+  `LoadMessage` barrier; stops via a oneshot, not by dropping handles), `mirror` Snapshot, `policy` (`policy.toml`:
+  locked, allow, auto_accept) + `enforcer` (watch channel, re-checks open invitations on change), `dto` stable JSON.
+  `crates/brumm-cli`: one-shot commands (`--no-daemon`) or the daemon (auto-started, `--idle-exit` 60 s; lock file
+  `daemon.lock` serializes racing starts), JSON-RPC 2.0 NDJSON over a 0600 Unix socket with peer-uid check
+  (**protocol.md**). Profiles open lazily (per-name slot) and close when idle; cap `DEFAULT_MAX_PROFILES` 16 (measured
+  ~10 MB daemon, +23 MB first profile, +4 MB each). Subscriptions: bounded queue (256), overflow → `lagged` sent via
+  `reserve()` as soon as there is room (never only with the next event); clients reread rooms from their cursor.
+  `python/`: stdlib-only `brumm` package (sync `Client`, `brumm.aio`, `BrummHandler`), maturin `bindings = "bin"` wheel
+  bundling `brumm-cli` (verified locally; CI workflow `.github/workflows/python-wheels.yml` not run yet). Windows
+  named-pipe code is untested. Deploy: `deploy/VPS.md`, `deploy/systemd/brumm-daemon.service`.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **Groups (#24): G1–G6 done** (only the manual browser run is open). SPEC.md §14 (design) and §14.11 (what was
   built, how it differs, scale numbers). Plan with checkboxes: **PLAN-GROUPS.md**; review brief: **REVIEW-GROUPS.md**. Up to 10k members, owner/admin/member, signed op
@@ -189,12 +207,27 @@ crates/brumm-core/        no UI; everything async/network/storage
   tests/consistency.rs    e2e: lost envelopes/deletes/sessions repaired, mailbox notes once + in order
                           (simulates losses by editing a stopped node's DB, `Stopped::sql`)
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
+crates/brumm-host/        native-only glue for the app and headless hosts (PLAN-AGENTS.md)
+  src/lock.rs             ProfileLock: one core per profile dir (file lock, waits out a draining predecessor)
+  src/client.rs           async Client over Command/Event: open (lock + Ready), send → id, wait_status, read_since/latest
+  src/mirror.rs           Snapshot (profile, contacts, groups, invitations) kept current from events
+  src/policy.rs           Policy (policy.toml): locked, allow, auto_accept; pure decide/check, atomic save
+  src/enforcer.rs         answers group invitations by the policy (watch channel)
+  src/dto.rs              stable JSON views (Room, Message, Contact, Status, Page, Notice), base32 ids, resolve_room
+  tests/client.rs         e2e: send + Delivered, cursor pages + restart, idempotent retry
+crates/brumm-cli/         binary `brumm-cli` (lib + bin); protocol in protocol.md
+  src/cli.rs, commands.rs clap subcommands → protocol calls over transport.rs (remote.rs socket or in-process host)
+  src/host/               registry (lazy open, idle close, BUSY across processes), session (subscriptions), methods
+  src/daemon/             mod (accept loop, idle exit, signals), socket (Unix 0600 + peer uid / Windows pipe), spawn
+  src/protocol.rs         JSON-RPC framing, error codes, PROTOCOL_VERSION; paths.rs (data root, sockets); text.rs; output.rs
+  tests/                  oneshot (bot ↔ app never online together), daemon (shared profile, restart cursor, policy),
+                          concurrency (retry storms, racing starts, idle close races, kill -9, slow subscriber; DB integrity)
+python/                   `brumm` Python package (uv, stdlib only): client.py, aio.py, logging.py, tests/ (pytest vs real daemon)
 crates/brumm-worker/      browser only: runs brumm-core in a Web Worker (OPFS storage, message pump)
 crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html + Trunk.toml for the web
   src/main.rs             picks native.rs (window, --profile, window size) or web.rs (canvas, ?profile=)
   src/bridge/native.rs    tokio runtime thread (2 workers) + channels; repaint on event;
                           closing the command channel stops the core, Drop waits for its drain
-  src/bridge/profile_lock.rs  one core per profile dir (file lock)
   src/bridge/web.rs       starts brumm-worker, postcard messages, queues commands until Listening
   src/history.rs          browser history push/back/popstate for the narrow layout (no-op on desktop)
   src/state.rs            AppState, mutated only via apply(Event); cached previews + bounded caches
@@ -283,6 +316,9 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
 cargo test                                   # unit + local e2e
 cargo test -p brumm-core --test network -- --ignored   # needs internet: relay + DNS discovery
 cargo clippy --all-targets
+(cd python && uv run --group dev pytest)     # Python package vs a real daemon (needs target/debug/brumm-cli)
+(cd python && uvx maturin build --release)   # wheel with the bundled brumm-cli
+cargo run -p brumm-cli -- --profile bot send notes "hi"   # headless CLI (auto-starts the daemon)
 cargo clippy -p brumm-app -p brumm-worker --target wasm32-unknown-unknown
 (cd crates/brumm-app && trunk serve)         # browser build: http://localhost:8080/?profile=alice
 cargo run -- --profile alice                 # separate data dir per profile

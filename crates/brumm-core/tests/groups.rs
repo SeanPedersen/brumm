@@ -211,6 +211,7 @@ async fn announcement_mode_files_and_reactions() {
     bob.send(Command::SendText {
         conversation: ConversationId::Group(group),
         text: "may I?".into(),
+        id: None,
     });
     assert!(bob.expect_error().await.contains("only admins"));
 
@@ -218,6 +219,7 @@ async fn announcement_mode_files_and_reactions() {
         conversation: ConversationId::Group(group),
         name: "notes.txt".into(),
         data: b"group file body".to_vec(),
+        id: None,
     });
     let messages = bob.wait_group_texts(group, &[""]).await;
     let file = &messages[0];

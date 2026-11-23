@@ -29,6 +29,13 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
   touch-friendly composer, on-screen keyboard aware). The core runs in a Web Worker and stores data in the
   browser's private storage (OPFS); it connects through iroh relays only.
   Build with `(cd crates/brumm-app && trunk serve)`.
+- **`brumm-cli`** for bots, scripts and agents: a headless brumm identity per profile. One-shot
+  (`echo done | brumm-cli --profile bot send me`) or through a local daemon that keeps profiles online and
+  serves any language over a JSON-RPC socket ([protocol.md](protocol.md)). Pair it with your app once
+  (`brumm-cli --profile bot accept '<invite link>' --lock`) and read its messages in your own chat list.
+  Running on a server: [deploy/VPS.md](deploy/VPS.md).
+- **Python package** ([python/](python/README.md)): `brumm.Client("bot").send("me", "build finished")`,
+  `iter_messages()`, asyncio, and a rate-limited `logging` handler. The wheel bundles `brumm-cli`.
 
 Planned: offline invites and contact introductions, stickers, native mobile apps,
 Bluetooth/Wi‑Fi mesh. See [SPEC.md](SPEC.md) for the full design and milestones.
@@ -55,6 +62,7 @@ generic icon until the entry and icon are installed.
 ```sh
 cargo test                                                    # unit + local end-to-end (incl. in-memory Nostr relay)
 cargo test -p brumm-core --test network -- --ignored          # needs internet: iroh relays, DNS discovery, public Nostr relays
+(cd python && uv run --group dev pytest)                      # Python package against a real daemon (after cargo build)
 ```
 
 ## Layout
@@ -62,6 +70,9 @@ cargo test -p brumm-core --test network -- --ignored          # needs internet: 
 crates/brumm-core   protocol, crypto, storage, networking (no UI) — talks to UIs via Command/Event
 crates/brumm-worker browser only: runs brumm-core in a Web Worker
 crates/brumm-app    egui app (desktop + web)
+crates/brumm-host   native glue for the app and headless hosts (profile lock, async client, JSON views, policy)
+crates/brumm-cli    `brumm-cli`: one-shot commands and the daemon (protocol.md)
+python/             the `brumm` Python package
 SPEC.md             protocol + architecture specification
 ```
 

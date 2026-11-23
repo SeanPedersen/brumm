@@ -178,6 +178,7 @@ impl TestNode {
         self.send(Command::SendText {
             conversation: ConversationId::Direct(contact),
             text: text.into(),
+            id: None,
         });
         let text = text.to_owned();
         self.expect(|event| match event {
@@ -419,6 +420,7 @@ impl TestNode {
         self.send(Command::SendText {
             conversation: ConversationId::Group(group),
             text: text.into(),
+            id: None,
         });
         let text = text.to_owned();
         self.expect(|event| match event {

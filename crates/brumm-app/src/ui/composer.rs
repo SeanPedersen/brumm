@@ -66,6 +66,7 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         commands.push(Command::SendText {
             conversation,
             text: draft.trim().to_owned(),
+            id: None,
         });
         draft.clear();
         ui.memory_mut(|memory| memory.request_focus(input_id));

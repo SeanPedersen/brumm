@@ -515,6 +515,8 @@ impl AppState {
                 let overflow = self.errors.len().saturating_sub(MAX_VISIBLE_ERRORS);
                 self.errors.drain(..overflow);
             }
+            // Answers for headless clients (brumm-host); the app never asks for them.
+            Event::NewerMessages { .. } | Event::LatestMessages { .. } | Event::Message { .. } => {}
         }
     }
 

@@ -11,9 +11,8 @@ use brumm_core::{
     api::{Command, Event, EventSink},
     node::{self, NodeConfig, SHUTDOWN_DRAIN_MAX},
 };
+use brumm_host::ProfileLock;
 use tokio::sync::mpsc;
-
-use super::profile_lock::ProfileLock;
 
 /// The core is network-light: a small multi-thread runtime is enough and keeps
 /// idle thread/stack overhead low.

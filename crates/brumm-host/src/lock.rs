@@ -1,4 +1,4 @@
-//! One running core per profile directory. Two processes on the same SQLite file would both
+//! One running core per profile directory (desktop app, CLI, daemon alike). Two processes on the same SQLite file would both
 //! advance the same Olm ratchets and break the sessions for good. The lock is held for the whole
 //! life of the core, including its shutdown drain, so a relaunch during the drain waits instead
 //! of overlapping. The OS releases it when the process ends, however it ends.

@@ -1,0 +1,21 @@
+[package]
+name = "brumm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native-only glue shared by the brumm desktop app and headless hosts (CLI, daemon)"
+
+[dependencies]
+brumm-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+serde.workspace = true
+data-encoding.workspace = true
+rand.workspace = true
+toml = "1.2"
+
+[dev-dependencies]
+serde_json = "1"
+tracing-subscriber.workspace = true

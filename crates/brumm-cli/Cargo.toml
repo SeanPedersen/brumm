@@ -1,0 +1,32 @@
+[package]
+name = "brumm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless brumm for software, bots and agents: CLI, one-shot sends and a JSON-RPC daemon"
+
+[[bin]]
+name = "brumm-cli"
+path = "src/main.rs"
+
+[dependencies]
+brumm-core.workspace = true
+brumm-host.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "io-std", "signal", "fs"] }
+serde.workspace = true
+serde_json = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+data-encoding.workspace = true
+blake3.workspace = true
+qrcode.workspace = true
+rand.workspace = true
+directories.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+nostr-sdk = { workspace = true, features = ["local-relay"] }
+rusqlite.workspace = true

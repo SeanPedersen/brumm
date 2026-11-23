@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/brumm-core", "crates/brumm-app", "crates/brumm-worker"]
+members = ["crates/brumm-core", "crates/brumm-host", "crates/brumm-cli", "crates/brumm-app", "crates/brumm-worker"]
 # Plain `cargo run` / `cargo test` stay on the native app; brumm-worker is the browser-only
 # core thread and is built by `trunk` (issue #2).
-default-members = ["crates/brumm-core", "crates/brumm-app"]
+default-members = ["crates/brumm-core", "crates/brumm-host", "crates/brumm-cli", "crates/brumm-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/SeanPedersen/brumm"
 
 [workspace.dependencies]
 brumm-core = { path = "crates/brumm-core" }
+brumm-host = { path = "crates/brumm-host" }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 # Only features that build on wasm32; native crates add `rt-multi-thread` themselves.

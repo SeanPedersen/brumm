@@ -69,13 +69,18 @@ impl Node {
     }
 
     /// `SendText` / `SendFile` in a group.
-    pub(in crate::node) fn send_group_message(&mut self, group: GroupId, body: Body) -> Result<()> {
+    pub(in crate::node) fn send_group_message(
+        &mut self,
+        group: GroupId,
+        id: MessageId,
+        body: Body,
+    ) -> Result<()> {
         let me = self.active_me()?.user_key();
         let runtime = self.group(&group)?;
         ensure!(runtime.is_active(), "you are no longer in this group");
         ensure!(runtime.state().may_post(&me), "only admins can post in this group");
         let message = ChatMessage {
-            id: rand::random(),
+            id,
             sent_at_ms: now_ms(),
             body,
         };
