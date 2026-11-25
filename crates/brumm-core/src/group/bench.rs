@@ -1,4 +1,4 @@
-//! Scale numbers for SPEC.md §14.7 / PLAN-GROUPS G6, as ignored tests that print a table:
+//! Scale numbers for SPEC.md §14.7 / §14.11 G6, as ignored tests that print a table:
 //!
 //! ```sh
 //! cargo test --release -p brumm-core --lib group::bench -- --ignored --nocapture --test-threads 1

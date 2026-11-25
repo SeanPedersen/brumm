@@ -1,5 +1,5 @@
 //! brumm-host: native-only glue between brumm-core and the programs that host it, i.e. the
-//! desktop app and the headless hosts for software, bots and agents (PLAN-AGENTS.md, #14).
+//! desktop app and the headless hosts for software, bots and agents (#14).
 //!
 //! - [`lock`]: one running core per profile directory.
 //! - [`client`]: an async request/response API over the core's `Command`/`Event` channel.

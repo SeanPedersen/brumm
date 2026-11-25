@@ -81,7 +81,7 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   incl. the drain) makes a relaunch wait for it and refuses a second live instance: two processes on one DB would
   diverge the Olm ratchets. A browser tab cannot drain, so on wasm `enqueue_to_own_devices` also posts to the mailbox
   at enqueue time (not on native: no extra relay traffic). Tests: `tests/mailbox.rs` (quit right after send, Notes via relay).
-- **Headless hosts (#14, PLAN-AGENTS.md, SPEC.md §15): H1–H4 done.** Bots/agents are ordinary user identities, one
+- **Headless hosts (#14, SPEC.md §15): H1–H4 done.** Bots/agents are ordinary user identities, one
   profile each. Core: `SendText`/`SendFile` take an optional caller-chosen `id`; a known id (stored or deleted,
   `Store::message_known`) is a no-op, so retries never send twice. Reads by **arrival order** (`messages.seq`, schema
   v12: a trigger numbers every insert from the `meta` counter `message_seq`, never reused, survives `wipe`; the trigger
@@ -101,7 +101,7 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   named-pipe code is untested. Deploy: `deploy/VPS.md`, `deploy/systemd/brumm-daemon.service`.
 - **Next (rest of M3):** offline invites, contact cards plus intro-gated requests.
 - **Groups (#24): G1–G6 done** (only the manual browser run is open). SPEC.md §14 (design) and §14.11 (what was
-  built, how it differs, scale numbers). Plan with checkboxes: **PLAN-GROUPS.md**; review brief: **REVIEW-GROUPS.md**. Up to 10k members, owner/admin/member, signed op
+  built, how it differs, scale numbers). Up to 10k members, owner/admin/member, signed op
   log, HPKE rekeys (not MLS, see §14.9). Every chat is keyed by `ConversationId { Direct(UserKey), Group(GroupId) }`
   (`conversation.rs`, stored as `tag byte ‖ 32 bytes` since schema v9; schema v10 adds the group tables in
   `store/groups.rs`). Core split: pure protocol in `group/` (no I/O, unit tested), node glue in `node/groups/`.
@@ -223,7 +223,7 @@ crates/brumm-core/        no UI; everything async/network/storage
   tests/consistency.rs    e2e: lost envelopes/deletes/sessions repaired, mailbox notes once + in order
                           (simulates losses by editing a stopped node's DB, `Stopped::sql`)
   tests/network.rs        ignored (needs internet): relay-only, DNS rediscovery, offline retry, public Nostr relays
-crates/brumm-host/        native-only glue for the app and headless hosts (PLAN-AGENTS.md)
+crates/brumm-host/        native-only glue for the app and headless hosts
   src/lock.rs             ProfileLock: one core per profile dir (file lock, waits out a draining predecessor)
   src/client.rs           async Client over Command/Event: open (lock + Ready), send → id, wait_status, read_since/latest
   src/mirror.rs           Snapshot (profile, contacts, groups, invitations) kept current from events

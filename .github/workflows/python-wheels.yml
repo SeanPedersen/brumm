@@ -1,4 +1,4 @@
-# Python wheels with the bundled brumm-cli binary (PLAN-AGENTS.md H4). Built on tags and on
+# Python wheels with the bundled brumm-cli binary (H4). Built on tags and on
 # demand; each wheel is tested with pytest against its own binary before it is uploaded.
 name: python-wheels
 

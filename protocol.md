@@ -1,7 +1,7 @@
 # brumm daemon protocol, version 1
 
 The `brumm-cli` daemon hosts brumm profiles (one identity each) for programs: bots, log channels and
-agents (PLAN-AGENTS.md). Any language can talk to it; the Python package (`python/`) and `brumm-cli` itself
+agents (SPEC.md §15). Any language can talk to it; the Python package (`python/`) and `brumm-cli` itself
 are clients. This file is the contract. Fields may be **added** within version 1; removing or changing
 one bumps `protocol` (see `daemon.status`).
 

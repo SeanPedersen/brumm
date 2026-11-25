@@ -1,4 +1,4 @@
-//! brumm-cli: headless brumm for software, bots and agents (PLAN-AGENTS.md, issue #14).
+//! brumm-cli: headless brumm for software, bots and agents (issue #14).
 //!
 //! One code path, two transports: every subcommand becomes protocol calls ([`commands`]) that
 //! go either to the daemon over its socket ([`remote`], started on demand by

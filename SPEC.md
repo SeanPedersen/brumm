@@ -614,7 +614,7 @@ What the code does where it differs from or adds to §14.1–14.10:
   simulator's bootstrap clusters the overlay). A topic where every node keeps only 3 neighbours loses messages; with 4
   nothing was lost, so browsers use 4.
 
-## 15. Headless hosts (#14, built; plan in PLAN-AGENTS.md)
+## 15. Headless hosts (#14, built)
 Programs use brumm without the app: a **bot** is a user identity whose only contact is its owner (a 1:1 log
 channel), an **agent** is a member of a group (agent room). Each has its own identity, so senders are attributed
 and a leaked profile exposes only its own chats. The protocol is unchanged: a bot is a normal user.
