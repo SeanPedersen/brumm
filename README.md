@@ -23,6 +23,38 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
   kicking with a fresh group key, optional shared history for newcomers. Messages spread peer-to-peer (iroh-gossip),
   members serve the group's log to each other, and Nostr relays carry what nobody online received.
 
+## Why brumm, compared to WhatsApp and Signal
+WhatsApp and Signal encrypt message content well. brumm's different bet is **less trust in whoever runs
+the infrastructure**, including metadata, not just content.
+
+| | WhatsApp | Signal | brumm |
+|---|---|---|---|
+| Account needs a phone number | Yes | Yes | **No** (24-word seed phrase) |
+| Central server required | Yes (Meta) | Yes (Signal Foundation) | **No own server.** Uses public iroh and Nostr infrastructure that anyone can replace |
+| Can be switched off or blocked by one operator | Yes | Yes | **Much harder.** There is no single operator to shut down or compel |
+| Social graph and metadata held by a company | Yes (Meta) | Minimal, but the server sees your number and when you connect | **No contact list on any server.** Relays see IPs and timing at most |
+| Open source | No | Yes | Yes |
+| End-to-end encryption | Yes (Signal protocol) | Yes (Signal protocol) | Yes (Olm double ratchet) |
+| Multi-device without a primary phone | Limited | Limited (phone-linked) | **Yes**, any device can link, remove or revoke others |
+| Groups without a server | No | No | **Yes**, up to 10 000 members, gossip + member-served logs |
+| Bots and agents as ordinary identities | Business API only | Unofficial | **Yes**, `brumm-cli` and the Python package, no approval needed |
+
+What that buys you: no phone number to leak, SIM-swap or hand over, no company that can build a
+social graph from your contacts, no single point of failure or legal pressure, and an identity you
+fully own and can restore from the seed phrase.
+
+**Where they are still ahead, honestly:**
+- brumm is **pre-release and unaudited**. Signal's protocol and apps have years of scrutiny. Don't
+  trust brumm with anything sensitive yet.
+- No native mobile apps (only desktop and a mobile-friendly web client), no push notifications,
+  no voice or video calls, no stickers.
+- The local database is **not encrypted at rest** yet.
+- Signal's sealed sender and mature abuse and spam handling are more refined. brumm exposes your IP
+  to the relays and, in direct connections, to your contacts.
+- Offline delivery depends on public Nostr relays, which give no delivery guarantee. Signal's
+  server holds messages reliably.
+- Finding people is manual (invite link or QR). There is no phone-book discovery, by design.
+
 ## Clients
 - **Desktop app** (Linux, macOS, Windows) built with [egui](https://github.com/emilk/egui).
 - **Web client**: the same egui UI in the browser, optimized for mobile (single-pane chat list / chat,
@@ -36,6 +68,24 @@ and when a device is offline its messages wait encrypted on **public Nostr relay
   Running on a server: [deploy/VPS.md](deploy/VPS.md).
 - **Python package** ([python/](python/README.md)): `brumm.Client("bot").send("me", "build finished")`,
   `iter_messages()`, asyncio, and a rate-limited `logging` handler. The wheel bundles `brumm-cli`.
+
+### Decentralization
+brumm has no server of its own and no account system, but it does lean on public infrastructure
+run by others. Where it is truly P2P and where it is not:
+
+| Part | Status | Details |
+|---|---|---|
+| Identity, keys, contacts, history | **Fully P2P** | Seed phrase and device keys exist only on your devices. Data lives in the local SQLite database. No registry, no phone number. |
+| Direct messages and files | **P2P** | End-to-end encrypted, sent device to device over iroh (QUIC, hole punching). Content is never visible to a third party. |
+| Groups | **P2P** | iroh-gossip per group, members serve the log to each other. No group server. |
+| Connection setup (iroh relays and DNS) | **Centralized default** | The default relays and address discovery are run by [n0](https://n0.computer). They help peers find each other and punch through NATs, and carry the traffic when no direct path works (always, in the browser). They only see encrypted traffic plus IP addresses and who connects to whom. They can be replaced or self-hosted, but brumm does not ship that yet. |
+| Offline delivery | **Public, replaceable** | Encrypted letters wait on public Nostr relays (`relay.damus.io`, `nos.lol`, `relay.primal.net`), from a hard-coded list. Anyone can run one, and one reachable relay is enough. Relays see timing, size and your IP, not sender, recipient or content. |
+| Web client hosting | **Centralized** | The browser build is static files from one host. Whoever serves it could ship you different code, so the desktop app is the more trustworthy client. Once loaded, the app does not depend on that host. |
+
+In short: messages and keys are decentralized and end-to-end encrypted, while peer discovery, NAT
+traversal fallback and offline delivery depend on third-party servers that can see metadata but not
+content. If those go down, devices that are online together and know each other's addresses still
+connect directly.
 
 Planned: offline invites and contact introductions, stickers, native mobile apps,
 Bluetooth/Wi‑Fi mesh. See [SPEC.md](SPEC.md) for the full design and milestones.
