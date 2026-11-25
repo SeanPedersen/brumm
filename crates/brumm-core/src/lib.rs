@@ -2,6 +2,8 @@
 //! messenger, with Olm end-to-end encryption per device pair. UIs talk to it only through [`api::Command`] / [`api::Event`] and [`node::run`].
 //! See SPEC.md for the protocol.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
 pub mod clock;
 pub mod conversation;

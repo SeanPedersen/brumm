@@ -1,6 +1,8 @@
 //! brumm app entry point: the desktop window natively, an egui canvas in the browser (#2).
 //! Each target's startup lives in its own module; everything below `app` is shared.
 
+#![deny(unsafe_code)]
+
 mod app;
 mod bridge;
 mod history;

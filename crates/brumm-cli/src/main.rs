@@ -1,5 +1,7 @@
 //! `brumm-cli`: see the library docs. Parses arguments, sets up logging and the runtime.
 
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 use clap::Parser;

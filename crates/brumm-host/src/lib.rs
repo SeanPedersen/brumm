@@ -7,6 +7,8 @@
 //! - [`policy`] + [`enforcer`]: auto-accept and lock rules (`policy.toml`) and their application.
 //! - [`dto`]: stable JSON views (ids as base32 strings) that do not change with core types.
 
+#![forbid(unsafe_code)]
+
 pub mod client;
 pub mod dto;
 pub mod enforcer;

@@ -6,6 +6,8 @@
 //! handles, which browsers only provide to dedicated workers. Each profile gets its own OPFS
 //! directory, so two tabs with different profiles do not contend for the same pool lock.
 
+#![forbid(unsafe_code)]
+
 #[cfg(target_family = "wasm")]
 mod worker;
 

@@ -5,6 +5,8 @@
 //! [`daemon::spawn`]) or, with `--no-daemon`, to a host inside this process
 //! ([`transport::Transport::local`]). Both run the same [`host::methods`].
 
+#![forbid(unsafe_code)]
+
 pub mod cli;
 pub mod commands;
 pub mod daemon;

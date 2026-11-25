@@ -512,7 +512,8 @@ fn prepare_generic(bytes: &[u8], max_edge: u32) -> Option<ChatImage> {
 
 /// glibc keeps a freed multi-megabyte image in the heap. Call this on the decode thread.
 pub(crate) fn release_freed_heap() {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[allow(unsafe_code, reason = "FFI call to glibc malloc_trim, no memory-safety preconditions")]
     unsafe {
         unsafe extern "C" {
             fn malloc_trim(pad: usize) -> i32;
