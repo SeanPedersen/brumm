@@ -69,7 +69,7 @@ fully own and can restore from the seed phrase.
 - **Python package** ([python/](python/README.md)): `brumm.Client("bot").send("me", "build finished")`,
   `iter_messages()`, asyncio, and a rate-limited `logging` handler. The wheel bundles `brumm-cli`.
 
-### Decentralization
+## Decentralization
 brumm has no server of its own and no account system, but it does lean on public infrastructure
 run by others. Where it is truly P2P and where it is not:
 
