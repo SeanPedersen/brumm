@@ -2,8 +2,9 @@
 resolver = "3"
 members = ["crates/brumm-core", "crates/brumm-host", "crates/brumm-cli", "crates/brumm-app", "crates/brumm-worker"]
 # Plain `cargo run` / `cargo test` stay on the native app; brumm-worker is the browser-only
-# core thread and is built by `trunk` (issue #2).
-default-members = ["crates/brumm-core", "crates/brumm-host", "crates/brumm-cli", "crates/brumm-app"]
+# core thread and is built by `trunk` (issue #2). brumm-cli is left out so `cargo run` has a
+# single binary to pick; build and test it with `-p brumm-cli`.
+default-members = ["crates/brumm-core", "crates/brumm-host", "crates/brumm-app"]
 
 [workspace.package]
 version = "0.1.0"

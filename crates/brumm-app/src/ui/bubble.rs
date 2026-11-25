@@ -2,7 +2,8 @@
 //! time + delivery marker sharing the last line, plus the selection chrome (highlight, check mark)
 //! and the per-message interaction (context menu, click-to-select). Web and mail links open with
 //! the system handler. A note longer than a few kilobytes keeps an estimated height and shapes
-//! only the lines inside the viewport.
+//! only the lines inside the viewport. Text with markdown is laid out by [`markdown`]; a windowed
+//! note stays plain.
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, Sense, Str
 use crate::{
     state::LoadedAttachment,
     touch,
-    ui::{emoji, files, icons, links::TextLink, theme, time_fmt},
+    ui::{emoji, files, icons, links::TextLink, markdown, theme, time_fmt},
 };
 
 const REACTION_EMOJI_SIZE: f32 = 22.0;
@@ -61,7 +62,10 @@ const CHIP_EMOJI_SIZE: f32 = 15.0;
 const CHIP_COUNT_SIZE: f32 = 12.0;
 const META_PILL_PADDING: Vec2 = egui::vec2(6.0, 2.0);
 /// A longer body is never shaped in full. Only the lines that meet the viewport become a galley.
-const WINDOWED_TEXT_BYTES: usize = 8 * 1024;
+pub(crate) const WINDOWED_TEXT_BYTES: usize = 8 * 1024;
+/// Markdown is laid out in full (one galley per block, so off-screen blocks are culled). Only
+/// a plain note, or one over the send limit, is windowed.
+const MARKDOWN_MAX_BYTES: usize = brumm_core::wire::MAX_TEXT_BYTES;
 /// Row height of `FontId::proportional(15)` with the app font. The windowed note uses this
 /// instead of a galley, so it has to match or the visible lines drift.
 const ESTIMATE_LINE_HEIGHT: f32 = 17.0;
@@ -105,6 +109,7 @@ enum Content<'a> {
         galley: Arc<Galley>,
         links: Vec<TextLink>,
     },
+    Markdown(markdown::Rendered),
     Image {
         size: Vec2,
         loaded: Option<&'a LoadedAttachment>,
@@ -207,10 +212,15 @@ pub fn show(ui: &mut egui::Ui, message: &MessageView, inputs: &Inputs) -> Output
     };
     let meta = layout_meta(ui, message, meta_color);
 
-    // A long note keeps an estimated height and shapes only the lines inside the clip.
+    let doc = (message.attachment.is_none() && message.text.len() <= MARKDOWN_MAX_BYTES)
+        .then(|| markdown::doc(ui.ctx(), &message.text))
+        .flatten();
+    // A long plain note keeps an estimated height and shapes only the lines inside the clip.
     // Falling back here covers a row whose line index was not cached yet.
     let generated;
-    let line_starts = if message.attachment.is_none()
+    let line_starts = if doc.is_some() {
+        &[]
+    } else if message.attachment.is_none()
         && inputs.line_starts.is_empty()
         && message.text.len() > WINDOWED_TEXT_BYTES
     {
@@ -223,6 +233,7 @@ pub fn show(ui: &mut egui::Ui, message: &MessageView, inputs: &Inputs) -> Output
         Some(measure_content(
             ui,
             message,
+            doc.as_deref(),
             inputs.attachment,
             max_inner_width,
         ))
@@ -404,11 +415,15 @@ fn enlarge_for_touch(ui: &mut egui::Ui) {
 fn measure_content<'a>(
     ui: &egui::Ui,
     message: &MessageView,
+    doc: Option<&markdown::Doc>,
     loaded: Option<&'a LoadedAttachment>,
     max_inner_width: f32,
 ) -> Content<'a> {
     let Some(attachment) = message.attachment.as_ref() else {
         note_shaped(message.text.len());
+        if let Some(doc) = doc {
+            return Content::Markdown(markdown::layout(ui, doc, BODY_FONT_SIZE, max_inner_width));
+        }
         let links = crate::ui::links::find_links(&message.text);
         let galley = layout_body(ui, &message.text, &links, max_inner_width);
         return Content::Text { galley, links };
@@ -451,6 +466,10 @@ fn body_block(content: &Content) -> Block {
         Content::Text { galley, .. } => Block {
             size: galley.size(),
             last_row_width: galley.rows.last().map_or(0.0, |row| row.rect().width()),
+        },
+        Content::Markdown(rendered) => Block {
+            size: rendered.size,
+            last_row_width: rendered.last_row_width,
         },
         Content::Image { size, .. } => Block {
             size: *size,
@@ -592,6 +611,27 @@ fn link_hit(ui: &egui::Ui, galley: &Galley, origin: Pos2, links: &[TextLink]) ->
         link,
         #[cfg(test)]
         link_rects: link_screen_rects(galley, origin, links),
+    }
+}
+
+/// [`link_hit`] over every text of a markdown body.
+fn markdown_link_hit(ui: &egui::Ui, rendered: &markdown::Rendered, origin: Pos2) -> PaintHit {
+    let pointer = ui.input(|input| input.pointer.latest_pos());
+    let link = pointer.and_then(|pointer| {
+        rendered.texts.iter().find_map(|text| {
+            link_under(&text.galley, origin + text.offset, pointer, &text.links)
+                .map(|link| link.url.clone())
+        })
+    });
+    PaintHit {
+        card: None,
+        link,
+        #[cfg(test)]
+        link_rects: rendered
+            .texts
+            .iter()
+            .flat_map(|text| link_screen_rects(&text.galley, origin + text.offset, &text.links))
+            .collect(),
     }
 }
 
@@ -756,6 +796,11 @@ fn paint_content(ui: &egui::Ui, bubble: Rect, content: Content, padding: Vec2) -
             let origin = bubble.min + padding;
             ui.painter().galley(origin, galley.clone(), theme::TEXT);
             link_hit(ui, &galley, origin, &links)
+        }
+        Content::Markdown(rendered) => {
+            let origin = bubble.min + padding;
+            rendered.paint(ui.painter(), origin);
+            markdown_link_hit(ui, &rendered, origin)
         }
         Content::Image { size, loaded, uri } => {
             let rect = Rect::from_min_size(bubble.min + padding, size);

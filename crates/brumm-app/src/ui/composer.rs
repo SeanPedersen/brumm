@@ -1,12 +1,20 @@
 //! Message composer: attach button, a one-line pill that grows with its content (Shift+Enter adds
 //! a line), an emoji picker and a round send button. Enter sends too, except on touch devices.
+//! A draft over the text limit is kept and not sent; a notice above the pill says why.
 
-use brumm_core::api::{Command, ConversationId};
+use brumm_core::{
+    api::{Command, ConversationId},
+    wire::MAX_TEXT_BYTES,
+};
 use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::{
     touch,
-    ui::{emoji, files::FileDialogs, icons, theme},
+    ui::{
+        emoji,
+        files::{FileDialogs, format_size},
+        icons, theme,
+    },
 };
 
 const PILL_MIN_HEIGHT: f32 = 44.0;
@@ -48,6 +56,19 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         ui.memory_mut(|memory| memory.request_focus(input_id));
     }
 
+    let text_len = draft.trim().len();
+    let sendable = is_sendable(text_len);
+    if text_len > MAX_TEXT_BYTES {
+        ui.label(
+            egui::RichText::new(format!(
+                "Too long to send: {} of {}. Send it as a file instead.",
+                format_size(text_len),
+                format_size(MAX_TEXT_BYTES)
+            ))
+            .small()
+            .color(theme::DANGER),
+        );
+    }
     let mut send_clicked = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = ATTACH_GAP;
@@ -57,12 +78,12 @@ pub fn show(ui: &mut egui::Ui, composer: Composer, commands: &mut Vec<Command>) 
         // Right-to-left: the send button takes its space first, the pill fills the rest. A
         // hand-computed width would overflow and fight the sidebar resize.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            send_clicked = send_button(ui, input_id, !draft.trim().is_empty());
+            send_clicked = send_button(ui, input_id, sendable);
             pill(ui, input_id, draft);
         });
     });
 
-    if (enter_pressed || send_clicked) && !draft.trim().is_empty() {
+    if (enter_pressed || send_clicked) && sendable {
         commands.push(Command::SendText {
             conversation,
             text: draft.trim().to_owned(),
@@ -176,6 +197,11 @@ fn attach_button(ui: &mut egui::Ui) -> bool {
 
 /// Round send button: accent-filled once there is text to send. Clicking keeps the input
 /// focused, so the on-screen keyboard stays open on phones.
+/// The core refuses empty or over-limit text; checking first keeps the draft instead of losing it.
+fn is_sendable(trimmed_len: usize) -> bool {
+    trimmed_len > 0 && trimmed_len <= MAX_TEXT_BYTES
+}
+
 fn send_button(ui: &mut egui::Ui, input_id: egui::Id, active: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SEND_BUTTON_SIZE), Sense::click());
     touch::send_button_at(ui.ctx(), rect);
@@ -203,6 +229,13 @@ fn send_button(ui: &mut egui::Ui, input_id: egui::Id, active: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn over_limit_or_empty_text_is_not_sendable() {
+        assert!(!is_sendable(0));
+        assert!(is_sendable(MAX_TEXT_BYTES));
+        assert!(!is_sendable(MAX_TEXT_BYTES + 1));
+    }
 
     /// Height of the composer after a few frames for the given draft.
     fn composer_height(draft: &str) -> f32 {

@@ -18,6 +18,7 @@ mod icons;
 mod links;
 pub mod logout;
 pub mod main_screen;
+pub mod markdown;
 pub mod narrow;
 pub mod new_group;
 pub mod onboarding;

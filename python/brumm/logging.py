@@ -18,7 +18,7 @@ from .client import Client
 
 DEFAULT_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_PER_MINUTE = 10
-#: Well below the 16 KiB message limit, so one message stays readable on a phone.
+#: Well below the 56 KiB message limit, so one message stays readable on a phone.
 DEFAULT_MAX_CHARS = 4000
 DEFAULT_QUEUE_RECORDS = 10_000
 SECONDS_PER_MINUTE = 60.0

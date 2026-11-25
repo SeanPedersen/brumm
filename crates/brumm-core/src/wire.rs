@@ -15,9 +15,12 @@ use crate::{
 pub const ALPN: &[u8] = b"brumm/3";
 /// Largest sealed frame. Sized for a maximal file plus Olm and framing overhead.
 pub const MAX_FRAME_BYTES: usize = 20 * 1024 * 1024;
-pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Largest text body. A whole Markdown document fits, and the encoded group unit stays under
+/// `group::message::MAX_WIRE_BYTES` (64 KiB). The mailbox carries it to an offline device in
+/// letter parts. Receivers never check it, so raising it stays wire compatible.
+pub const MAX_TEXT_BYTES: usize = 56 * 1024;
 /// Files travel inline in one sealed envelope (larger transfers wait for iroh-blobs, M4).
-/// Anything above the mailbox letter limit is only delivered while both devices are online.
+/// Anything above `mailbox::MAX_MAILBOX_BYTES` (1.5 MiB) is only delivered while both are online.
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_FILE_NAME_CHARS: usize = 255;
 /// Small enough to also fit into a Nostr mailbox letter.

@@ -11,6 +11,11 @@
 //!
 //! Relays therefore see neither sender nor recipient identity, only an inbox key and timing.
 //!
+//! A payload larger than one event ([`MAX_LETTER_BYTES`]) goes as up to [`parts::MAX_PARTS`]
+//! **letter parts** under the same tag (`part:` + base64 of a [`parts::LetterPart`]); the receiver
+//! reassembles and checks them before handling the letter, so a long text or a photo still
+//! reaches an offline device. Each part is sealed to a fresh key like any letter.
+//!
 //! **Group letters** (SPEC.md §14.4, item 3) carry one encoded group unit for every member at
 //! once: the `p` tag is a key derived from the epoch secret ([`group_tag_keys`]), so it changes
 //! with every epoch and relays cannot link epochs; members subscribe to the tags of the epochs
@@ -24,7 +29,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use data_encoding::BASE64;
 use iroh::EndpointId;
 use nostr::nips::nip44;
@@ -36,6 +41,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{crypto::Sealed, wire};
+
+mod parts;
+
+use parts::{Assembler, LetterPart};
 
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -50,8 +59,15 @@ const GROUP_TAG_CONTEXT: &str = "brumm 2026 group letter tag v1";
 const GROUP_SUBSCRIPTION_ID: &str = "brumm-groups";
 const LOG_SUBSCRIPTION_ID: &str = "brumm-group-logs";
 const LETTER_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// Relays commonly cap events around 64–128 KiB; base64 + NIP-44 inflate roughly 1.8×.
-const MAX_LETTER_SEALED_BYTES: usize = 32 * 1024;
+/// Payload of one letter. Base64, NIP-44 padding and base64 again make the event about 2.2×
+/// larger (≈ 55 KB here), under the 64 KiB event cap of common relays (strfry's default).
+const MAX_LETTER_BYTES: usize = 24 * 1024 + 512;
+/// Slice of a larger payload per part; the part's own framing stays under [`MAX_LETTER_BYTES`].
+const PART_BYTES: usize = 24 * 1024;
+/// Marks a part's plaintext. `:` is not in the base64 alphabet, so a whole letter never starts so.
+const PART_PREFIX: &str = "part:";
+/// Largest payload the mailbox carries (direct letter or group unit); larger only goes direct.
+pub const MAX_MAILBOX_BYTES: usize = PART_BYTES * parts::MAX_PARTS;
 const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// Re-fetch a little before the last seen letter to tolerate relay clock skew.
 const SINCE_MARGIN_SECS: u64 = 10 * 60;
@@ -177,6 +193,10 @@ impl Mailbox {
         let chunk_tags = log_tags.clone();
         n0_future::task::spawn(async move {
             use nostr_sdk::prelude::StreamExt;
+            // One per channel: a part only completes a payload of its own kind.
+            let mut inbox_parts = Assembler::default();
+            let mut group_parts = Assembler::default();
+            let mut log_parts = Assembler::default();
             while let Some(notification) = notifications.next().await {
                 let ClientNotification::Event { event, .. } = notification else {
                     continue;
@@ -185,22 +205,34 @@ impl Mailbox {
                     .map(|tag| (tag, true))
                     .or_else(|| group_tag_of(&tags, &event).map(|tag| (tag, false)));
                 if let Some((tag, log_chunk)) = tag {
-                    match open_group_letter(&tag, &event, log_chunk) {
-                        Ok(letter) => {
+                    let assembler = if log_chunk {
+                        &mut log_parts
+                    } else {
+                        &mut group_parts
+                    };
+                    match open_payload(&tag, &event, assembler) {
+                        Ok(Some((unit, posted_at_secs))) => {
+                            let letter = GroupLetter {
+                                unit,
+                                posted_at_secs,
+                                log_chunk,
+                            };
                             if group_letters.send(letter).await.is_err() {
                                 return;
                             }
                         }
+                        Ok(None) => {}
                         Err(err) => tracing::debug!(?err, "ignoring unreadable group letter"),
                     }
                     continue;
                 }
-                match open_letter(&inbox, &event) {
-                    Ok(delivery) => {
+                match open_letter(&inbox, &event, &mut inbox_parts) {
+                    Ok(Some(delivery)) => {
                         if deliveries.send(delivery).await.is_err() {
                             return;
                         }
                     }
+                    Ok(None) => {}
                     Err(err) => tracing::debug!(?err, "ignoring unreadable letter"),
                 }
             }
@@ -263,11 +295,7 @@ impl Mailbox {
 
     /// Posts one group unit under `tag` to our relays and `extra_relays` (other members').
     pub async fn post_group(&self, tag: &Keys, unit: &[u8], extra_relays: &[String]) -> Result<()> {
-        ensure!(
-            unit.len() <= MAX_LETTER_SEALED_BYTES,
-            "too large for a group letter"
-        );
-        let event = seal_group_letter(tag, unit)?;
+        let events = seal_payload(tag.public_key(), unit).context("group letter")?;
         let mut targets: Vec<&str> = self.relays.iter().map(String::as_str).collect();
         for relay in extra_relays {
             if !targets.contains(&relay.as_str()) {
@@ -281,20 +309,27 @@ impl Mailbox {
                 .with_context(|| format!("add relay {relay}"))?;
         }
         self.client.connect().and_wait(CONNECT_WAIT).await;
-        let output = self.client.send_event(&event).to(targets).await?;
-        if output.success.is_empty() {
-            bail!("no relay accepted the group letter: {:?}", output.failed);
+        self.send_all(&events, &targets).await
+    }
+
+    /// Sends every event (a letter or all its parts); each must reach at least one relay.
+    async fn send_all(&self, events: &[Event], targets: &[&str]) -> Result<()> {
+        for event in events {
+            let output = self
+                .client
+                .send_event(event)
+                .to(targets.iter().copied())
+                .await?;
+            if output.success.is_empty() {
+                bail!("no relay accepted the letter: {:?}", output.failed);
+            }
         }
         Ok(())
     }
 
     /// Posts `sealed` to the recipient's inbox; succeeds if at least one relay accepted it.
     pub async fn post(&self, to: &MailboxAddress, from: EndpointId, sealed: Sealed) -> Result<()> {
-        ensure!(
-            sealed.ciphertext.len() <= MAX_LETTER_SEALED_BYTES,
-            "too large for a mailbox letter"
-        );
-        let event = seal_letter(
+        let events = seal_letter(
             to,
             Letter {
                 sender: from,
@@ -308,15 +343,8 @@ impl Mailbox {
                 .with_context(|| format!("add relay {relay}"))?;
         }
         self.client.connect().and_wait(CONNECT_WAIT).await;
-        let output = self
-            .client
-            .send_event(&event)
-            .to(to.relays.iter().map(String::as_str))
-            .await?;
-        if output.success.is_empty() {
-            bail!("no relay accepted the letter: {:?}", output.failed);
-        }
-        Ok(())
+        let targets: Vec<&str> = to.relays.iter().map(String::as_str).collect();
+        self.send_all(&events, &targets).await
     }
 
     pub async fn shutdown(&self) {
@@ -324,16 +352,32 @@ impl Mailbox {
     }
 }
 
-fn seal_letter(to: &MailboxAddress, letter: Letter) -> Result<Event> {
+fn seal_letter(to: &MailboxAddress, letter: Letter) -> Result<Vec<Event>> {
     let recipient = PublicKey::from_slice(&to.inbox_key)?;
+    seal_payload(recipient, &wire::encode(&letter))
+}
+
+/// One letter for `payload`, or its parts when it is larger than one event.
+fn seal_payload(recipient: PublicKey, payload: &[u8]) -> Result<Vec<Event>> {
+    if payload.len() <= MAX_LETTER_BYTES {
+        return Ok(vec![seal_event(recipient, BASE64.encode(payload))?]);
+    }
+    let parts = parts::split(payload, PART_BYTES).with_context(|| {
+        format!(
+            "{} bytes is too large for the mailbox (limit {MAX_MAILBOX_BYTES})",
+            payload.len()
+        )
+    })?;
+    parts
+        .iter()
+        .map(|part| seal_event(recipient, format!("{PART_PREFIX}{}", BASE64.encode(&wire::encode(part)))))
+        .collect()
+}
+
+/// A gift wrap of `plaintext` to `recipient`, signed by a fresh key.
+fn seal_event(recipient: PublicKey, plaintext: String) -> Result<Event> {
     let ephemeral = Keys::generate();
-    let plaintext = BASE64.encode(&wire::encode(&letter));
-    let content = nip44::encrypt(
-        ephemeral.secret_key(),
-        &recipient,
-        plaintext,
-        nip44::Version::V2,
-    )?;
+    let content = nip44::encrypt(ephemeral.secret_key(), &recipient, plaintext, nip44::Version::V2)?;
     let expires = Timestamp::now() + LETTER_TTL;
     Ok(EventBuilder::new(Kind::GiftWrap, content)
         .tags([Tag::public_key(recipient), Tag::expiration(expires)])
@@ -348,44 +392,48 @@ fn group_tag_of(tags: &GroupTags, event: &Event) -> Option<Keys> {
         .find_map(|public| tags.get(&public).cloned())
 }
 
-fn seal_group_letter(tag: &Keys, unit: &[u8]) -> Result<Event> {
-    let ephemeral = Keys::generate();
-    let content = nip44::encrypt(
-        ephemeral.secret_key(),
-        &tag.public_key(),
-        BASE64.encode(unit),
-        nip44::Version::V2,
-    )?;
-    let expires = Timestamp::now() + LETTER_TTL;
-    Ok(EventBuilder::new(Kind::GiftWrap, content)
-        .tags([Tag::public_key(tag.public_key()), Tag::expiration(expires)])
-        .finalize(&ephemeral)?)
+/// The payload of a letter and its post time; `None` while it is a part of an unfinished one.
+fn open_payload(
+    keys: &Keys,
+    event: &Event,
+    assembler: &mut Assembler,
+) -> Result<Option<(Vec<u8>, u64)>> {
+    event.verify()?;
+    let plaintext = nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)?;
+    let posted_at_secs = event.created_at.as_secs();
+    let Some(encoded) = plaintext.strip_prefix(PART_PREFIX) else {
+        return Ok(Some((BASE64.decode(plaintext.as_bytes())?, posted_at_secs)));
+    };
+    let part: LetterPart = wire::decode(&BASE64.decode(encoded.as_bytes())?)?;
+    Ok(assembler.insert(part, PART_BYTES, posted_at_secs))
 }
 
-fn open_group_letter(tag: &Keys, event: &Event, log_chunk: bool) -> Result<GroupLetter> {
-    event.verify()?;
-    let plaintext = nip44::decrypt(tag.secret_key(), &event.pubkey, &event.content)?;
-    Ok(GroupLetter {
-        unit: BASE64.decode(plaintext.as_bytes())?,
-        posted_at_secs: event.created_at.as_secs(),
-        log_chunk,
-    })
-}
-
-fn open_letter(inbox: &Keys, event: &Event) -> Result<MailboxDelivery> {
-    event.verify()?;
-    let plaintext = nip44::decrypt(inbox.secret_key(), &event.pubkey, &event.content)?;
-    let letter: Letter = wire::decode(&BASE64.decode(plaintext.as_bytes())?)?;
-    Ok(MailboxDelivery {
+fn open_letter(
+    inbox: &Keys,
+    event: &Event,
+    assembler: &mut Assembler,
+) -> Result<Option<MailboxDelivery>> {
+    let Some((payload, posted_at_secs)) = open_payload(inbox, event, assembler)? else {
+        return Ok(None);
+    };
+    let letter: Letter = wire::decode(&payload)?;
+    Ok(Some(MailboxDelivery {
         from: letter.sender,
         sealed: letter.sealed,
-        posted_at_secs: event.created_at.as_secs(),
-    })
+        posted_at_secs,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed(len: usize) -> Sealed {
+        Sealed {
+            message_type: 1,
+            ciphertext: (0..len).map(|index| (index % 251) as u8).collect(),
+        }
+    }
 
     #[test]
     fn letter_roundtrip_and_privacy() {
@@ -397,7 +445,7 @@ mod tests {
             message_type: 1,
             ciphertext: b"olm-ciphertext".to_vec(),
         };
-        let event = seal_letter(
+        let events = seal_letter(
             &to,
             Letter {
                 sender,
@@ -405,25 +453,90 @@ mod tests {
             },
         )
         .unwrap();
+        let [event] = events.as_slice() else {
+            panic!("a small letter is one event");
+        };
 
         assert!(!event.content.contains("olm-ciphertext"));
-        assert_ne!(
-            event.pubkey.to_bytes(),
-            to.inbox_key,
-            "signed by an ephemeral key"
-        );
-        let opened = open_letter(&inbox_keys(&device_secret), &event).unwrap();
+        assert_ne!(event.pubkey.to_bytes(), to.inbox_key, "signed by an ephemeral key");
+        let opened = open_letter(&inbox_keys(&device_secret), event, &mut Assembler::default())
+            .unwrap()
+            .expect("whole letter");
         assert_eq!((opened.from, opened.sealed), (sender, sealed));
-        assert!(open_letter(&inbox_keys(&[8; 32]), &event).is_err());
+        assert!(open_letter(&inbox_keys(&[8; 32]), event, &mut Assembler::default()).is_err());
+    }
+
+    #[test]
+    fn a_large_letter_goes_in_parts_and_reassembles_in_any_order() {
+        let device_secret = [9; 32];
+        let to = address(&device_secret, default_relays());
+        let sender = iroh::SecretKey::generate().public();
+        let large = sealed(100 * 1024);
+        let mut events = seal_letter(
+            &to,
+            Letter {
+                sender,
+                sealed: large.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 5);
+        let signers: std::collections::HashSet<_> = events.iter().map(|event| event.pubkey).collect();
+        assert_eq!(signers.len(), events.len(), "every part has its own signing key");
+        events.rotate_left(2);
+        let inbox = inbox_keys(&device_secret);
+        let mut assembler = Assembler::default();
+        let mut opened = Vec::new();
+        for event in &events {
+            if let Some(delivery) = open_letter(&inbox, event, &mut assembler).unwrap() {
+                opened.push(delivery);
+            }
+        }
+        let [delivery] = opened.as_slice() else {
+            panic!("exactly one letter after the last part, got {}", opened.len());
+        };
+        assert_eq!((delivery.from, &delivery.sealed), (sender, &large));
+    }
+
+    #[test]
+    fn every_event_fits_a_strict_relay() {
+        const STRICT_RELAY_EVENT_BYTES: usize = 64 * 1024;
+        let to = address(&[2; 32], default_relays());
+        let sender = iroh::SecretKey::generate().public();
+        for len in [MAX_LETTER_BYTES - 100, 200 * 1024] {
+            let letter = Letter {
+                sender,
+                sealed: sealed(len),
+            };
+            for event in seal_letter(&to, letter).unwrap() {
+                let size = event.as_json().len();
+                assert!(size <= STRICT_RELAY_EVENT_BYTES, "{len}: event of {size} bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn letters_over_the_mailbox_limit_are_refused() {
+        let to = address(&[1; 32], default_relays());
+        let sender = iroh::SecretKey::generate().public();
+        let letter = Letter {
+            sender,
+            sealed: sealed(MAX_MAILBOX_BYTES + 1),
+        };
+        assert!(seal_letter(&to, letter).is_err());
     }
 
     #[test]
     fn group_letters_open_with_the_tag_only() {
         let tag = group_tag_keys(&[3; 32]);
-        let event = seal_group_letter(&tag, b"unit").unwrap();
+        let events = seal_payload(tag.public_key(), b"unit").unwrap();
+        let [event] = events.as_slice() else {
+            panic!("one event");
+        };
         assert!(event.tags.public_keys().any(|key| key == tag.public_key()));
-        assert_eq!(open_group_letter(&tag, &event, false).unwrap().unit, b"unit");
-        assert!(open_group_letter(&group_tag_keys(&[4; 32]), &event, false).is_err());
+        let opened = open_payload(&tag, event, &mut Assembler::default()).unwrap();
+        assert_eq!(opened.map(|(unit, _)| unit), Some(b"unit".to_vec()));
+        assert!(open_payload(&group_tag_keys(&[4; 32]), event, &mut Assembler::default()).is_err());
     }
 
     #[test]

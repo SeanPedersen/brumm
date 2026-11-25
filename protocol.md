@@ -62,7 +62,7 @@ deleted) is a no-op that answers the stored message's status. `wait`: `none` ans
 stored; `sent` (default) once it reached the recipient or a mailbox relay; `delivered` once the recipient
 confirmed it. Groups tick `sent` only. A wait that runs out answers `TIMEOUT` with `data: {id, room, status}`:
 the message is stored and keeps being retried, so wait again or resend with the same id.
-Text is limited to 16 KiB and files to 10 MiB (`brumm-cli send` sends longer text as a file or `--split`).
+Text is limited to 56 KiB and files to 10 MiB (`brumm-cli send` sends longer text as a file or `--split`). Offline readers get anything up to 1.5 MiB through the Nostr mailbox (in parts); larger files only arrive while both are online.
 
 **Reading.** Messages are numbered in **arrival order** on this device (not send time), and `cursor` is the
 arrival number of the last message returned. `since: cursor` returns what arrived after it, so a message that

@@ -41,6 +41,32 @@ async fn never_online_together() {
     alice.delivered(sent).await;
 }
 
+/// A text far over one relay event goes as letter parts and is reassembled by the offline reader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_text_reaches_an_offline_contact_in_parts() {
+    let (_relay, relays) = local_relay().await;
+    let mut alice = TestNode::spawn_with("parts-alice", relays.clone());
+    let mut bob = TestNode::spawn_with("parts-bob", relays);
+    alice.create_identity("Alice").await;
+    let bob_key = bob.create_identity("Bob").await;
+    let link = alice.create_invite().await;
+    bob.send(Command::AcceptInvite { link });
+    bob.contact_added().await;
+    alice.contact_added().await;
+
+    let bob_offline = bob.stop().await;
+    let line = "## Route\nA line of a long markdown document about a route.\n\n";
+    let long = line.repeat(50 * 1024 / line.len()).trim_end().to_owned();
+    assert!(long.len() > 40 * 1024 && long.len() <= brumm_core::wire::MAX_TEXT_BYTES);
+    let sent = alice.send_text(bob_key, &long).await;
+    alice.status(sent, DeliveryStatus::Sent).await;
+    let _alice_offline = alice.stop().await;
+
+    let mut bob = bob_offline.start();
+    bob.ready().await;
+    assert_eq!(bob.received_text().await, long);
+}
+
 /// Notes written on one device reach a linked device that was offline, through the relay alone:
 /// the writer is gone again before the other device starts (desktop → phone, both directions).
 #[tokio::test(flavor = "multi_thread")]

@@ -1860,6 +1860,61 @@ mod tests {
     }
 
     #[test]
+    fn long_markdown_note_renders_as_markdown_not_windowed() {
+        let mut harness = Harness::new();
+        let section = "## Route\n\nSome **bold** words and a paragraph of text that wraps.\n\n";
+        // The list sticks to the newest content, so the link sits at the end of the note.
+        let note = format!(
+            "{}[end](https://example.com/end)",
+            section.repeat(50 * 1024 / section.len())
+        );
+        assert!(
+            note.len() > bubble::WINDOWED_TEXT_BYTES && note.len() <= brumm_core::wire::MAX_TEXT_BYTES
+        );
+        let messages = harness.state.conversations.get_mut(&CONTACT).expect("conversation");
+        messages.truncate(1);
+        messages[0].text = note;
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        let link = harness.chat.link_rects.first().copied().expect("markdown link painted");
+        // Only the label is painted; the plain (windowed) path would show the whole URL.
+        assert!(link.width() < 40.0, "{link:?}");
+        let at = link.center();
+        harness.press(at, egui::Modifiers::NONE);
+        harness.release(at, egui::Modifiers::NONE);
+        assert_eq!(harness.opened_urls, vec!["https://example.com/end".to_owned()]);
+    }
+
+    #[test]
+    fn clicking_a_markdown_link_opens_its_target() {
+        let mut harness = Harness::new();
+        harness
+            .state
+            .conversations
+            .get_mut(&CONTACT)
+            .expect("conversation")[2]
+            .text = "**Docs:**\n\n- read [the guide](https://example.com/guide)".into();
+        for _ in 0..4 {
+            harness.frame(vec![], egui::Modifiers::NONE);
+        }
+        let link = harness
+            .chat
+            .link_rects
+            .first()
+            .copied()
+            .expect("painted link");
+        let at = link.center();
+        harness.press(at, egui::Modifiers::NONE);
+        harness.release(at, egui::Modifiers::NONE);
+        assert_eq!(
+            harness.opened_urls,
+            vec!["https://example.com/guide".to_owned()]
+        );
+        assert!(harness.selected().is_empty());
+    }
+
+    #[test]
     fn wheel_notches_in_a_burst_scroll_further() {
         let mut wheel = WheelAccel::default();
         update_wheel(&mut wheel, 1.0, 0.016, &[(40.0, true)]);

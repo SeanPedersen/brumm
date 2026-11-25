@@ -61,7 +61,9 @@ impl Default for ColorEmojiFont {
 
 impl FontProvider for ColorEmojiFont {
     fn fonts_for_family(&self, family: &FontFamily) -> Vec<FontInsert> {
-        if !matches!(family, FontFamily::Proportional | FontFamily::Monospace) {
+        let is_text_family = matches!(family, FontFamily::Proportional | FontFamily::Monospace)
+            || crate::ui::markdown::is_bold_family(family);
+        if !is_text_family {
             return Vec::new();
         }
         let Some(data) = self.data() else {

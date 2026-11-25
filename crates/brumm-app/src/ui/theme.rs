@@ -58,6 +58,8 @@ pub const SCROLLBAR_HOVER_WIDTH: f32 = 12.0;
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
+    // Before any other font provider: the color emoji provider appends to the bold family too.
+    crate::ui::markdown::install_fonts(ctx);
     ctx.global_style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(14.0, 7.0);

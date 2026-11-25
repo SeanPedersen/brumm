@@ -26,8 +26,10 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   → onboarding. Same path on desktop and in the browser (OPFS). Commands are refused while logging out.
 - **M3 mailbox done:** offline delivery via **public Nostr relays** (no own server). Unreachable
   device → the outbox ciphertext is posted once as a NIP-44 letter to its inbox key → status Sent ✔ →
-  the recipient answers with `Payload::Receipt` → Delivered ✔✔.
-- **Rich messages done:** inline files (`Body::File`, ≤ 10 MiB, one sealed envelope; > mailbox letter limit
+  the recipient answers with `Payload::Receipt` → Delivered ✔✔. A payload over one event (24.5 KiB, events must stay
+  < 64 KiB) goes as up to 64 letter parts (`mailbox/parts.rs`: split + bounded reassembly, blake3-checked), so text and
+  files up to `MAX_MAILBOX_BYTES` (1.5 MiB) reach offline devices; group letters use the same parts.
+- **Rich messages done:** inline files (`Body::File`, ≤ 10 MiB, one sealed envelope; > `MAX_MAILBOX_BYTES`
   is only delivered while both are online), "delete for everyone" (`Payload::Delete` / own-device `DeleteSync`),
   profile photos (`Payload::Avatar`, ≤ 24 KiB, stored in the `avatars` table, schema v5 upgrades v4 in place),
   emoji reactions (`Payload::Reaction` / own-device `ReactionSync`, one per user and message, last write wins by
@@ -142,6 +144,13 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   in a well-known path) is installed after the text fonts and before discovered fallbacks.
   Sans fonts that also contain emoji outlines (DejaVu Sans, Noto Sans Symbols 2) would otherwise
   paint those codepoints grey. Letters and digits stay with the text font.
+- **Markdown** in every text message (always on, no toggle): CommonMark + GFM tables, strikethrough, task lists
+  (`ui/markdown/`: `parse.rs` pure pulldown-cmark → flat `Doc` of blocks with styled runs; `layout.rs` → galleys +
+  decorations; `fonts.rs` bundles Ubuntu Medium as the `bold` family, since egui ships only Ubuntu Light). Markers are hidden,
+  Copy copies the raw text. Messenger rules: a single newline is a line break, raw HTML shows as typed, images are never fetched
+  (alt text links to the URL). A message that parses to one unstyled paragraph equal to its source keeps the plain path; the parse
+  is cached per frame (`egui::cache::FrameCache`). Markdown is laid out in full up to `MAX_TEXT_BYTES` (56 KiB, raised from 16; receivers never check it, a group unit stays < 64 KiB, the mailbox sends it in parts); only plain notes over `WINDOWED_TEXT_BYTES` (8 KiB) are windowed. The composer keeps an over-limit draft and says why instead of sending it. Chat-list
+  previews, search snippets and notifications still show the raw text.
 - **Links:** `http`, `https`, `www.` and `mailto` in a message open with the system handler on click.
   A long note only scans the lines on screen. A single precise click does not select the message.
 - **In-chat search:** the magnifying glass at the right of the chat header (also Ctrl+F) switches the
@@ -193,6 +202,7 @@ crates/brumm-core/        no UI; everything async/network/storage
                           write-through persistence
   src/link.rs             LinkTicket (brumm://link/) + LinkBundle
   src/mailbox.rs          Nostr mailbox: inbox keys, letters (kind 1059 + NIP-44), post/subscribe
+  src/mailbox/parts.rs    letter parts for payloads over one event: split, bounded reassembly (pure)
   src/invite.rs           Invite ticket <-> brumm://invite/<base32(postcard)>
   src/wire.rs             ALPN brumm/3, Frame / Envelope / Payload / Reply, URI + history chunking
   src/transport.rs        iroh Endpoint + Router (presets::N0), conn cache, InboundHandler
@@ -244,6 +254,7 @@ crates/brumm-app/         eframe binary `brumm` (desktop + browser); index.html 
                           chat_search.rs (query, snippets, jump target), time_fmt.rs
                           (jiff 1.0 local time)
                           bubble.rs (text/image/file-card bubble + clickable links + selection chrome + context menu),
+                          markdown/ (parse: pure markdown → Doc, layout: Doc → galleys + decorations, fonts: bold face),
                           composer.rs (growing one-line pill, emoji, attach), emoji.rs (picker, insert at
                           cursor), emoji_font.rs (system color emoji ahead of monochrome symbol fonts),
                           files.rs (rfd dialogs on threads, avatar shrink to JPEG, chat image
@@ -313,10 +324,11 @@ Target: window in ~100 ms, private memory in the tens of MB. Keep it that way.
 
 ## Commands
 ```
-cargo test                                   # unit + local e2e
+cargo test                                   # unit + local e2e (core, host, app)
+cargo test -p brumm-cli                      # CLI + daemon (not a default member, so `cargo run` picks the app)
 cargo test -p brumm-core --test network -- --ignored   # needs internet: relay + DNS discovery
 cargo clippy --all-targets
-(cd python && uv run --group dev pytest)     # Python package vs a real daemon (needs target/debug/brumm-cli)
+(cd python && uv run --group dev pytest)     # Python package vs a real daemon (needs `cargo build -p brumm-cli` first)
 (cd python && uvx maturin build --release)   # wheel with the bundled brumm-cli
 cargo run -p brumm-cli -- --profile bot send notes "hi"   # headless CLI (auto-starts the daemon)
 cargo clippy -p brumm-app -p brumm-worker --target wasm32-unknown-unknown
@@ -337,5 +349,5 @@ without them it rejects the bulk-memory ops that current rustc emits.
 Data dir: `~/.local/share/brumm/profiles/<profile>/` (Linux): `brumm.db`, `window-size`.
 
 ## Stack
-Rust 2024 · iroh 1.5 · iroh-gossip · hpke · chacha20poly1305 · eframe/egui 0.37 · tokio · rusqlite (bundled) · postcard · ed25519-dalek 3 ·
+Rust 2024 · iroh 1.5 · iroh-gossip · hpke · chacha20poly1305 · eframe/egui 0.37 · pulldown-cmark 0.13 · tokio · rusqlite (bundled) · postcard · ed25519-dalek 3 ·
 bip39 · blake3 · qrcode · jiff. vodozemac 0.11 · nostr-sdk / nostr 0.45 (NIP-44; `local-relay` for tests). Planned: keyring + SQLCipher (M5).

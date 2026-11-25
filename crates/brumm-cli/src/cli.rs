@@ -146,7 +146,7 @@ pub struct SendArgs {
     pub wait: WaitStatus,
     #[arg(long, default_value = "60s", value_parser = parse_duration)]
     pub timeout: Duration,
-    /// Text over the 16 KiB limit: send several messages (default: one file).
+    /// Text over the 56 KiB limit: send several messages (default: one file).
     #[arg(long)]
     pub split: bool,
 }

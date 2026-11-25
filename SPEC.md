@@ -279,7 +279,13 @@ and `relay.primal.net` (each device publishes its own list, max 3).
   ciphertext from the outbox is posted **once** as a letter:
   - kind 1059 (gift wrap), signed by a **fresh random key** per letter
   - tag `p` = recipient inbox key; NIP-40 `expiration` = now + 14 days
-  - content = NIP-44(ephemeral → inbox key) of `{ sender device id, sealed }`, max 32 KiB sealed
+  - content = NIP-44(ephemeral → inbox key) of `{ sender device id, sealed }` when that payload is ≤ 24.5 KiB
+    (the event then stays under the 64 KiB cap of common relays)
+  - a larger payload (≤ 1.5 MiB) goes as up to 64 **letter parts**: each a letter of its own (fresh key, same `p` tag),
+    content `"part:" ‖ base64(LetterPart { digest = blake3(payload), index, count, ≤ 24 KiB })`. `:` is not base64,
+    so a part never reads as a whole letter. The receiver collects parts in any order (≤ 16 MiB pending, oldest
+    dropped first), checks the digest and then handles the payload as one letter, dated by its earliest part.
+    Group letters (§14.4) use the same parts. Older clients ignore parts (unreadable letter).
 
   Message status becomes **Sent** (✔). Direct retries continue meanwhile.
 - **Fetching**: each device subscribes to `kind 1059, #p = inbox key, since = last letter − 10 min`

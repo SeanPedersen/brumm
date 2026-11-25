@@ -39,7 +39,8 @@ async fn bot_and_app_never_online_together() {
     assert!(started.elapsed() < QUICK_EXIT, "took {:?}", started.elapsed());
     let sent = env.json(&["--no-daemon", "-p", "bot", "send", "me", "build 2 finished"]);
     assert_eq!(sent[0]["status"], "sent");
-    let long = "line of a long log\n".repeat(1200);
+    // Over wire::MAX_TEXT_BYTES (56 KiB): one file, or two parts with --split.
+    let long = "line of a long log\n".repeat(3200);
     env.run_with_stdin(&["--no-daemon", "-p", "bot", "send", "me", "--wait", "none"], long.as_bytes());
     let split = env.json(&["--no-daemon", "-p", "bot", "send", "me", "--split", "--wait", "none", &long]);
     assert_eq!(split.len(), 2);

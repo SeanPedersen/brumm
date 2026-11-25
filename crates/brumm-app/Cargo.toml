@@ -16,6 +16,8 @@ tracing.workspace = true
 egui.workspace = true
 qrcode.workspace = true
 jiff.workspace = true
+# Markdown in text messages; parsing only (no HTML renderer).
+pulldown-cmark = { version = "0.13.6", default-features = false }
 egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Scaled IDCT (1/2, 1/4, 1/8) so a 4K photo never becomes a full-size bitmap.
