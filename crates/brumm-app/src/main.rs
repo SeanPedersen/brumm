@@ -4,10 +4,10 @@
 mod app;
 mod bridge;
 mod history;
+mod page;
 mod preview;
 mod state;
 mod touch;
-mod page;
 mod ui;
 mod version;
 mod web_files;

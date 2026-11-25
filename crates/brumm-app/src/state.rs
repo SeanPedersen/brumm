@@ -246,7 +246,10 @@ impl AppState {
             .contacts
             .iter()
             .map(|contact| ConversationId::Direct(contact.user_key));
-        let groups = self.groups.keys().map(|group| ConversationId::Group(*group));
+        let groups = self
+            .groups
+            .keys()
+            .map(|group| ConversationId::Group(*group));
         direct
             .chain(groups)
             .filter_map(|conversation| self.chat_title(&conversation))

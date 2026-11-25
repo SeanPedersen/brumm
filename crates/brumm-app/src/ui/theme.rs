@@ -129,7 +129,9 @@ const DIALOG_SCREEN_MARGIN: f32 = 8.0;
 /// on a phone, anchored at the top so the on-screen keyboard does not cover it.
 pub fn dialog(title: &str, ctx: &egui::Context, width: f32) -> egui::Window<'static> {
     let screen = ctx.content_rect();
-    let fitted = width.min(screen.width() - DIALOG_SCREEN_MARGIN * 2.0).max(1.0);
+    let fitted = width
+        .min(screen.width() - DIALOG_SCREEN_MARGIN * 2.0)
+        .max(1.0);
     let window = egui::Window::new(title.to_owned())
         .collapsible(false)
         .resizable(false)

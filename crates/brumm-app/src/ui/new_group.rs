@@ -50,7 +50,10 @@ pub fn show(
                     .char_limit(MAX_NAME_CHARS)
                     .desired_width(f32::INFINITY),
             );
-            ui.checkbox(&mut view.announcement, "Only admins can post (announcements)");
+            ui.checkbox(
+                &mut view.announcement,
+                "Only admins can post (announcements)",
+            );
             ui.separator();
             ui.label(egui::RichText::new("Invite contacts").strong());
             ui.add(

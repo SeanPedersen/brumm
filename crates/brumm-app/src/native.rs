@@ -7,7 +7,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::{app, bridge::{self, CoreBridge}, window_size};
+use crate::{
+    app,
+    bridge::{self, CoreBridge},
+    window_size,
+};
 
 const DEFAULT_PROFILE: &str = "default";
 const PROFILE_FLAG: &str = "--profile";

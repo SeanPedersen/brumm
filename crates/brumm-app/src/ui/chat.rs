@@ -19,12 +19,11 @@ use crate::{
     touch,
     ui::{
         avatar,
-        group_rows,
         bubble::{self, Action},
         chat_search::{self, Pending},
         composer::{self, Composer},
         files::{self, FileDialogs},
-        sync_hint, theme, time_fmt,
+        group_rows, sync_hint, theme, time_fmt,
     },
 };
 
@@ -476,7 +475,13 @@ fn header(
                         avatar::show(ui, theme::HEADER_AVATAR_SIZE, &view.key, view.name, photo);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(egui::RichText::new(view.name).size(16.0).strong());
+                            // Selectable labels would swallow the click meant for the group-info hit area.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(view.name).size(16.0).strong(),
+                                )
+                                .selectable(false),
+                            );
                             let subtitle = match group {
                                 Some(group) => match group.member_count {
                                     1 => "1 member".to_owned(),
@@ -485,10 +490,13 @@ fn header(
                                 None if is_notes => "visible on all your devices".to_owned(),
                                 None => "end-to-end encrypted".to_owned(),
                             };
-                            ui.label(
-                                egui::RichText::new(subtitle)
-                                    .small()
-                                    .color(theme::MUTED_TEXT),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(subtitle)
+                                        .small()
+                                        .color(theme::MUTED_TEXT),
+                                )
+                                .selectable(false),
                             );
                         });
                     })
@@ -1137,7 +1145,11 @@ fn estimate_row(
 ) -> (f32, f32, Vec<u32>) {
     let separator = estimate_separator(previous, message);
     if message.system {
-        return (group_rows::SYSTEM_ROW_ESTIMATE + separator, separator, Vec::new());
+        return (
+            group_rows::SYSTEM_ROW_ESTIMATE + separator,
+            separator,
+            Vec::new(),
+        );
     }
     let (bubble, line_starts) = bubble::estimated_height(message, column_width);
     ((bubble + separator).max(1.0), separator, line_starts)
@@ -1277,7 +1289,15 @@ fn paint_rows(
         if message.system {
             let bubble_top = ui.cursor().min.y;
             let row = group_rows::paint_system(ui, &message.text);
-            finish_row(ui, chat, index, top, bubble_top, anchor_index, &mut heights_changed);
+            finish_row(
+                ui,
+                chat,
+                index,
+                top,
+                bubble_top,
+                anchor_index,
+                &mut heights_changed,
+            );
             slots.push(RowSlot {
                 index,
                 row,
@@ -1325,7 +1345,15 @@ fn paint_rows(
             ui.painter()
                 .set(band, egui::Shape::rect_filled(rect, 0.0, SEARCH_HIT_TINT));
         }
-        finish_row(ui, chat, index, top, bubble_top, anchor_index, &mut heights_changed);
+        finish_row(
+            ui,
+            chat,
+            index,
+            top,
+            bubble_top,
+            anchor_index,
+            &mut heights_changed,
+        );
         slots.push(RowSlot {
             index,
             row: output.row,
@@ -1869,21 +1897,34 @@ mod tests {
             section.repeat(50 * 1024 / section.len())
         );
         assert!(
-            note.len() > bubble::WINDOWED_TEXT_BYTES && note.len() <= brumm_core::wire::MAX_TEXT_BYTES
+            note.len() > bubble::WINDOWED_TEXT_BYTES
+                && note.len() <= brumm_core::wire::MAX_TEXT_BYTES
         );
-        let messages = harness.state.conversations.get_mut(&CONTACT).expect("conversation");
+        let messages = harness
+            .state
+            .conversations
+            .get_mut(&CONTACT)
+            .expect("conversation");
         messages.truncate(1);
         messages[0].text = note;
         for _ in 0..4 {
             harness.frame(vec![], egui::Modifiers::NONE);
         }
-        let link = harness.chat.link_rects.first().copied().expect("markdown link painted");
+        let link = harness
+            .chat
+            .link_rects
+            .first()
+            .copied()
+            .expect("markdown link painted");
         // Only the label is painted; the plain (windowed) path would show the whole URL.
         assert!(link.width() < 40.0, "{link:?}");
         let at = link.center();
         harness.press(at, egui::Modifiers::NONE);
         harness.release(at, egui::Modifiers::NONE);
-        assert_eq!(harness.opened_urls, vec!["https://example.com/end".to_owned()]);
+        assert_eq!(
+            harness.opened_urls,
+            vec!["https://example.com/end".to_owned()]
+        );
     }
 
     #[test]

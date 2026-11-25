@@ -190,7 +190,10 @@ fn invite_section(
     new_group::contact_picker(ui, state, &view.invite_filter, &mut view.picked);
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!view.picked.is_empty(), egui::Button::new("Send invitations"))
+            .add_enabled(
+                !view.picked.is_empty(),
+                egui::Button::new("Send invitations"),
+            )
             .clicked()
         {
             commands.push(Command::InviteToGroup {
@@ -294,7 +297,11 @@ fn member_row(
             ui.menu_button("⋯", |ui| {
                 let user = member.user_key;
                 let promote = member.role == Role::Member;
-                let label = if promote { "Make admin" } else { "Remove admin" };
+                let label = if promote {
+                    "Make admin"
+                } else {
+                    "Remove admin"
+                };
                 if group.my_role == Some(Role::Owner) && ui.button(label).clicked() {
                     commands.push(Command::SetRole {
                         group: group.id,
@@ -398,7 +405,9 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, PHONE)),
                 ..Default::default()
             };
-            let mut output = ctx.run_ui(input, |ui| show(ui, &state, &mut view, &dialogs, &mut commands));
+            let mut output = ctx.run_ui(input, |ui| {
+                show(ui, &state, &mut view, &dialogs, &mut commands)
+            });
             output.textures_delta.clear();
         }
         let offsets: Vec<u32> = commands
@@ -408,8 +417,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(offsets, vec![0], "only the first page while the list is at its top");
+        assert_eq!(
+            offsets,
+            vec![0],
+            "only the first page while the list is at its top"
+        );
         let window = view.rect.expect("window shown");
-        assert!(window.left() >= 0.0 && window.right() <= PHONE.x, "{window:?} off screen");
+        assert!(
+            window.left() >= 0.0 && window.right() <= PHONE.x,
+            "{window:?} off screen"
+        );
     }
 }

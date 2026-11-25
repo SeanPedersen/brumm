@@ -42,24 +42,37 @@ pub fn author(message: &MessageView) -> Author {
 }
 
 /// The name to show above an incoming group bubble that starts a run.
-pub fn sender_label<'a>(previous: Option<&MessageView>, message: &'a MessageView, new_day: bool) -> Option<&'a str> {
+pub fn sender_label<'a>(
+    previous: Option<&MessageView>,
+    message: &'a MessageView,
+    new_day: bool,
+) -> Option<&'a str> {
     let sender = message.sender.as_ref()?;
     if message.system || message.direction == Direction::Outgoing {
         return None;
     }
-    let continues = !new_day && previous.is_some_and(|previous| author(previous) == author(message));
+    let continues =
+        !new_day && previous.is_some_and(|previous| author(previous) == author(message));
     (!continues).then_some(sender.display_name.as_str())
 }
 
 /// Paints the sender's name in a color derived from their key (like their avatar).
 pub fn paint_sender(ui: &mut egui::Ui, name: &str, key: &UserKey) {
     let color = avatar::color_of(key);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(name.to_owned(), FontId::proportional(SENDER_FONT_SIZE), color);
-    let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), galley.size().y), Sense::hover());
-    ui.painter()
-        .galley(egui::pos2(row.left() + SENDER_INSET_X, row.top()), galley, color);
+    let galley = ui.painter().layout_no_wrap(
+        name.to_owned(),
+        FontId::proportional(SENDER_FONT_SIZE),
+        color,
+    );
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), galley.size().y),
+        Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::pos2(row.left() + SENDER_INSET_X, row.top()),
+        galley,
+        color,
+    );
     ui.add_space(SENDER_GAP_BELOW);
 }
 
@@ -115,7 +128,11 @@ mod tests {
         assert_eq!(sender_label(None, &bob, false), Some("member 1"));
         assert_eq!(sender_label(Some(&bob), &bob, false), None);
         assert_eq!(sender_label(Some(&bob), &carol, false), Some("member 2"));
-        assert_eq!(sender_label(Some(&bob), &bob, true), Some("member 1"), "a new day starts a run");
+        assert_eq!(
+            sender_label(Some(&bob), &bob, true),
+            Some("member 1"),
+            "a new day starts a run"
+        );
     }
 
     #[test]

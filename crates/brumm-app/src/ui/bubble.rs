@@ -1054,7 +1054,12 @@ fn chips(reactions: &ReactionsView) -> Vec<Chip> {
         .theirs
         .iter()
         .map(|emoji| (emoji.clone(), 1))
-        .chain(reactions.others.iter().map(|(emoji, count)| (emoji.clone(), *count as usize)))
+        .chain(
+            reactions
+                .others
+                .iter()
+                .map(|(emoji, count)| (emoji.clone(), *count as usize)),
+        )
         .map(|(emoji, count)| Chip {
             emoji,
             count,

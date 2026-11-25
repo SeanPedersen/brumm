@@ -33,11 +33,22 @@ pub fn show(
     }
     add_contact::show(ui, state, &mut view.add_contact, commands);
     devices::show(ui, state, &mut view.devices, commands);
-    if let Some(group) = view.chat.open_group_info.take().and_then(|id| state.groups.get(&id)) {
+    if let Some(group) = view
+        .chat
+        .open_group_info
+        .take()
+        .and_then(|id| state.groups.get(&id))
+    {
         view.group_info.open(group);
     }
     new_group::show(ui, state, &mut view.new_group, commands);
-    group_info::show(ui, state, &mut view.group_info, &view.chat.dialogs, commands);
+    group_info::show(
+        ui,
+        state,
+        &mut view.group_info,
+        &view.chat.dialogs,
+        commands,
+    );
     seed_phrase::show(ui, state);
     logout::show(ui, state, &mut view.logout, commands);
 }

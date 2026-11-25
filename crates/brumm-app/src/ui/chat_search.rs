@@ -217,7 +217,10 @@ impl Session {
                     id: message.id,
                     sent_at_ms: message.sent_at_ms,
                     direction: message.direction,
-                    sender: message.sender.as_ref().map(|sender| sender.display_name.clone()),
+                    sender: message
+                        .sender
+                        .as_ref()
+                        .map(|sender| sender.display_name.clone()),
                     before,
                     matched,
                     after,

@@ -16,7 +16,10 @@ mod tests {
     #[test]
     fn label_names_the_crate_version_and_a_build() {
         let label = super::LABEL;
-        assert!(label.starts_with(concat!("v", env!("CARGO_PKG_VERSION"), " · ")), "{label}");
+        assert!(
+            label.starts_with(concat!("v", env!("CARGO_PKG_VERSION"), " · ")),
+            "{label}"
+        );
         assert!(!env!("BRUMM_BUILD_ID").is_empty());
     }
 }

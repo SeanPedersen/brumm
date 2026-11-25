@@ -454,14 +454,22 @@ fn chat_list(
 fn invitation_status(invitation: &GroupInvitationView) -> Option<String> {
     match invitation.stage {
         InvitationStage::Open => None,
-        InvitationStage::Accepted => Some(format!("Waiting for {} to add you…", invitation.inviter_name)),
+        InvitationStage::Accepted => Some(format!(
+            "Waiting for {} to add you…",
+            invitation.inviter_name
+        )),
         InvitationStage::Loading => Some("Loading members and recent messages…".to_owned()),
     }
 }
 
 /// An accepted invitation: a clock while the inviter has not added us (that can take days, so
 /// nothing animates), a spinner while the group loads. Only the wait can be cancelled.
-fn invitation_progress(ui: &mut egui::Ui, invitation: &GroupInvitationView, status: String, commands: &mut Vec<Command>) {
+fn invitation_progress(
+    ui: &mut egui::Ui,
+    invitation: &GroupInvitationView,
+    status: String,
+    commands: &mut Vec<Command>,
+) {
     ui.horizontal(|ui| {
         let icon = egui::vec2(INVITATION_STATUS_ICON, INVITATION_STATUS_ICON);
         if invitation.stage == InvitationStage::Loading {
@@ -472,7 +480,9 @@ fn invitation_progress(ui: &mut egui::Ui, invitation: &GroupInvitationView, stat
         }
         ui.label(egui::RichText::new(status).small().color(theme::MUTED_TEXT));
         if invitation.stage == InvitationStage::Accepted && ui.small_button("Cancel").clicked() {
-            commands.push(Command::DeclineGroupInvitation { group: invitation.group });
+            commands.push(Command::DeclineGroupInvitation {
+                group: invitation.group,
+            });
         }
     });
 }
