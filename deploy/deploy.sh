@@ -13,8 +13,14 @@ set -a; source "$ENV_FILE"; set +a
 : "${DEPLOY_HOST:?set DEPLOY_HOST in .env}" "${DEPLOY_DIR:?set DEPLOY_DIR in .env}"
 : "${EDGE_NETWORK:?set EDGE_NETWORK in .env}"
 
-echo "→ Building the web client"
+# Same id as crates/brumm-app/build.rs: shown in the app menu, compiled into the client and
+# written to version.txt, so an open tab running another build reloads itself.
+BRUMM_BUILD_ID="$(git -C "$REPO_DIR" rev-list --count HEAD)-$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+export BRUMM_BUILD_ID
+
+echo "→ Building the web client ($BRUMM_BUILD_ID)"
 (cd "$REPO_DIR/crates/brumm-app" && trunk build --release)
+printf '%s\n' "$BRUMM_BUILD_ID" > "$DIST_DIR/version.txt"
 
 echo "→ Syncing to $DEPLOY_HOST:$DEPLOY_DIR"
 ssh "$DEPLOY_HOST" "mkdir -p '$DEPLOY_DIR/web-dist'"

@@ -333,11 +333,24 @@ fn paint_snippet(
     );
 }
 
+/// Top right of the menu: compare it across devices to see they run the same build.
+fn version_label(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new(crate::version::LABEL)
+            .small()
+            .color(theme::MUTED_TEXT),
+    )
+    .on_hover_text("App version · build (commit count - commit)");
+}
+
 fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
     egui::menu::MenuButton::from_button(icon_button_widget("☰", 18.0, theme::MUTED_TEXT)).ui(
         ui,
         |ui| {
             ui.set_min_width(220.0);
+            if state.profile.is_none() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), version_label);
+            }
             if let Some(profile) = &state.profile {
                 ui.horizontal(|ui| {
                     avatar::show(
@@ -359,6 +372,7 @@ fn menu_button(ui: &mut egui::Ui, state: &AppState, view: &mut ViewState) {
                             "Your fingerprint — compare it with contacts to verify each other",
                         );
                     });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), version_label);
                 });
                 ui.separator();
             }

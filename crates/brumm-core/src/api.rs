@@ -189,6 +189,9 @@ pub enum Command {
     RefreshGroupKeys {
         group: GroupId,
     },
+    /// The app came back (browser tab visible again, network online): reconnect the mailbox
+    /// relays, fetch letters missed meanwhile, and retry the outbox.
+    Resume,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

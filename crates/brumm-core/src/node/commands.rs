@@ -198,6 +198,7 @@ impl Node {
                 limit,
             } => self.load_members(group, query, offset, limit),
             Command::RefreshGroupKeys { group } => self.refresh_group_keys(&group),
+            Command::Resume => self.resume(),
         }
     }
 

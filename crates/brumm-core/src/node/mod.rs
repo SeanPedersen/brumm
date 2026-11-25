@@ -381,6 +381,23 @@ impl Node {
         });
     }
 
+    /// [`Command::Resume`]: reconnects the mailbox to fetch letters missed while the app was
+    /// suspended, and retries the outbox right away instead of at the next tick.
+    fn resume(&mut self) -> Result<()> {
+        let Some(me) = self.me.as_ref() else {
+            return Ok(());
+        };
+        if let Some(mailbox) = me.mailbox.clone() {
+            let since = self.store.mailbox_since()?;
+            task::spawn(async move {
+                if let Err(err) = mailbox.reconnect(since).await {
+                    tracing::info!(?err, "mailbox reconnect failed");
+                }
+            });
+        }
+        self.flush_outbox()
+    }
+
     async fn start(&mut self) {
         let started = Instant::now();
         let loaded = self.load_me().await;

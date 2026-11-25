@@ -88,6 +88,32 @@ async fn recipient_offline_then_back_while_sender_online() {
     alice.delivered(sent).await;
 }
 
+/// A 51 KB markdown note (like a pasted document) goes as letter parts to the public relays while
+/// the reader is offline, and the reader assembles it alone after the writer is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs internet"]
+async fn long_text_in_parts_via_public_nostr_relays() {
+    let mut alice = TestNode::spawn_with("public-parts-alice", default_relays());
+    let mut bob = TestNode::spawn_with("public-parts-bob", default_relays());
+    alice.create_identity("Alice").await;
+    let bob_key = bob.create_identity("Bob").await;
+    let link = alice.create_invite().await;
+    bob.send(Command::AcceptInvite { link });
+    bob.contact_added().await;
+    alice.contact_added().await;
+
+    let bob_offline = bob.stop().await;
+    let line = "## Route\nA line of a long markdown document about a route.\n\n";
+    let long = line.repeat(51 * 1024 / line.len()).trim_end().to_owned();
+    let sent = alice.send_text(bob_key, &long).await;
+    alice.status(sent, brumm_core::api::DeliveryStatus::Sent).await;
+    let _alice_offline = alice.stop().await;
+
+    let mut bob = bob_offline.start();
+    bob.ready().await;
+    assert_eq!(bob.received_text().await, long);
+}
+
 /// Alice sends and goes offline *before* Bob comes back: the letter waits on public Nostr relays.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs internet"]

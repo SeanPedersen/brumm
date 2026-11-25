@@ -3,7 +3,11 @@
 
 mod common;
 
-use brumm_core::api::{Command, DeliveryStatus};
+use brumm_core::{
+    api::{Command, DeliveryStatus},
+    crypto::Sealed,
+    mailbox::{self, Mailbox},
+};
 use common::{TestNode, local_relay};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -130,4 +134,36 @@ async fn notes_show_sent_then_delivered_like_any_chat() {
     let mut phone = phone_offline.start();
     phone.ready().await;
     laptop.delivered(note).await;
+}
+
+/// A reconnect (what a browser tab does when it comes back) keeps the inbox subscription alive:
+/// a letter posted afterwards still arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbox_still_receives_after_a_reconnect() {
+    let (_relay, relays) = local_relay().await;
+    let reader_secret = [21; 32];
+    let (letters_tx, mut letters) = tokio::sync::mpsc::channel(4);
+    let (group_tx, _group_letters) = tokio::sync::mpsc::channel(4);
+    let reader = Mailbox::start(&reader_secret, &relays, None, letters_tx, group_tx)
+        .await
+        .unwrap();
+    reader.reconnect(None).await.unwrap();
+
+    let (writer_tx, _writer_letters) = tokio::sync::mpsc::channel(4);
+    let (writer_group_tx, _writer_group) = tokio::sync::mpsc::channel(4);
+    let writer = Mailbox::start(&[22; 32], &relays, None, writer_tx, writer_group_tx)
+        .await
+        .unwrap();
+    let to = mailbox::address(&reader_secret, relays.clone());
+    let from = iroh::SecretKey::generate().public();
+    let sealed = Sealed {
+        message_type: 1,
+        ciphertext: vec![7; 60 * 1024],
+    };
+    writer.post(&to, from, sealed.clone()).await.unwrap();
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(10), letters.recv())
+        .await
+        .expect("letter after reconnect")
+        .expect("open channel");
+    assert_eq!((delivery.from, delivery.sealed), (from, sealed));
 }

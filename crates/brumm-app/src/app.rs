@@ -61,6 +61,9 @@ impl eframe::App for BrummApp {
             }
             self.state.apply(event, ctx);
         }
+        if crate::page::take_resumed() {
+            self.core.send(Command::Resume);
+        }
         while let Some(job) = self.state.take_pending_preview() {
             self.previews.submit(
                 job.conversation,

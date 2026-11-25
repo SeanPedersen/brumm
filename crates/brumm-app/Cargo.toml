@@ -74,8 +74,10 @@ web-sys = { version = "0.3", features = [
     "MediaQueryList",
     "MessageEvent",
     "Node",
+    "Response",
     "Url",
     "UrlSearchParams",
+    "VisibilityState",
     "Window",
     "Worker",
 ] }

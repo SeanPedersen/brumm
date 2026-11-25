@@ -58,6 +58,8 @@ const GROUP_TAG_CONTEXT: &str = "brumm 2026 group letter tag v1";
 /// One REQ for all group tags; sending it again replaces the previous filter on the relays.
 const GROUP_SUBSCRIPTION_ID: &str = "brumm-groups";
 const LOG_SUBSCRIPTION_ID: &str = "brumm-group-logs";
+/// Fixed so a [`Mailbox::reconnect`] replaces the inbox filter instead of adding a second one.
+const INBOX_SUBSCRIPTION_ID: &str = "brumm-inbox";
 const LETTER_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Payload of one letter. Base64, NIP-44 padding and base64 again make the event about 2.2×
 /// larger (≈ 55 KB here), under the 64 KiB event cap of common relays (strfry's default).
@@ -150,6 +152,7 @@ type GroupTags = Arc<Mutex<HashMap<PublicKey, Keys>>>;
 
 pub struct Mailbox {
     client: Client,
+    inbox: PublicKey,
     relays: Vec<String>,
     group_tags: GroupTags,
     log_tags: GroupTags,
@@ -176,16 +179,8 @@ impl Mailbox {
         client.connect().and_wait(CONNECT_WAIT).await;
 
         let mut notifications = client.notifications();
-        let mut filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .pubkey(inbox.public_key());
-        if let Some(since) = since_secs {
-            filter = filter.since(Timestamp::from(since.saturating_sub(SINCE_MARGIN_SECS)));
-        }
-        client
-            .subscribe(filter)
-            .await
-            .context("subscribe to inbox")?;
+        let inbox_public = inbox.public_key();
+        subscribe_inbox(&client, inbox_public, since_secs).await?;
 
         let group_tags = GroupTags::default();
         let tags = group_tags.clone();
@@ -239,6 +234,7 @@ impl Mailbox {
         });
         Ok(Arc::new(Self {
             client,
+            inbox: inbox_public,
             relays: relays.to_vec(),
             group_tags,
             log_tags,
@@ -347,9 +343,32 @@ impl Mailbox {
         self.send_all(&events, &targets).await
     }
 
+    /// Drops and reopens every relay connection, then asks again for letters posted after
+    /// `since_secs`. The browser cannot ping its WebSockets, so a tab that was suspended or
+    /// changed networks may hold a dead connection that never reports an error; this is how it
+    /// catches up. The group and log filters are sent again on reconnect as they were.
+    pub async fn reconnect(&self, since_secs: Option<u64>) -> Result<()> {
+        self.client.disconnect().await;
+        self.client.connect().and_wait(CONNECT_WAIT).await;
+        subscribe_inbox(&self.client, self.inbox, since_secs).await
+    }
+
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
     }
+}
+
+async fn subscribe_inbox(client: &Client, inbox: PublicKey, since_secs: Option<u64>) -> Result<()> {
+    let mut filter = Filter::new().kind(Kind::GiftWrap).pubkey(inbox);
+    if let Some(since) = since_secs {
+        filter = filter.since(Timestamp::from(since.saturating_sub(SINCE_MARGIN_SECS)));
+    }
+    client
+        .subscribe(filter)
+        .with_id(SubscriptionId::new(INBOX_SUBSCRIPTION_ID))
+        .await
+        .context("subscribe to inbox")?;
+    Ok(())
 }
 
 fn seal_letter(to: &MailboxAddress, letter: Letter) -> Result<Vec<Event>> {

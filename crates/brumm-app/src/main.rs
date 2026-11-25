@@ -7,7 +7,9 @@ mod history;
 mod preview;
 mod state;
 mod touch;
+mod page;
 mod ui;
+mod version;
 mod web_files;
 
 #[cfg(not(target_family = "wasm"))]

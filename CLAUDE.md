@@ -54,7 +54,13 @@ milestone plan is in **SPEC.md**, so read it before changing protocol, storage o
   relay is ever chosen. Peer addresses are normalized the same way before dialing. A ticket (link or
   invite) is only issued with a relay address (`Transport::addr` fails after 30 s instead). File picking uses a hidden `<input type=file>` (`web_files.rs`, bytes as `Picked::Dropped` /
   `AvatarData`); Save As has no dialog: the worker answers `SaveAttachment` with `Event::FileExport`
-  and the UI starts a Blob download into the browser's download folder. Not on the web yet:
+  and the UI starts a Blob download into the browser's download folder.
+  **Tab lifecycle** (`page.rs`): when the tab becomes visible, is restored from the bfcache, goes `online`, and every 5 min while
+  visible, the app sends `Command::Resume` (core: `Mailbox::reconnect` drops and reopens the relay sockets and re-subscribes the
+  inbox from `mailbox_since`, then flushes the outbox). Needed because nostr-sdk does not ping WebSockets in wasm: a suspended
+  phone tab kept dead sockets and only got letters once the sender reached it directly. The same check fetches `version.txt` and
+  reloads the tab when the deployed build differs. **Build id** (`build.rs`): `<commit count>-<short hash>`, shown at the top right
+  of the ☰ menu (`version.rs`); `deploy.sh` passes the same id and writes `version.txt`. Not on the web yet:
   clipboard file paste, system color emoji. Core code uses `n0_future::{task::spawn, time}` (tokio natively,
   setTimeout/spawn_local in wasm), never `tokio::spawn` / `tokio::time` / `std::time::Instant`.
 - **Responsive layout:** below `NARROW_BREAKPOINT` (600 logical px, width-based, so a narrowed desktop window too) only one pane
